@@ -82,6 +82,13 @@ pub enum TransportError {
     #[error("invalid UTF-8 in text frame")]
     InvalidUtf8,
 
+    /// Runtime connection header generation failed before an HTTP upgrade attempt.
+    ///
+    /// Provider error details are deliberately not retained because they may contain
+    /// authentication material. Connection policy treats this as a transient attempt failure.
+    #[error("connection header provider failed")]
+    ConnectionHeaderProvider,
+
     /// Backend returned an error not covered by other variants. Carries a
     /// short description; consumers should treat as fatal.
     #[error("transport error: {0}")]
@@ -169,6 +176,7 @@ mod tests {
             TransportError::Handshake("bad".into()),
             TransportError::UpgradeRejected(429),
             TransportError::ProxyConnectRejected(503),
+            TransportError::ConnectionHeaderProvider,
         ] {
             assert!(err.is_fatal(), "expected fatal: {err:?}");
             assert!(!err.is_closed(), "expected not closed: {err:?}");

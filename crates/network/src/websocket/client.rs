@@ -160,6 +160,7 @@ const MAX_CONTROL_FRAME_PAYLOAD_BYTES: usize = 125;
 pub struct WebSocketClientInner {
     config: WebSocketConfig,
     reconnect_headers: ReconnectHeaders,
+    connection_header_provider: Option<ConnectionHeaderProvider>,
     handler: Option<IncomingHandler>,
     ping_handler: Option<IncomingPingHandler>,
     read_task: Option<dst::task::JoinHandle<()>>,
@@ -194,6 +195,7 @@ struct ConnectionRateLimit {
 struct InitialConnectOptions {
     retry_policy: Option<InitialConnectRetryPolicy>,
     cancellation_token: Option<CancellationToken>,
+    connection_header_provider: Option<ConnectionHeaderProvider>,
 }
 
 impl WebSocketClientInner {
@@ -289,6 +291,7 @@ impl WebSocketClientInner {
         Ok(Self {
             config,
             reconnect_headers,
+            connection_header_provider: None,
             handler: None, // Stream mode has no handler
             ping_handler: None,
             writer_tx,
@@ -386,10 +389,12 @@ impl WebSocketClientInner {
             TransportError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
         })?;
 
-        let cancellation_token = initial_connect_options
-            .cancellation_token
-            .unwrap_or_default();
-        let retry_policy = initial_connect_options.retry_policy;
+        let InitialConnectOptions {
+            retry_policy,
+            cancellation_token,
+            connection_header_provider,
+        } = initial_connect_options;
+        let cancellation_token = cancellation_token.unwrap_or_default();
         let max_attempts = retry_policy
             .as_ref()
             .map_or(1, |policy| policy.max_attempts.get());
@@ -406,12 +411,17 @@ impl WebSocketClientInner {
                         .await;
                 }
 
+                let headers =
+                    connection_attempt_headers(connection_header_provider.as_ref(), || {
+                        config.headers.clone()
+                    })?;
+
                 // Bound only the dial: the connection rate-limit wait has its own venue timing
                 dst::time::timeout(
                     connect_timeout,
                     Box::pin(Self::connect_with_server(
                         &config.url,
-                        config.headers.clone(),
+                        headers,
                         config.backend,
                         config.proxy_url.as_deref(),
                     )),
@@ -515,6 +525,7 @@ impl WebSocketClientInner {
         Ok(Self {
             config,
             reconnect_headers,
+            connection_header_provider,
             handler,
             ping_handler,
             read_task,
@@ -911,6 +922,28 @@ fn tungstenite_request(
     Ok(request)
 }
 
+fn connection_attempt_headers(
+    provider: Option<&ConnectionHeaderProvider>,
+    configured_headers: impl FnOnce() -> Vec<(String, String)>,
+) -> Result<Vec<(String, String)>, TransportError> {
+    let headers = match provider {
+        Some(provider) => provider().map_err(|_| TransportError::ConnectionHeaderProvider)?,
+        None => configured_headers(),
+    };
+
+    // Validate the whole provider result before giving either backend ownership of it. Values are
+    // intentionally absent from every error and log path because these headers commonly carry
+    // credentials.
+    for (name, value) in &headers {
+        HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| TransportError::Handshake(format!("invalid header name: {e}")))?;
+        HeaderValue::from_str(value)
+            .map_err(|e| TransportError::Handshake(format!("invalid header value: {e}")))?;
+    }
+
+    Ok(headers)
+}
+
 fn is_connection_drop_transport_error(err: &TransportError) -> bool {
     err.is_closed() || matches!(err, TransportError::Io(e) if is_connection_drop_io_error(e))
 }
@@ -919,7 +952,8 @@ fn is_retryable_initial_connect_error(err: &TransportError) -> bool {
     match err {
         TransportError::ConnectionClosed
         | TransportError::ConnectionReset
-        | TransportError::ClosedByPeer(_) => true,
+        | TransportError::ClosedByPeer(_)
+        | TransportError::ConnectionHeaderProvider => true,
         TransportError::Io(error) => !matches!(
             error.kind(),
             std::io::ErrorKind::InvalidInput
@@ -1341,12 +1375,16 @@ impl WebSocketClientInner {
             return Ok(ReconnectOutcome::Aborted);
         }
 
+        let headers = connection_attempt_headers(self.connection_header_provider.as_ref(), || {
+            self.reconnect_headers.snapshot()
+        })?;
+
         // Bound only connection establishment; the swap below must run to completion
         let (new_writer, reader) = dst::time::timeout(
             self.connect_timeout,
             Box::pin(Self::connect_with_server(
                 &self.config.url,
-                self.reconnect_headers.snapshot(),
+                headers,
                 self.config.backend,
                 self.config.proxy_url.as_deref(),
             )),
@@ -2273,9 +2311,18 @@ pub struct WebSocketClient {
     reconnect_supported: bool,
 }
 
+/// Supplies one complete, immutable header set for a WebSocket connection attempt.
+///
+/// The transport invokes the provider after any connection rate-limit or retry/backoff delay and
+/// immediately before the HTTP upgrade. It invokes the provider again for every later attempt.
+/// Provider failures are sanitized and handled as retryable connection-attempt failures.
+pub type ConnectionHeaderProvider =
+    Arc<dyn Fn() -> Result<Vec<(String, String)>, TransportError> + Send + Sync>;
+
 /// Shared headers used by future automatic WebSocket reconnects.
 ///
 /// Updating these headers does not affect the active connection or trigger a reconnect.
+/// A configured [`ConnectionHeaderProvider`] replaces this static collection for every attempt.
 #[derive(Clone)]
 pub struct ReconnectHeaders {
     inner: Arc<RwLock<Vec<(String, String)>>>,
@@ -2627,7 +2674,9 @@ impl WebSocketClient {
     /// reading, or fine-grained backpressure handling.
     ///
     /// `default_quota` and `keyed_quotas` limit outgoing messages. `state_sink` reports transport
-    /// availability changes.
+    /// availability changes. `connection_header_provider` is a runtime-only alternative to
+    /// `config.headers`; when present, it supplies the complete header set immediately before the
+    /// single HTTP upgrade attempt.
     ///
     /// See [`WebSocketConfig`] documentation for comparison with handler mode.
     ///
@@ -2643,17 +2692,21 @@ impl WebSocketClient {
         #[builder(default)] keyed_quotas: Vec<(String, Quota)>,
         default_quota: Option<Quota>,
         state_sink: Option<SocketStateSink>,
+        connection_header_provider: Option<ConnectionHeaderProvider>,
     ) -> Result<(MessageReader, Self), TransportError> {
         install_cryptographic_provider();
 
         // Create a single connection and split it, respecting configured headers.
         // The connection attempt bound is a fixed default: stream mode documents reconnect_* fields as ignored
         let connect_timeout = Duration::from_secs(10);
+        let headers = connection_attempt_headers(connection_header_provider.as_ref(), || {
+            config.headers.clone()
+        })?;
         let (writer, reader) = dst::time::timeout(
             connect_timeout,
             Box::pin(WebSocketClientInner::connect_with_server(
                 &config.url,
-                config.headers.clone(),
+                headers,
                 config.backend,
                 config.proxy_url.as_deref(),
             )),
@@ -2737,6 +2790,10 @@ impl WebSocketClient {
     /// creates one from `default_quota` and `keyed_quotas`. `connection_rate_limiter` gates the
     /// initial connection and reconnects using `connection_rate_keys`.
     ///
+    /// `connection_header_provider` is a runtime-only alternative to `config.headers`. When
+    /// present, it supplies the complete header set after connection rate limits and retry/backoff
+    /// delays, immediately before every initial or reconnect HTTP upgrade attempt.
+    ///
     /// Without `initial_connect_retry_policy` the builder makes exactly one connection attempt.
     /// With one, failures classified as retryable are retried up to its `max_attempts`; see
     /// [`InitialConnectRetryPolicy`] for which failures return before that bound is reached.
@@ -2772,6 +2829,7 @@ impl WebSocketClient {
         state_sink: Option<SocketStateSink>,
         connection_rate_limiter: Option<Arc<RateLimiter<Ustr, MonotonicClock>>>,
         #[builder(default)] connection_rate_keys: Arc<[Ustr]>,
+        connection_header_provider: Option<ConnectionHeaderProvider>,
         initial_connect_retry_policy: Option<InitialConnectRetryPolicy>,
         cancellation_token: Option<CancellationToken>,
     ) -> Result<Self, TransportError> {
@@ -2788,6 +2846,7 @@ impl WebSocketClient {
             InitialConnectOptions {
                 retry_policy: initial_connect_retry_policy,
                 cancellation_token,
+                connection_header_provider,
             },
         )
         .await
@@ -2799,6 +2858,7 @@ impl WebSocketClient {
     /// and both its incoming messages and `RECONNECTED` notification carry that new value. Use
     /// [`Self::send_text_on_connection`] to bind an outgoing message to one of those epochs.
     /// Rate-limit, state, initial-connect retry, and cancellation options match [`Self::builder`].
+    /// The runtime-only `connection_header_provider` option also matches [`Self::builder`].
     /// Set either `ping_handler` or `epoch_ping_handler` when custom ping handling is required.
     ///
     /// The epoch handler is required:
@@ -2832,6 +2892,7 @@ impl WebSocketClient {
         state_sink: Option<SocketStateSink>,
         connection_rate_limiter: Option<Arc<RateLimiter<Ustr, MonotonicClock>>>,
         #[builder(default)] connection_rate_keys: Arc<[Ustr]>,
+        connection_header_provider: Option<ConnectionHeaderProvider>,
         initial_connect_retry_policy: Option<InitialConnectRetryPolicy>,
         cancellation_token: Option<CancellationToken>,
     ) -> Result<Self, TransportError> {
@@ -2859,6 +2920,7 @@ impl WebSocketClient {
             InitialConnectOptions {
                 retry_policy: initial_connect_retry_policy,
                 cancellation_token,
+                connection_header_provider,
             },
         )
         .await
@@ -2973,7 +3035,10 @@ impl WebSocketClient {
         })
     }
 
-    /// Returns shared headers used by future automatic reconnect attempts.
+    /// Returns shared static headers used by future automatic reconnect attempts.
+    ///
+    /// When a [`ConnectionHeaderProvider`] is configured, the provider supplies each attempt's
+    /// complete header set and changes made through this handle are not consulted.
     #[must_use]
     pub fn reconnect_headers(&self) -> ReconnectHeaders {
         self.reconnect_headers.clone()
@@ -3718,7 +3783,10 @@ mod tests {
     use std::{
         collections::HashMap,
         num::NonZeroU32,
-        sync::{Arc, atomic::Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
         time::Duration,
     };
 
@@ -3753,17 +3821,37 @@ mod tests {
         ratelimiter::quota::Quota,
         transport::TransportError,
         websocket::{
-            InitialConnectRetryPolicy, ReconnectHeaders, TransportBackend, WebSocketClient,
-            WebSocketConfig,
+            ConnectionHeaderProvider, InitialConnectRetryPolicy, ReconnectHeaders,
+            TransportBackend, WebSocketClient, WebSocketConfig, channel_message_handler,
         },
     };
 
     const SECRET_MARKER: &str = "OUTBOUND_SECRET_MARKER";
     const PING_TRIGGER: &str = "send-test-ping";
+    const PROVIDER_TEST_TIMEOUT: Duration = Duration::from_secs(10);
     const NETWORK_LOG_TARGETS: &[&str] = &[
         "nautilus_network::http::client",
         "nautilus_network::websocket::client",
     ];
+
+    fn provider_test_config(port: u16) -> WebSocketConfig {
+        WebSocketConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            headers: vec![],
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(1_000),
+            reconnect_delay_initial_ms: None,
+            reconnect_delay_max_ms: None,
+            reconnect_backoff_factor: None,
+            reconnect_jitter_ms: None,
+            reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
+            idle_timeout_ms: None,
+            backend: TransportBackend::Tungstenite,
+            proxy_url: None,
+        }
+    }
 
     struct TestServer {
         task: JoinHandle<()>,
@@ -4747,6 +4835,227 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_header_provider_is_atomic_and_shared_by_manual_and_loss_reconnects() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (header_tx, mut header_rx) = mpsc::unbounded_channel();
+        let (close_second_tx, close_second_rx) = oneshot::channel();
+
+        let server_task = task::spawn(async move {
+            let mut held_connections = Vec::new();
+            let mut close_second_rx = Some(close_second_rx);
+            for connection_index in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let header_tx = header_tx.clone();
+                let mut websocket = accept_hdr_async(
+                    stream,
+                    move |request: &server::Request, response: server::Response| {
+                        let timestamp = request
+                            .headers()
+                            .get("x-attempt-timestamp")
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .to_string();
+                        let signature = request
+                            .headers()
+                            .get("x-attempt-signature")
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .to_string();
+                        header_tx.send((timestamp, signature)).unwrap();
+                        Ok(response)
+                    },
+                )
+                .await
+                .unwrap();
+
+                if connection_index == 1 {
+                    close_second_rx.take().unwrap().await.unwrap();
+                    websocket.close(None).await.unwrap();
+                } else {
+                    held_connections.push(websocket);
+                }
+            }
+            std::future::pending::<()>().await;
+        });
+
+        let credential_version = Arc::new(AtomicU64::new(1));
+        let credential_version_provider = Arc::clone(&credential_version);
+        let provider_calls = Arc::new(AtomicU64::new(0));
+        let provider_calls_callback = Arc::clone(&provider_calls);
+        let provider: ConnectionHeaderProvider = Arc::new(move || {
+            let call = provider_calls_callback.fetch_add(1, Ordering::SeqCst) + 1;
+            let version = credential_version_provider.load(Ordering::SeqCst);
+            let token = format!("{version}:{call}");
+            Ok(vec![
+                ("X-Attempt-Timestamp".to_string(), token.clone()),
+                ("X-Attempt-Signature".to_string(), format!("signed:{token}")),
+            ])
+        });
+        let (handler, _rx) = channel_message_handler();
+        let client = WebSocketClient::builder()
+            .config(provider_test_config(port))
+            .message_handler(handler)
+            .connection_header_provider(provider)
+            .connect()
+            .await
+            .unwrap();
+
+        let initial = header_rx.recv().await.unwrap();
+        assert_eq!(initial, ("1:1".to_string(), "signed:1:1".to_string()));
+
+        credential_version.store(2, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(client.is_active());
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert!(header_rx.try_recv().is_err());
+
+        assert!(client.request_reconnect());
+        let manual = tokio::time::timeout(PROVIDER_TEST_TIMEOUT, header_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(manual, ("2:2".to_string(), "signed:2:2".to_string()));
+        wait_until_async(|| async { client.is_active() }, PROVIDER_TEST_TIMEOUT).await;
+
+        credential_version.store(3, Ordering::SeqCst);
+        close_second_tx.send(()).unwrap();
+        let automatic = tokio::time::timeout(PROVIDER_TEST_TIMEOUT, header_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(automatic, ("3:3".to_string(), "signed:3:3".to_string()));
+        wait_until_async(|| async { client.is_active() }, PROVIDER_TEST_TIMEOUT).await;
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 3);
+
+        client.disconnect().await;
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn reconnect_backoff_precedes_each_new_header_provider_invocation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (rejected_tx, rejected_rx) = oneshot::channel();
+        let server_task = task::spawn(async move {
+            let (first_stream, _) = listener.accept().await.unwrap();
+            let first = accept_async(first_stream).await.unwrap();
+
+            for _ in 0..2 {
+                let (mut rejected_stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 1024];
+                    let read = rejected_stream.read(&mut chunk).await.unwrap();
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                rejected_stream
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+            rejected_tx.send(()).unwrap();
+
+            let (replacement_stream, _) = listener.accept().await.unwrap();
+            let replacement = accept_async(replacement_stream).await.unwrap();
+            let _held_connections = (first, replacement);
+            std::future::pending::<()>().await;
+        });
+
+        let provider_times = Arc::new(Mutex::new(Vec::new()));
+        let provider_times_callback = Arc::clone(&provider_times);
+        let provider_calls = Arc::new(AtomicU64::new(0));
+        let provider_calls_callback = Arc::clone(&provider_calls);
+        let provider: ConnectionHeaderProvider = Arc::new(move || {
+            let attempt = provider_calls_callback.fetch_add(1, Ordering::SeqCst) + 1;
+            provider_times_callback
+                .lock()
+                .push(std::time::Instant::now());
+            Ok(vec![("X-Attempt".to_string(), attempt.to_string())])
+        });
+        let (handler, _rx) = channel_message_handler();
+        let mut config = provider_test_config(port);
+        config.reconnect_delay_initial_ms = Some(200);
+        config.reconnect_delay_max_ms = Some(200);
+        config.reconnect_backoff_factor = Some(1.0);
+        config.reconnect_jitter_ms = Some(0);
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connection_header_provider(provider)
+            .connect()
+            .await
+            .unwrap();
+
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert!(client.request_reconnect());
+        tokio::time::timeout(PROVIDER_TEST_TIMEOUT, rejected_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 3);
+
+        wait_until_async(|| async { client.is_active() }, PROVIDER_TEST_TIMEOUT).await;
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 4);
+        let provider_times = provider_times.lock();
+        assert!(provider_times[3].duration_since(provider_times[2]) >= Duration::from_millis(175));
+
+        client.disconnect().await;
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn reconnect_header_provider_failure_exhausts_reconnect_policy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_task = task::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _initial = accept_async(stream).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let provider_calls = Arc::new(AtomicU64::new(0));
+        let provider_calls_callback = Arc::clone(&provider_calls);
+        let provider: ConnectionHeaderProvider = Arc::new(move || {
+            let call = provider_calls_callback.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                Ok(vec![("X-Attempt".to_string(), "initial".to_string())])
+            } else {
+                Err(TransportError::Other(
+                    "credential=must-not-appear".to_string(),
+                ))
+            }
+        });
+        let (handler, _rx) = channel_message_handler();
+        let mut config = provider_test_config(port);
+        config.reconnect_delay_initial_ms = Some(1);
+        config.reconnect_delay_max_ms = Some(1);
+        config.reconnect_backoff_factor = Some(1.0);
+        config.reconnect_jitter_ms = Some(0);
+        config.reconnect_max_attempts = Some(2);
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(handler)
+            .connection_header_provider(provider)
+            .connect()
+            .await
+            .unwrap();
+
+        assert!(client.request_reconnect());
+        wait_until_async(|| async { client.is_closed() }, PROVIDER_TEST_TIMEOUT).await;
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 3);
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
     async fn test_rate_limiter() {
         let server = TestServer::setup().await;
         let quota = Quota::per_second(NonZeroU32::new(2).unwrap()).unwrap();
@@ -4970,6 +5279,7 @@ mod rust_tests {
     #[case(TransportError::ProxyConnectRejected(429), true)]
     #[case(TransportError::ProxyConnectRejected(407), false)]
     #[case(TransportError::ConnectionClosed, true)]
+    #[case(TransportError::ConnectionHeaderProvider, true)]
     #[case(
         TransportError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
         true
@@ -4997,6 +5307,33 @@ mod rust_tests {
     #[case(TransportError::Handshake("malformed".to_string()), false)]
     fn initial_connect_error_classification(#[case] error: TransportError, #[case] expected: bool) {
         assert_eq!(is_retryable_initial_connect_error(&error), expected);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn connection_header_provider_failure_retries_and_exhausts_initial_policy() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_provider = Arc::clone(&calls);
+        let provider: ConnectionHeaderProvider = Arc::new(move || {
+            calls_provider.fetch_add(1, Ordering::SeqCst);
+            Err(TransportError::Other(
+                "credential=must-not-appear".to_string(),
+            ))
+        });
+        let (handler, _rx) = channel_message_handler();
+
+        let error = WebSocketClient::builder()
+            .config(reconnect_test_config(9))
+            .message_handler(handler)
+            .connection_header_provider(provider)
+            .initial_connect_retry_policy(initial_connect_retry_policy(3, 1))
+            .connect()
+            .await
+            .expect_err("provider should fail every attempt");
+
+        assert!(matches!(error, TransportError::ConnectionHeaderProvider));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(!error.to_string().contains("must-not-appear"));
     }
 
     async fn rejected_upgrade_attempts(
@@ -5389,8 +5726,8 @@ mod rust_tests {
             None,
             Some(rate_limit),
             InitialConnectOptions {
-                retry_policy: None,
                 cancellation_token: Some(token.clone()),
+                ..InitialConnectOptions::default()
             },
         );
         tokio::pin!(connect);

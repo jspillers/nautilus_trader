@@ -80,7 +80,8 @@ pub mod types;
 // Re-export main types for convenience
 pub use auth::AuthTracker;
 pub use client::{
-    ReconnectHeaders, WebSocketClient, WebSocketClientInner, WebSocketReconnectHandle,
+    ConnectionHeaderProvider, ReconnectHeaders, WebSocketClient, WebSocketClientInner,
+    WebSocketReconnectHandle,
 };
 pub use config::{InitialConnectRetryPolicy, TransportBackend, WebSocketConfig};
 pub use consts::{AUTHENTICATION_TIMEOUT_SECS, TEXT_PING, TEXT_PONG};
