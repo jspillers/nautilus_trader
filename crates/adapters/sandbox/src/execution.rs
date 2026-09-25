@@ -1097,22 +1097,36 @@ impl SandboxInner {
             return;
         }
 
-        let has_open_positions = self.cache.borrow().has_positions_open(
+        let cache = self.cache.borrow();
+        let has_open_positions = cache.has_positions_open(
             Some(&self.config.venue),
             Some(&instrument_id),
             None,
             None,
             None,
         );
+        let has_positions = cache.has_positions(
+            Some(&self.config.venue),
+            Some(&instrument_id),
+            None,
+            None,
+            None,
+        );
+        drop(cache);
 
         if has_open_positions {
             return;
         }
 
         self.matching_engines.remove(&instrument_id);
-        self.cache
-            .borrow_mut()
-            .purge_instrument_skip_order_guard(instrument_id);
+        // Closed positions and their snapshots remain part of portfolio accounting. Retire the
+        // heavier matching engine after settlement, but keep the instrument definition needed
+        // for realized-PnL calculation and persisted position readback.
+        if !has_positions {
+            self.cache
+                .borrow_mut()
+                .purge_instrument_skip_order_guard(instrument_id);
+        }
     }
 
     fn sync_expired_cleanup_many(&mut self, instrument_ids: &[InstrumentId]) {
