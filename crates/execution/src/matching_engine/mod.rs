@@ -3568,9 +3568,16 @@ impl OrderMatchingEngine {
                 .borrow_mut()
                 .add_order(order.clone(), None, None, false)
                 .is_err()
-                && let Err(e) = self.cache.borrow_mut().replace_order(order)
+                && let Some(mut cached_order) = self
+                    .cache
+                    .borrow_mut()
+                    .order_mut(&order.client_order_id())
             {
-                log::debug!("Failed to update order in cache: {e}");
+                // The accepted event above owns the order-state transition. With the live
+                // runner it is queued for the execution engine, so replacing the shared order
+                // here would pre-apply the acceptance and make that event invalid when the
+                // engine consumes it. Only the matching annotation is needed synchronously.
+                cached_order.set_liquidity_side(LiquiditySide::Taker);
             }
             self.fill_limit_order(order.client_order_id());
 

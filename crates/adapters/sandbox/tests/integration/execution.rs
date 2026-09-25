@@ -2691,6 +2691,21 @@ fn test_instrument_close_keeps_engine_until_position_closed(
     );
 
     assert_eq!(harness.client.matching_engine_count(), 0);
+    assert!(
+        harness
+            .cache
+            .borrow()
+            .instrument(&harness.instrument.id())
+            .is_some(),
+        "settled position accounting still requires the instrument definition",
+    );
+    assert!(harness.cache.borrow().has_positions(
+        Some(&venue),
+        Some(&harness.instrument.id()),
+        None,
+        None,
+        None,
+    ));
 
     harness.client.stop().unwrap();
 }
@@ -3176,7 +3191,14 @@ fn test_instrument_close_sync_cleanup_handles_synchronous_position_closed_reentr
         publish_expired_close(&test_clock, &instrument, Price::from("1.000"), 200);
 
         assert_eq!(client.matching_engine_count(), 0);
-        assert!(cache.borrow().instrument(&instrument.id()).is_none());
+        assert!(cache.borrow().instrument(&instrument.id()).is_some());
+        assert!(cache.borrow().has_positions_closed(
+            Some(&venue),
+            Some(&instrument.id()),
+            None,
+            Some(&account_id),
+            None,
+        ));
         client.stop().unwrap();
     })
     .join()
@@ -4927,6 +4949,12 @@ fn test_inbound_latency_public_quote_processing_drains_due_commands(
 
     let quote = create_quote_tick(instrument.id(), 2000.00, 2010.00);
     context.client.process_quote_tick(&quote).unwrap();
+
+    assert_eq!(
+        cached_status(&context.cache, &order),
+        OrderStatus::Submitted,
+        "the matcher must leave acceptance for the execution engine to apply",
+    );
 
     let kinds: Vec<(&str, ClientOrderId)> =
         apply_order_events_from_channel(&context.cache, &mut rx)
