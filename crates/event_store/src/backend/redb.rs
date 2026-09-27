@@ -168,6 +168,8 @@ impl RedbBackend {
     /// [`EventStore::append_batch`] with [`EventStoreError::Closed`] (the manifest is
     /// already sealed), and exposes every read path: [`EventStore::scan_range`],
     /// [`EventStore::scan_seq`], [`EventStore::lookup`], and [`EventStore::manifest`].
+    /// Opening reads metadata and the final entry key without decoding entry payloads;
+    /// scans and the verifier remain responsible for validating the consumed entries.
     ///
     /// # Errors
     ///
@@ -226,7 +228,20 @@ impl RedbBackend {
                 manifest.status,
             )));
         }
-        let (high_watermark, max_ts_init) = Self::compute_progress(&db)?;
+
+        // Sealed readers cannot append or re-seal, so the terminal manifest already
+        // supplies their maximum timestamp. Only writable crash recovery needs a scan.
+        let max_ts_init = manifest.end_ts_init.unwrap_or_default();
+        let high_watermark = {
+            let txn = db.begin_read().map_err(map_transaction_err)?;
+            let table = txn.open_table(ENTRIES_TABLE).map_err(map_table_err)?;
+
+            // Keep the actual table boundary even if forensic metadata disagrees
+            table
+                .last()
+                .map_err(map_storage_err)?
+                .map_or(0, |(key, _)| key.value())
+        };
 
         Ok(Self {
             base_dir: base,

@@ -745,6 +745,169 @@ fn seal_with_no_entries_leaves_end_ts_unset() {
 }
 
 #[rstest]
+#[case::ended(RunStatus::Ended)]
+#[case::crashed_recovered(RunStatus::CrashedRecovered)]
+#[case::quarantined(RunStatus::Quarantined)]
+fn sealed_open_preserves_manifest_and_nonmonotonic_entry_clocks(#[case] status: RunStatus) {
+    let (tmp, mut backend) = open_backend();
+    let entries = [
+        append_with(1, 10, Vec::new()),
+        append_with(2, 25, Vec::new()),
+        append_with(3, 17, Vec::new()),
+    ];
+    backend.append_batch(&entries).expect("append");
+    backend.seal(status).expect("seal");
+    let expected = backend.manifest().expect("manifest");
+    let path = backend.current_path().expect("path").to_path_buf();
+    drop(backend);
+    let before = std::fs::read(&path).expect("read file");
+
+    for reader in [
+        RedbBackend::open_sealed(tmp.path(), INSTANCE_ID, &expected.run_id).expect("open by id"),
+        RedbBackend::open_sealed_file(&path).expect("open by path"),
+    ] {
+        assert_eq!(reader.manifest().expect("manifest"), expected);
+        assert_eq!(reader.high_watermark().expect("watermark"), 3);
+        assert_eq!(expected.end_ts_init, Some(UnixNanos::from(25)));
+        let scanned = reader
+            .scan_range(1, 3, ScanDirection::Forward)
+            .expect("scan");
+        assert_eq!(
+            scanned,
+            entries
+                .iter()
+                .map(|item| item.entry.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(std::fs::read(&path).expect("read unchanged file"), before);
+}
+
+#[rstest]
+fn sealed_open_handles_empty_run_without_end_timestamp() {
+    let (_tmp, mut backend) = open_backend();
+    backend.seal(RunStatus::Ended).expect("seal");
+    let path = backend.current_path().expect("path").to_path_buf();
+    drop(backend);
+    let reader = RedbBackend::open_sealed_file(path).expect("open empty run");
+    assert_eq!(reader.high_watermark().expect("watermark"), 0);
+    assert_eq!(reader.manifest().expect("manifest").end_ts_init, None);
+    assert!(
+        reader
+            .scan_range(1, 1, ScanDirection::Forward)
+            .expect("scan")
+            .is_empty()
+    );
+}
+
+#[rstest]
+#[case::malformed("malformed")]
+#[case::hash_mismatch("hash")]
+#[case::gap("gap")]
+#[case::missing_tail("tail")]
+fn sealed_open_keeps_actual_boundary_and_scan_validation(#[case] corruption: &str) {
+    let (_tmp, mut backend) = open_backend();
+    backend
+        .append_batch(&[
+            append_with(1, 10, Vec::new()),
+            append_with(2, 25, Vec::new()),
+            append_with(3, 17, Vec::new()),
+        ])
+        .expect("append");
+    backend.seal(RunStatus::Ended).expect("seal");
+    let expected = backend.manifest().expect("manifest");
+    let path = backend.current_path().expect("path").to_path_buf();
+    drop(backend);
+    {
+        let db = redb::Database::open(&path).expect("open for tampering");
+        let txn = db.begin_write().expect("begin write");
+        {
+            let definition: redb::TableDefinition<u64, &[u8]> =
+                redb::TableDefinition::new("entries");
+            let mut table = txn.open_table(definition).expect("entries");
+
+            match corruption {
+                "malformed" => {
+                    table
+                        .insert(2, b"invalid-entry".as_slice())
+                        .expect("tamper");
+                }
+                "hash" => {
+                    let mut entry = build_entry(2, Headers::empty(), 25);
+                    entry.entry_hash = nautilus_event_store::EntryHash([0; 32]);
+                    let bytes = nautilus_event_store::codec::encode_to_vec(&entry).expect("encode");
+                    table.insert(2, bytes.as_slice()).expect("tamper");
+                }
+                "gap" => {
+                    table.remove(2).expect("remove middle");
+                }
+                "tail" => {
+                    table.remove(3).expect("remove tail");
+                }
+                _ => unreachable!(),
+            }
+        }
+        txn.commit().expect("commit tampering");
+    }
+    let reader = RedbBackend::open_sealed_file(&path).expect("open for forensics");
+    assert_eq!(reader.manifest().expect("manifest"), expected);
+    assert_eq!(
+        reader.high_watermark().expect("watermark"),
+        if corruption == "tail" { 2 } else { 3 }
+    );
+
+    if corruption == "tail" {
+        assert_eq!(
+            reader
+                .scan_range(1, 3, ScanDirection::Forward)
+                .expect("remaining rows")
+                .len(),
+            2
+        );
+        let report = nautilus_event_store::Verifier::new(Box::new(reader))
+            .verify()
+            .expect("verify truncated run");
+        assert!(report.findings.iter().any(|finding| matches!(
+            finding,
+            nautilus_event_store::VerifyFinding::ManifestMismatch {
+                kind: nautilus_event_store::ManifestField::HighWatermark,
+                ..
+            }
+        )));
+    } else {
+        let error = reader
+            .scan_seq(2)
+            .expect_err("consumed corruption must fail");
+        assert!(matches!(
+            (corruption, error),
+            ("malformed", EventStoreError::Corrupted(_))
+                | ("hash", EventStoreError::HashMismatch { seq: 2 })
+                | ("gap", EventStoreError::Gap { missing: 2, .. })
+        ));
+        assert!(reader.scan_range(1, 3, ScanDirection::Forward).is_err());
+    }
+}
+
+#[rstest]
+fn sealed_open_rejects_missing_manifest() {
+    let (_tmp, mut backend) = open_backend();
+    backend.seal(RunStatus::Ended).expect("seal");
+    let path = backend.current_path().expect("path").to_path_buf();
+    drop(backend);
+    {
+        let db = redb::Database::open(&path).expect("open for tampering");
+        let txn = db.begin_write().expect("begin write");
+        let definition: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("manifest");
+        txn.open_table(definition)
+            .expect("manifest")
+            .remove("current")
+            .expect("remove");
+        txn.commit().expect("commit tampering");
+    }
+    assert_corrupted(RedbBackend::open_sealed_file(path));
+}
+
+#[rstest]
 fn reopening_running_run_returns_crashed_predecessor_in_same_backend() {
     let (_tmp, mut backend) = fresh_backend();
     backend.open_run(manifest("run-1")).expect("open 1");
