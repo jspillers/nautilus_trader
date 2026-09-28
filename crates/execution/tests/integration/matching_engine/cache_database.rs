@@ -35,7 +35,7 @@ use nautilus_model::{
     },
     instruments::{InstrumentAny, SyntheticInstrument},
     orderbook::OrderBook,
-    orders::OrderAny,
+    orders::{Order, OrderAny},
     position::Position,
     types::{Currency, Money},
 };
@@ -47,6 +47,8 @@ struct FailNthAddOrderState {
     fail_add_order_on: Option<usize>,
     fail_index_order_position: bool,
     add_order_calls: usize,
+    accounts: AHashMap<AccountId, AccountAny>,
+    orders: AHashMap<ClientOrderId, OrderAny>,
     order_snapshots: Vec<OrderSnapshot>,
     position_snapshots: Vec<PositionSnapshot>,
 }
@@ -65,6 +67,20 @@ impl FailNthAddOrderDatabaseControl {
 
     pub(super) fn set_fail_index_order_position(&self, fail: bool) {
         self.state.lock().fail_index_order_position = fail;
+    }
+
+    pub(super) fn set_accounts(&self, accounts: impl IntoIterator<Item = AccountAny>) {
+        self.state.lock().accounts = accounts
+            .into_iter()
+            .map(|account| (account.id(), account))
+            .collect();
+    }
+
+    pub(super) fn set_orders(&self, orders: impl IntoIterator<Item = OrderAny>) {
+        self.state.lock().orders = orders
+            .into_iter()
+            .map(|order| (order.client_order_id(), order))
+            .collect();
     }
 
     #[allow(dead_code, reason = "used by the sibling exec_engine test module")]
@@ -106,7 +122,12 @@ impl CacheDatabaseAdapter for FailNthAddOrderDatabase {
     }
 
     async fn load_all(&self) -> anyhow::Result<CacheMap> {
-        Ok(CacheMap::default())
+        let state = self.control.state.lock();
+        Ok(CacheMap {
+            accounts: state.accounts.clone(),
+            orders: state.orders.clone(),
+            ..Default::default()
+        })
     }
 
     fn load(&self) -> anyhow::Result<AHashMap<String, Bytes>> {

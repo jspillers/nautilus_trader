@@ -257,7 +257,7 @@ impl AxDataClient {
                         break;
                     }
                     () = &mut sleep => {
-                        match http_client.request_instruments(None, None).await {
+                        match http_client.request_instruments().await {
                             Ok(instruments) => {
                                 for inst in &instruments {
                                     instruments_cache.insert(inst.symbol().inner(), inst.clone());
@@ -499,13 +499,13 @@ impl DataClient for AxDataClient {
 
             Some(credential)
         } else {
-            log::debug!("No Ax credentials configured, instruments will report zero fees");
+            log::debug!("No Ax credentials configured");
             None
         };
 
         let instruments = self
             .http_client
-            .request_instruments(None, None)
+            .request_instruments()
             .await
             .context("Failed to fetch instruments")?;
 
@@ -637,7 +637,7 @@ impl DataClient for AxDataClient {
     }
 
     fn subscribe_index_prices(&mut self, _cmd: SubscribeIndexPrices) -> anyhow::Result<()> {
-        log::warn!("Index prices not supported by AX Exchange");
+        log::warn!("Index price subscriptions are not supported by the Architect AX adapter");
         Ok(())
     }
 
@@ -868,7 +868,7 @@ impl DataClient for AxDataClient {
         let clock = self.clock;
 
         self.spawn_task(async move {
-            match http.request_instruments(None, None).await {
+            match http.request_instruments().await {
                 Ok(instruments) => {
                     if cancel.is_cancelled() {
                         return;
@@ -918,7 +918,7 @@ impl DataClient for AxDataClient {
         let clock = self.clock;
 
         self.spawn_task(async move {
-            match http.request_instrument(symbol, None, None).await {
+            match http.request_instrument(symbol).await {
                 Ok(instrument) => {
                     if cancel.is_cancelled() {
                         return;
@@ -1061,13 +1061,7 @@ impl DataClient for AxDataClient {
         let end_nanos = datetime_to_unix_nanos(end);
         let params = request.params;
         let clock = self.clock;
-        let width = match map_bar_spec_to_candle_width(&bar_type.spec()) {
-            Ok(w) => w,
-            Err(e) => {
-                log::error!("Failed to map bar type {bar_type}: {e}");
-                return Err(e);
-            }
-        };
+        let width = map_bar_spec_to_candle_width(&bar_type.spec())?;
 
         let cancel = self.cancellation_token.clone();
 
@@ -1409,10 +1403,7 @@ fn handle_md_message(
         AxMdMessage::Heartbeat(_) => {
             log::trace!("Received heartbeat");
         }
-        AxMdMessage::SubscriptionResponse(_) => {}
-        AxMdMessage::Error(error) => {
-            log::warn!("WebSocket error: {}", error.message);
-        }
+        AxMdMessage::SubscriptionResponse(_) | AxMdMessage::Error(_) => {}
     }
 }
 
@@ -1483,8 +1474,6 @@ mod tests {
             .size_increment(Quantity::from("1"))
             .margin_init(Decimal::new(1, 2))
             .margin_maint(Decimal::new(5, 3))
-            .maker_fee(Decimal::new(2, 4))
-            .taker_fee(Decimal::new(5, 4))
             .ts_event(UnixNanos::default())
             .ts_init(UnixNanos::default())
             .build()
@@ -1494,14 +1483,18 @@ mod tests {
 
     fn ticker_message(state: AxInstrumentState) -> AxMdTicker {
         AxMdTicker {
+            bp: None,
+            ap: None,
+            lst: None,
+            ef: None,
             ts: 1_700_000_000,
             tn: 0,
             s: Ustr::from("EURUSD-PERP"),
-            p: rust_decimal::Decimal::ZERO,
+            p: Some(rust_decimal::Decimal::ZERO),
             q: 0,
-            o: rust_decimal::Decimal::ZERO,
-            l: rust_decimal::Decimal::ZERO,
-            h: rust_decimal::Decimal::ZERO,
+            o: Some(rust_decimal::Decimal::ZERO),
+            l: Some(rust_decimal::Decimal::ZERO),
+            h: Some(rust_decimal::Decimal::ZERO),
             v: 0,
             oi: None,
             m: None,
@@ -1548,7 +1541,7 @@ mod tests {
         let mut instrument_states = AHashMap::new();
         let clock = get_atomic_clock_realtime();
 
-        let msg = AxMdMessage::Ticker(ticker_message(AxInstrumentState::Open));
+        let msg = AxMdMessage::Ticker(Box::new(ticker_message(AxInstrumentState::Open)));
         handle_md_message(
             msg.clone(),
             &tx.clone().into(),
@@ -1605,7 +1598,7 @@ mod tests {
         let clock = get_atomic_clock_realtime();
 
         handle_md_message(
-            AxMdMessage::Ticker(ticker_message(AxInstrumentState::Open)),
+            AxMdMessage::Ticker(Box::new(ticker_message(AxInstrumentState::Open))),
             &tx.clone().into(),
             &instruments,
             &sdt,
@@ -1615,7 +1608,7 @@ mod tests {
             clock,
         );
         handle_md_message(
-            AxMdMessage::Ticker(ticker_message(AxInstrumentState::Closed)),
+            AxMdMessage::Ticker(Box::new(ticker_message(AxInstrumentState::Closed))),
             &tx.into(),
             &instruments,
             &sdt,
@@ -1655,7 +1648,7 @@ mod tests {
         let clock = get_atomic_clock_realtime();
 
         handle_md_message(
-            AxMdMessage::Ticker(ticker_message(AxInstrumentState::Open)),
+            AxMdMessage::Ticker(Box::new(ticker_message(AxInstrumentState::Open))),
             &tx.into(),
             &instruments,
             &sdt,

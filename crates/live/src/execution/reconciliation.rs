@@ -38,7 +38,7 @@ use nautilus_common::{
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_execution::reconciliation::{
     create_inferred_reconciliation_trade_id, create_position_reconciliation_venue_order_id,
-    should_reconciliation_update,
+    is_inferred_reconciliation_trade_id_format, should_reconciliation_update,
 };
 use nautilus_model::{
     enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce},
@@ -61,7 +61,6 @@ use rust_decimal::Decimal;
 /// throttles, venue report lookups) so that multiple accounts holding the same
 /// instrument do not share the same tracking entry.
 pub type InstrumentAccountKey = (InstrumentId, AccountId);
-pub(super) type AccountInstrumentKey = (AccountId, InstrumentId);
 pub(super) type AccountInstrumentStrategyKey = (AccountId, InstrumentId, StrategyId);
 pub(super) type FillKey = (AccountId, InstrumentId, TradeId);
 
@@ -86,13 +85,15 @@ pub struct ExternalOrderMetadata {
     pub ts_init: UnixNanos,
 }
 
-/// Result of reconciliation containing events and external order metadata.
+/// Result of reconciliation containing events, external orders, and unresolved position diagnostics.
 #[derive(Debug, Default)]
 pub struct ReconciliationResult {
     /// Order events generated during reconciliation.
     pub events: Vec<OrderEventAny>,
     /// External orders that need to be registered with execution clients.
     pub external_orders: Vec<ExternalOrderMetadata>,
+    /// Diagnostics for in-scope nonzero venue positions unrecovered after event processing.
+    pub unresolved_positions: Vec<String>,
 }
 
 /// Result of inflight order checks containing terminal events and intermediate queries.
@@ -184,13 +185,15 @@ pub struct PositionFillReportPlan {
     pub discrepancy_keys: IndexSet<InstrumentAccountKey>,
 }
 
-/// Whether a fill is attributable and free of active inferred-fill overlap.
+/// Whether a fill is attributable and free of inferred-fill or reconciled-position overlap.
 #[derive(Debug)]
 pub enum PositionFillReportPreparation {
     /// The report can be applied to the cached execution state.
     Ready,
     /// An active inferred fill prevents authoritative replay.
     InferredOverlap,
+    /// A position reconciled from a venue position report already includes the fill.
+    SnapshotOverlap,
     /// A hedge fill cannot be assigned to an unambiguous position.
     Unattributed,
 }
@@ -235,19 +238,6 @@ pub(super) struct RetainedFillState {
     pub(super) missing_order_ids: IndexSet<(AccountId, InstrumentId, ClientOrderId)>,
     pub(super) missing_venue_order_ids: IndexSet<(AccountId, InstrumentId, VenueOrderId)>,
     pub(super) netting_lifecycle_starts: IndexMap<AccountInstrumentStrategyKey, UnixNanos>,
-}
-
-/// Historical fills grouped for a synthetic reconciliation order.
-pub(super) struct HistoricalFillGroup {
-    pub(super) venue_order_id: VenueOrderId,
-    pub(super) account_id: AccountId,
-    pub(super) instrument_id: InstrumentId,
-    pub(super) strategy_id: StrategyId,
-    pub(super) order_side: OrderSide,
-    pub(super) quantity: Decimal,
-    pub(super) reduce_only: bool,
-    pub(super) ts_event: UnixNanos,
-    pub(super) ts_last: UnixNanos,
 }
 
 /// Tracks pending fill identities and their generated reconciliation events.
@@ -569,11 +559,11 @@ pub(super) fn should_project_fill(
     fill: &OrderFilled,
     retained_fill_state: &RetainedFillState,
     reported_fill_keys: &IndexSet<FillKey>,
-    order_only_venue_order_ids: &IndexSet<VenueOrderId>,
+    order_only_ids: &IndexSet<VenueOrderId>,
 ) -> bool {
     let fill_key = (fill.account_id, fill.instrument_id, fill.trade_id);
     if retained_fill_state.fill_keys.contains(&fill_key)
-        || order_only_venue_order_ids.contains(&fill.venue_order_id)
+        || order_only_ids.contains(&fill.venue_order_id)
     {
         return true;
     }
@@ -598,14 +588,63 @@ pub(super) fn should_project_fill(
         .is_some_and(|ts_opened| fill.ts_event < *ts_opened)
 }
 
+/// Sorts reconciliation events by event time while keeping each venue order's lifecycle events
+/// ahead of the fills generated after them.
+///
+/// Fills sort by their own event time. A report's acceptance time can postdate its own
+/// fills when the venue reports a last update time or the adapter uses the reconciliation time,
+/// so any other event sorts no later than the earliest fill that follows it for the same client
+/// and venue order. Events of other venue orders, including a replaced order that shares the
+/// client order ID, keep their own times.
+pub(super) fn sort_reconciliation_events(events: &mut Vec<OrderEventAny>) {
+    let mut earliest_later_fill: IndexMap<(ClientOrderId, Option<VenueOrderId>), UnixNanos> =
+        IndexMap::new();
+    let mut keys = vec![UnixNanos::default(); events.len()];
+
+    for (index, event) in events.iter().enumerate().rev() {
+        let venue_order = (event.client_order_id(), event.venue_order_id());
+        let ts_event = event.ts_event();
+
+        keys[index] = if matches!(event, OrderEventAny::Filled(_)) {
+            let earliest = earliest_later_fill.entry(venue_order).or_insert(ts_event);
+            *earliest = (*earliest).min(ts_event);
+            ts_event
+        } else {
+            earliest_later_fill
+                .get(&venue_order)
+                .map_or(ts_event, |fill_ts| ts_event.min(*fill_ts))
+        };
+    }
+
+    let mut keyed: Vec<(UnixNanos, OrderEventAny)> =
+        keys.into_iter().zip(events.drain(..)).collect();
+    keyed.sort_by_key(|(key, _)| *key);
+    events.extend(keyed.into_iter().map(|(_, event)| event));
+}
+
 /// Checks active fill history for deterministic inferred reconciliation IDs.
+///
+/// Replays the order only when an active reconciliation fill has the inferred ID format.
 ///
 /// # Errors
 ///
-/// Returns an error if the cached order history cannot be replayed.
+/// Returns an error if the order requires replay and its cached history cannot be replayed.
 pub(super) fn has_active_inferred_fill(order: &OrderAny) -> anyhow::Result<bool> {
     let events = order.events();
     let trade_ids = order.trade_ids();
+
+    let is_candidate = |fill: &OrderFilled| {
+        fill.reconciliation
+            && is_inferred_reconciliation_trade_id_format(&fill.trade_id)
+            && trade_ids.contains(&&fill.trade_id)
+    };
+
+    if !events
+        .iter()
+        .any(|event| matches!(event, OrderEventAny::Filled(fill) if is_candidate(fill)))
+    {
+        return Ok(false);
+    }
 
     let Some((first, remaining)) = events.split_first() else {
         return Ok(false);
@@ -630,7 +669,7 @@ pub(super) fn has_active_inferred_fill(order: &OrderAny) -> anyhow::Result<bool>
             continue;
         };
 
-        if !fill.reconciliation || !trade_ids.contains(&&fill.trade_id) {
+        if !is_candidate(fill) {
             continue;
         }
 
@@ -762,6 +801,34 @@ pub(super) fn position_qty_aggregates(
     )
 }
 
+/// Returns the reports without duplicates, logging a warning for each one removed.
+///
+/// Reports are duplicates when they match apart from the locally assigned report ID and
+/// initialization timestamp. Keeps the first occurrence of each report in input order.
+pub(super) fn distinct_position_reports(
+    reports: Vec<PositionStatusReport>,
+) -> Vec<PositionStatusReport> {
+    let mut distinct_reports: Vec<PositionStatusReport> = Vec::with_capacity(reports.len());
+
+    for report in reports {
+        let is_duplicate = distinct_reports.iter().any(|distinct| {
+            let mut normalized = distinct.clone();
+            normalized.report_id = report.report_id;
+            normalized.ts_init = report.ts_init;
+            normalized == report
+        });
+
+        if is_duplicate {
+            log::warn!("Duplicate position report for {}", report.instrument_id);
+            continue;
+        }
+
+        distinct_reports.push(report);
+    }
+
+    distinct_reports
+}
+
 /// Builds a filled market-order report for one leg of a position reversal.
 ///
 /// Returns `None` if the quantity cannot be represented at instrument precision.
@@ -825,7 +892,7 @@ pub(super) mod tests {
     use nautilus_execution::reconciliation::inferred_fill_price_and_liquidity;
     use nautilus_model::{
         accounts::AccountAny,
-        enums::OmsType,
+        enums::{OmsType, PositionSide},
         identifiers::Venue,
         instruments::stubs::crypto_perpetual_ethusdt,
         orders::{OrderTestBuilder, stubs::TestOrderEventStubs},
@@ -836,6 +903,48 @@ pub(super) mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_targeted_reports_missing_client_marks_coverage_incomplete(
+        #[values(false, true)] missing_first: bool,
+    ) {
+        let client = CommissionStubClient::new(CommissionOutcome::NoOverride);
+        let missing_id = ClientId::from("MISSING");
+        let mut responsible_clients = vec![client.client_id(), missing_id];
+
+        if missing_first {
+            responsible_clients.reverse();
+        }
+
+        let client_order_id = ClientOrderId::from("O-MISSING-CLIENT");
+
+        let query = TargetedOrderQuery {
+            client_order_id,
+            responsible_clients: responsible_clients.into_iter().collect(),
+            command: GenerateOrderStatusReport::new(
+                UUID4::new(),
+                UnixNanos::from(123),
+                Some(InstrumentId::from("ETHUSDT-PERP.BINANCE")),
+                Some(client_order_id),
+                Some(VenueOrderId::from("V-MISSING-CLIENT")),
+                None,
+                None,
+            ),
+            report: None,
+            filled_qty: Quantity::from("0.0"),
+        };
+
+        let results = request_targeted_order_reports(vec![query], &[&client], Duration::ZERO).await;
+
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        assert_eq!(result.client_order_id, client_order_id);
+        assert_eq!(result.client_id, None);
+        assert_eq!(result.report, None);
+        assert!(result.fills.is_empty());
+        assert!(!result.coverage_complete);
+    }
 
     /// Configured result of a stub commission calculation.
     #[derive(Clone)]
@@ -1042,6 +1151,7 @@ pub(super) mod tests {
     fn test_create_orphan_fill_order_report_rejects_aggregate_quantity_overflow() {
         let (instrument, mut fills) = orphan_fill_fixtures();
         let max_qty = Quantity::new(QUANTITY_MAX, 0);
+
         for fill in &mut fills {
             fill.last_qty = max_qty;
             fill.last_px = Price::from("1.00");
@@ -1084,6 +1194,43 @@ pub(super) mod tests {
             .collect();
 
         (instrument, fills)
+    }
+
+    #[rstest]
+    #[case::venue_format("T-VENUE-1")]
+    #[case::uuid_v5_format("2d89666b-1a1e-5a75-b193-4eb3b454c757")]
+    fn test_has_active_inferred_fill_ignores_venue_trade_ids(#[case] trade_id: &str) {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let mut order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .build();
+        let submitted = TestOrderEventStubs::submitted(&order, AccountId::from("TEST-001"));
+        order.apply(submitted).unwrap();
+
+        let trade_id = TradeId::from(trade_id);
+
+        let OrderEventAny::Filled(mut fill) = TestOrderEventStubs::filled(
+            &order,
+            &instrument,
+            Some(trade_id),
+            None,
+            Some(Price::from("100.00")),
+            Some(Quantity::from("1.000")),
+            None,
+            None,
+            None,
+            None,
+        ) else {
+            unreachable!();
+        };
+
+        fill.reconciliation = true;
+        order.apply(OrderEventAny::Filled(fill)).unwrap();
+
+        assert!(order.trade_ids().contains(&&trade_id));
+        assert!(!has_active_inferred_fill(&order).unwrap());
     }
 
     #[rstest]
@@ -1418,6 +1565,53 @@ pub(super) mod tests {
 
     proptest! {
         #[rstest]
+        fn prop_position_quantities_match_tolerance_and_side_exposure(
+            long in 100i64..1_000_000,
+            short in 100i64..1_000_000,
+            long_delta in -10i64..=10,
+            short_delta in -10i64..=10,
+            tolerance in 0i64..=20,
+            scale in 0u32..=6,
+            side_reports in any::<bool>(),
+        ) {
+            let venue_net = long + long_delta - short - short_delta;
+            let (venue_long, venue_short) = if side_reports {
+                (long + long_delta, short + short_delta)
+            } else {
+                (venue_net.max(0), (-venue_net).max(0))
+            };
+            let comparison = PositionQuantityComparison {
+                cached_positions: Vec::new(),
+                cached_signed_qty: Decimal::new(long - short, scale),
+                cached_long_qty: Decimal::new(long, scale),
+                cached_short_qty: Decimal::new(short, scale),
+                venue_signed_qty: Decimal::new(venue_net, scale),
+                venue_long_qty: Decimal::new(venue_long, scale),
+                venue_short_qty: Decimal::new(venue_short, scale),
+                nonflat_count: if side_reports { 2 } else { 1 },
+                venue_report: None,
+                venue_has_side_reports: side_reports,
+            };
+            let mut largest_error = (long_delta - short_delta).abs();
+
+            if side_reports {
+                largest_error = largest_error.max(long_delta.abs()).max(short_delta.abs());
+            }
+
+            prop_assert_eq!(
+                comparison.quantities_match(Decimal::new(tolerance, scale)),
+                largest_error <= tolerance,
+            );
+            prop_assert!(comparison.quantities_match(Decimal::new(largest_error, scale)));
+
+            if largest_error > 0 {
+                prop_assert!(!comparison.quantities_match(Decimal::new(largest_error - 1, scale)));
+            }
+        }
+    }
+
+    proptest! {
+        #[rstest]
         fn prop_position_qty_aggregates_preserves_sign_and_net(
             values in proptest::collection::vec(-1_000_000i64..=1_000_000, 0..32),
         ) {
@@ -1432,5 +1626,187 @@ pub(super) mod tests {
             prop_assert!(short >= Decimal::ZERO);
             prop_assert_eq!(reversed, (-net, short, long));
         }
+    }
+
+    #[rstest]
+    fn test_distinct_position_reports_removes_non_adjacent_duplicates() {
+        let report = |side: PositionSide, quantity: &str, venue_position_id: &str, ts_init: u64| {
+            PositionStatusReport::new(
+                AccountId::from("BINANCE-001"),
+                InstrumentId::from("ETHUSDT-PERP.BINANCE"),
+                side,
+                Quantity::from(quantity),
+                UnixNanos::from(1_000),
+                UnixNanos::from(ts_init),
+                None,
+                Some(PositionId::from(venue_position_id)),
+                Some(dec!(3000)),
+            )
+        };
+
+        let long = report(PositionSide::Long, "2.0", "P-LONG", 2_000);
+        let short = report(PositionSide::Short, "3.0", "P-SHORT", 2_001);
+        let long_duplicate = report(PositionSide::Long, "2.0", "P-LONG", 2_002);
+        let short_duplicate = report(PositionSide::Short, "3.0", "P-SHORT", 2_003);
+
+        let result = distinct_position_reports(vec![
+            long.clone(),
+            short.clone(),
+            long_duplicate,
+            short_duplicate,
+        ]);
+
+        assert_eq!(result, vec![long, short]);
+    }
+
+    #[rstest]
+    fn test_sort_reconciliation_events_accepts_before_earlier_fills() {
+        let first = market_order("O-FIRST", OrderSide::Buy);
+        let second = market_order("O-SECOND", OrderSide::Sell);
+        let mut events = vec![
+            accepted_at(&second, "V-SECOND", 900),
+            filled_at(&second, "V-SECOND", "T-SECOND", 200),
+            accepted_at(&first, "V-FIRST", 900),
+            filled_at(&first, "V-FIRST", "T-FIRST", 100),
+            canceled_at(&first, "V-FIRST", 950),
+        ];
+
+        sort_reconciliation_events(&mut events);
+
+        assert_eq!(
+            event_sequence(&events),
+            vec![
+                "O-FIRST V-FIRST accepted",
+                "O-FIRST V-FIRST filled",
+                "O-SECOND V-SECOND accepted",
+                "O-SECOND V-SECOND filled",
+                "O-FIRST V-FIRST canceled",
+            ]
+        );
+    }
+
+    #[rstest]
+    fn test_sort_reconciliation_events_keeps_other_venue_order_fill_times() {
+        let order = market_order("O-REPLACED", OrderSide::Buy);
+        let mut events = vec![
+            accepted_at(&order, "V-NEW", 900),
+            filled_at(&order, "V-NEW", "T-NEW", 950),
+            filled_at(&order, "V-OLD", "T-OLD", 100),
+        ];
+
+        sort_reconciliation_events(&mut events);
+
+        assert_eq!(
+            event_sequence(&events),
+            vec![
+                "O-REPLACED V-OLD filled",
+                "O-REPLACED V-NEW accepted",
+                "O-REPLACED V-NEW filled",
+            ]
+        );
+    }
+
+    #[rstest]
+    fn test_sort_reconciliation_events_keeps_fills_after_earlier_terminal_time() {
+        let canceled_order = market_order("O-CANCELED", OrderSide::Buy);
+        let filled_order = market_order("O-FILLED", OrderSide::Sell);
+        let mut events = vec![
+            accepted_at(&canceled_order, "V-CANCELED", 100),
+            filled_at(&canceled_order, "V-CANCELED", "T-CANCELED", 500),
+            canceled_at(&canceled_order, "V-CANCELED", 100),
+            accepted_at(&filled_order, "V-FILLED", 200),
+            filled_at(&filled_order, "V-FILLED", "T-FILLED", 300),
+        ];
+
+        sort_reconciliation_events(&mut events);
+
+        assert_eq!(
+            event_sequence(&events),
+            vec![
+                "O-CANCELED V-CANCELED accepted",
+                "O-CANCELED V-CANCELED canceled",
+                "O-FILLED V-FILLED accepted",
+                "O-FILLED V-FILLED filled",
+                "O-CANCELED V-CANCELED filled",
+            ]
+        );
+    }
+
+    fn market_order(client_order_id: &str, side: OrderSide) -> OrderAny {
+        OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(crypto_perpetual_ethusdt().id())
+            .client_order_id(ClientOrderId::from(client_order_id))
+            .side(side)
+            .quantity(Quantity::from("1.000"))
+            .build()
+    }
+
+    fn accepted_at(order: &OrderAny, venue_order_id: &str, ts: u64) -> OrderEventAny {
+        let mut event = TestOrderEventStubs::accepted(
+            order,
+            AccountId::from("SIM-001"),
+            VenueOrderId::from(venue_order_id),
+        );
+
+        if let OrderEventAny::Accepted(accepted) = &mut event {
+            accepted.ts_event = UnixNanos::from(ts);
+        }
+
+        event
+    }
+
+    fn filled_at(order: &OrderAny, venue_order_id: &str, trade_id: &str, ts: u64) -> OrderEventAny {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let mut event = TestOrderEventStubs::filled(
+            order,
+            &instrument,
+            Some(TradeId::from(trade_id)),
+            None,
+            Some(Price::from("100.00")),
+            Some(Quantity::from("1.000")),
+            None,
+            None,
+            Some(UnixNanos::from(ts)),
+            Some(AccountId::from("SIM-001")),
+        );
+
+        if let OrderEventAny::Filled(filled) = &mut event {
+            filled.venue_order_id = VenueOrderId::from(venue_order_id);
+        }
+
+        event
+    }
+
+    fn canceled_at(order: &OrderAny, venue_order_id: &str, ts: u64) -> OrderEventAny {
+        let mut event = TestOrderEventStubs::canceled(
+            order,
+            AccountId::from("SIM-001"),
+            Some(VenueOrderId::from(venue_order_id)),
+        );
+
+        if let OrderEventAny::Canceled(canceled) = &mut event {
+            canceled.ts_event = UnixNanos::from(ts);
+        }
+
+        event
+    }
+
+    fn event_sequence(events: &[OrderEventAny]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| {
+                let kind = match event {
+                    OrderEventAny::Accepted(_) => "accepted",
+                    OrderEventAny::Filled(_) => "filled",
+                    OrderEventAny::Canceled(_) => "canceled",
+                    _ => "other",
+                };
+                let venue_order_id = event
+                    .venue_order_id()
+                    .expect("test events carry a venue order ID");
+
+                format!("{} {venue_order_id} {kind}", event.client_order_id())
+            })
+            .collect()
     }
 }

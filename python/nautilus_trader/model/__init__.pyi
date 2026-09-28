@@ -280,6 +280,8 @@ class BettingAccount:
         last_qty: Quantity,
         last_px: Price,
         liquidity_side: LiquiditySide,
+        maker_rate: decimal.Decimal,
+        taker_rate: decimal.Decimal,
         use_quote_for_inverse: bool | None = None,
     ) -> Money: ...
     def calculate_pnls(
@@ -349,8 +351,6 @@ class BettingInstrument:
         min_price: Price | None = None,
         margin_init: decimal.Decimal | None = None,
         margin_maint: decimal.Decimal | None = None,
-        maker_fee: decimal.Decimal | None = None,
-        taker_fee: decimal.Decimal | None = None,
         tick_scheme: str | None = None,
         info: dict | None = None,
     ) -> None: ...
@@ -420,10 +420,6 @@ class BettingInstrument:
     @property
     def min_price(self) -> Price | None: ...
     @property
-    def maker_fee(self) -> decimal.Decimal: ...
-    @property
-    def taker_fee(self) -> decimal.Decimal: ...
-    @property
     def info(self) -> dict: ...
     @property
     def ts_event(self) -> int: ...
@@ -492,8 +488,6 @@ class BinaryOption:
         min_price: Price | None = None,
         margin_init: decimal.Decimal | None = None,
         margin_maint: decimal.Decimal | None = None,
-        maker_fee: decimal.Decimal | None = None,
-        taker_fee: decimal.Decimal | None = None,
         tick_scheme: str | None = None,
         info: dict | None = None,
         event_id: str | None = None,
@@ -543,10 +537,6 @@ class BinaryOption:
     def margin_init(self) -> decimal.Decimal: ...
     @property
     def margin_maint(self) -> decimal.Decimal: ...
-    @property
-    def maker_fee(self) -> decimal.Decimal: ...
-    @property
-    def taker_fee(self) -> decimal.Decimal: ...
     @property
     def info(self) -> dict: ...
     @property
@@ -724,6 +714,8 @@ class CashAccount:
         last_qty: Quantity,
         last_px: Price,
         liquidity_side: LiquiditySide,
+        maker_rate: decimal.Decimal,
+        taker_rate: decimal.Decimal,
         use_quote_for_inverse: bool | None = None,
     ) -> Money: ...
     def calculate_pnls(
@@ -771,8 +763,6 @@ class Cfd:
         min_price: Price | None = None,
         margin_init: decimal.Decimal | None = None,
         margin_maint: decimal.Decimal | None = None,
-        maker_fee: decimal.Decimal | None = None,
-        taker_fee: decimal.Decimal | None = None,
         tick_scheme: str | None = None,
         info: dict | None = None,
     ) -> None: ...
@@ -815,10 +805,6 @@ class Cfd:
     def margin_init(self) -> decimal.Decimal: ...
     @property
     def margin_maint(self) -> decimal.Decimal: ...
-    @property
-    def maker_fee(self) -> decimal.Decimal: ...
-    @property
-    def taker_fee(self) -> decimal.Decimal: ...
     @property
     def ts_event(self) -> int: ...
     @property
@@ -901,8 +887,6 @@ class Commodity:
         min_price: Price | None = None,
         margin_init: decimal.Decimal | None = None,
         margin_maint: decimal.Decimal | None = None,
-        maker_fee: decimal.Decimal | None = None,
-        taker_fee: decimal.Decimal | None = None,
         tick_scheme: str | None = None,
         info: dict | None = None,
     ) -> None: ...
@@ -943,10 +927,6 @@ class Commodity:
     def margin_init(self) -> decimal.Decimal: ...
     @property
     def margin_maint(self) -> decimal.Decimal: ...
-    @property
-    def maker_fee(self) -> decimal.Decimal: ...
-    @property
-    def taker_fee(self) -> decimal.Decimal: ...
     @property
     def ts_event(self) -> int: ...
     @property
@@ -1024,8 +1004,6 @@ class CryptoFuture:
         min_price: Price | None = None,
         margin_init: decimal.Decimal | None = None,
         margin_maint: decimal.Decimal | None = None,
-        maker_fee: decimal.Decimal | None = None,
-        taker_fee: decimal.Decimal | None = None,
         tick_scheme: str | None = None,
         info: dict | None = None,
     ) -> None: ...
@@ -1076,10 +1054,6 @@ class CryptoFuture:
     def margin_init(self) -> decimal.Decimal: ...
     @property
     def margin_maint(self) -> decimal.Decimal: ...
-    @property
-    def maker_fee(self) -> decimal.Decimal: ...
-    @property
-    def taker_fee(self) -> decimal.Decimal: ...
     @property
     def info(self) -> dict: ...
     @property
@@ -1146,8 +1120,6 @@ class CryptoFuturesSpread:
         min_price: Price | None = None,
         margin_init: decimal.Decimal | None = None,
         margin_maint: decimal.Decimal | None = None,
-        maker_fee: decimal.Decimal | None = None,
-        taker_fee: decimal.Decimal | None = None,
         tick_scheme: str | None = None,
         info: dict | None = None,
     ) -> None: ...
@@ -1200,10 +1172,6 @@ class CryptoFuturesSpread:
     def margin_init(self) -> decimal.Decimal: ...
     @property
     def margin_maint(self) -> decimal.Decimal: ...
-    @property
-    def maker_fee(self) -> decimal.Decimal: ...
-    @property
-    def taker_fee(self) -> decimal.Decimal: ...
     @property
     def info(self) -> dict: ...
     @property
@@ -1271,8 +1239,6 @@ class CryptoOption:
         min_price: Price | None = None,
         margin_init: decimal.Decimal | None = None,
         margin_maint: decimal.Decimal | None = None,
-        maker_fee: decimal.Decimal | None = None,
-        taker_fee: decimal.Decimal | None = None,
         tick_scheme: str | None = None,
         info: dict | None = None,
     ) -> None: ...
@@ -1327,10 +1293,6 @@ class CryptoOption:
     def margin_init(self) -> decimal.Decimal: ...
     @property
     def margin_maint(self) -> decimal.Decimal: ...
-    @property
-    def maker_fee(self) -> decimal.Decimal: ...
-    @property
-    def taker_fee(self) -> decimal.Decimal: ...
     @property
     def info(self) -> dict: ...
     @property
@@ -1397,8 +1359,6 @@ class CryptoOptionSpread:
         min_price: Price | None = None,
         margin_init: decimal.Decimal | None = None,
         margin_maint: decimal.Decimal | None = None,
-        maker_fee: decimal.Decimal | None = None,
-        taker_fee: decimal.Decimal | None = None,
         tick_scheme: str | None = None,
         info: dict | None = None,
     ) -> None: ...
@@ -1451,10 +1411,6 @@ class CryptoOptionSpread:
     def margin_init(self) -> decimal.Decimal: ...
     @property
     def margin_maint(self) -> decimal.Decimal: ...
-    @property
-    def maker_fee(self) -> decimal.Decimal: ...
-    @property
-    def taker_fee(self) -> decimal.Decimal: ...
     @property
     def info(self) -> dict: ...
     @property
@@ -1514,8 +1470,6 @@ class CryptoPerpetual:
         min_price: Price | None = None,
         margin_init: decimal.Decimal | None = None,
         margin_maint: decimal.Decimal | None = None,
-        maker_fee: decimal.Decimal | None = None,
-        taker_fee: decimal.Decimal | None = None,
         tick_scheme: str | None = None,
         info: dict | None = None,
     ) -> None: ...
@@ -1566,10 +1520,6 @@ class CryptoPerpetual:
     def margin_init(self) -> decimal.Decimal: ...
     @property
     def margin_maint(self) -> decimal.Decimal: ...
-    @property
-    def maker_fee(self) -> decimal.Decimal: ...
-    @property
-    def taker_fee(self) -> decimal.Decimal: ...
     @property
     def info(self) -> dict: ...
     @staticmethod
@@ -1656,8 +1606,6 @@ class CurrencyPair:
         min_price: Price | None = None,
         margin_init: decimal.Decimal | None = None,
         margin_maint: decimal.Decimal | None = None,
-        maker_fee: decimal.Decimal | None = None,
-        taker_fee: decimal.Decimal | None = None,
         tick_scheme: str | None = None,
         info: dict | None = None,
     ) -> None: ...
@@ -1696,10 +1644,6 @@ class CurrencyPair:
     def max_price(self) -> Price | None: ...
     @property
     def min_price(self) -> Price | None: ...
-    @property
-    def maker_fee(self) -> decimal.Decimal: ...
-    @property
-    def taker_fee(self) -> decimal.Decimal: ...
     @property
     def margin_maint(self) -> decimal.Decimal: ...
     @property
@@ -1743,6 +1687,8 @@ class DataType:
     def __init__(
         self, type_name: str, metadata: dict | None = None, identifier: str | None = None
     ) -> None: ...
+    @staticmethod
+    def from_str(s: str) -> DataType: ...
     def __hash__(self) -> int: ...
     @property
     def type_name(self) -> str: ...
@@ -1797,8 +1743,6 @@ class Equity:
         min_price: Price | None = None,
         margin_init: decimal.Decimal | None = None,
         margin_maint: decimal.Decimal | None = None,
-        maker_fee: decimal.Decimal | None = None,
-        taker_fee: decimal.Decimal | None = None,
         tick_scheme: str | None = None,
         info: dict | None = None,
     ) -> None: ...
@@ -1835,10 +1779,6 @@ class Equity:
     def margin_init(self) -> decimal.Decimal: ...
     @property
     def margin_maint(self) -> decimal.Decimal: ...
-    @property
-    def maker_fee(self) -> decimal.Decimal: ...
-    @property
-    def taker_fee(self) -> decimal.Decimal: ...
     @property
     def ts_event(self) -> int: ...
     @property
@@ -2051,8 +1991,6 @@ class FuturesContract:
         min_price: Price | None = None,
         margin_init: decimal.Decimal | None = None,
         margin_maint: decimal.Decimal | None = None,
-        maker_fee: decimal.Decimal | None = None,
-        taker_fee: decimal.Decimal | None = None,
         exchange: str | None = None,
         tick_scheme: str | None = None,
         info: dict | None = None,
@@ -2104,10 +2042,6 @@ class FuturesContract:
     def margin_init(self) -> decimal.Decimal: ...
     @property
     def margin_maint(self) -> decimal.Decimal: ...
-    @property
-    def maker_fee(self) -> decimal.Decimal: ...
-    @property
-    def taker_fee(self) -> decimal.Decimal: ...
     @property
     def info(self) -> dict: ...
     @staticmethod
@@ -2171,8 +2105,6 @@ class FuturesSpread:
         min_price: Price | None = None,
         margin_init: decimal.Decimal | None = None,
         margin_maint: decimal.Decimal | None = None,
-        maker_fee: decimal.Decimal | None = None,
-        taker_fee: decimal.Decimal | None = None,
         exchange: str | None = None,
         tick_scheme: str | None = None,
         info: dict | None = None,
@@ -2222,10 +2154,6 @@ class FuturesSpread:
     def margin_init(self) -> decimal.Decimal: ...
     @property
     def margin_maint(self) -> decimal.Decimal: ...
-    @property
-    def maker_fee(self) -> decimal.Decimal: ...
-    @property
-    def taker_fee(self) -> decimal.Decimal: ...
     @property
     def info(self) -> dict: ...
     @property
@@ -2317,8 +2245,6 @@ class IndexInstrument:
     @property
     def lot_size(self) -> Quantity | None: ...
     @property
-    def maker_fee(self) -> decimal.Decimal: ...
-    @property
     def margin_init(self) -> decimal.Decimal: ...
     @property
     def margin_maint(self) -> decimal.Decimal: ...
@@ -2336,8 +2262,6 @@ class IndexInstrument:
     def min_quantity(self) -> Quantity | None: ...
     @property
     def multiplier(self) -> Quantity: ...
-    @property
-    def taker_fee(self) -> decimal.Decimal: ...
     def __init__(
         self,
         instrument_id: InstrumentId,
@@ -2930,6 +2854,8 @@ class MarginAccount:
         last_qty: Quantity,
         last_px: Price,
         liquidity_side: LiquiditySide,
+        maker_rate: decimal.Decimal,
+        taker_rate: decimal.Decimal,
         use_quote_for_inverse: bool | None = None,
     ) -> Money: ...
     def calculate_pnls(
@@ -3636,8 +3562,6 @@ class OptionContract:
         min_price: Price | None = None,
         margin_init: decimal.Decimal | None = None,
         margin_maint: decimal.Decimal | None = None,
-        maker_fee: decimal.Decimal | None = None,
-        taker_fee: decimal.Decimal | None = None,
         exchange: str | None = None,
         tick_scheme: str | None = None,
         info: dict | None = None,
@@ -3689,10 +3613,6 @@ class OptionContract:
     def margin_init(self) -> decimal.Decimal: ...
     @property
     def margin_maint(self) -> decimal.Decimal: ...
-    @property
-    def maker_fee(self) -> decimal.Decimal: ...
-    @property
-    def taker_fee(self) -> decimal.Decimal: ...
     @property
     def info(self) -> dict: ...
     @property
@@ -3844,8 +3764,6 @@ class OptionSpread:
         min_price: Price | None = None,
         margin_init: decimal.Decimal | None = None,
         margin_maint: decimal.Decimal | None = None,
-        maker_fee: decimal.Decimal | None = None,
-        taker_fee: decimal.Decimal | None = None,
         exchange: str | None = None,
         tick_scheme: str | None = None,
         info: dict | None = None,
@@ -3895,10 +3813,6 @@ class OptionSpread:
     def margin_init(self) -> decimal.Decimal: ...
     @property
     def margin_maint(self) -> decimal.Decimal: ...
-    @property
-    def maker_fee(self) -> decimal.Decimal: ...
-    @property
-    def taker_fee(self) -> decimal.Decimal: ...
     @property
     def info(self) -> dict: ...
     @property
@@ -3989,7 +3903,7 @@ class OrderBook:
     def clear_stale_levels(self, side: OrderSide | None = None) -> list[BookLevel] | None: ...
     def apply_delta(self, delta: OrderBookDelta) -> None: ...
     def apply_deltas(self, deltas: OrderBookDeltas) -> None: ...
-    def apply_depth(self, depth: OrderBookDepth10) -> None: ...
+    def apply_depth(self, depth: OrderBookDepth) -> None: ...
     def check_integrity(self) -> None: ...
     def bids(self, depth: int | None = None) -> list[BookLevel]: ...
     def asks(self, depth: int | None = None) -> list[BookLevel]: ...
@@ -4152,7 +4066,7 @@ class OrderBookDeltas:
     ) -> OrderBookDeltas: ...
 
 @typing.final
-class OrderBookDepth10:
+class OrderBookDepth:
     def __init__(
         self,
         instrument_id: InstrumentId,
@@ -4193,16 +4107,16 @@ class OrderBookDepth10:
     @staticmethod
     def get_fields() -> dict: ...
     @staticmethod
-    def get_stub() -> OrderBookDepth10: ...
+    def get_stub() -> OrderBookDepth: ...
     @staticmethod
-    def from_dict(values: dict) -> OrderBookDepth10: ...
+    def from_dict(values: dict) -> OrderBookDepth: ...
     def to_dict(self) -> dict: ...
     def to_json_bytes(self) -> typing.Any: ...
     def to_msgpack_bytes(self) -> typing.Any: ...
     @staticmethod
-    def from_json(data: typing.Any) -> OrderBookDepth10: ...
+    def from_json(data: typing.Any) -> OrderBookDepth: ...
     @staticmethod
-    def from_msgpack(data: typing.Any) -> OrderBookDepth10: ...
+    def from_msgpack(data: typing.Any) -> OrderBookDepth: ...
 
 @typing.final
 class OrderCancelRejected:
@@ -5289,8 +5203,6 @@ class PerpetualContract:
         min_price: Price | None = None,
         margin_init: decimal.Decimal | None = None,
         margin_maint: decimal.Decimal | None = None,
-        maker_fee: decimal.Decimal | None = None,
-        taker_fee: decimal.Decimal | None = None,
         tick_scheme: str | None = None,
         info: dict | None = None,
     ) -> None: ...
@@ -5341,10 +5253,6 @@ class PerpetualContract:
     def margin_init(self) -> decimal.Decimal: ...
     @property
     def margin_maint(self) -> decimal.Decimal: ...
-    @property
-    def maker_fee(self) -> decimal.Decimal: ...
-    @property
-    def taker_fee(self) -> decimal.Decimal: ...
     @property
     def ts_event(self) -> int: ...
     @property
@@ -6274,6 +6182,38 @@ class Price:
     def as_double(self) -> float: ...
 
 @typing.final
+class NautilusDataType:
+    Instrument: NautilusDataType
+    QuoteTick: NautilusDataType
+    TradeTick: NautilusDataType
+    Bar: NautilusDataType
+    OrderBookDelta: NautilusDataType
+    OrderBookDepth: NautilusDataType
+    MarkPriceUpdate: NautilusDataType
+    IndexPriceUpdate: NautilusDataType
+    FundingRateUpdate: NautilusDataType
+    InstrumentStatus: NautilusDataType
+    OptionGreeks: NautilusDataType
+    InstrumentClose: NautilusDataType
+    Defi: NautilusDataType
+    @property
+    def type_name(self) -> str | None: ...
+    def __new__(cls, value: str) -> NautilusDataType: ...
+    @staticmethod
+    def Custom(type_name: str) -> NautilusDataType: ...
+    def __hash__(self) -> int: ...
+
+@typing.final
+class NautilusInstrumentType:
+    def __init__(self, value: str) -> None: ...
+    def __hash__(self) -> int: ...
+
+@typing.final
+class NautilusRecordType:
+    def __init__(self, value: str) -> None: ...
+    def __hash__(self) -> int: ...
+
+@typing.final
 class StrikeRange:
     @staticmethod
     def fixed(strikes: typing.Sequence[Price]) -> StrikeRange: ...
@@ -6938,8 +6878,6 @@ class TokenizedAsset:
         min_price: Price | None = None,
         margin_init: decimal.Decimal | None = None,
         margin_maint: decimal.Decimal | None = None,
-        maker_fee: decimal.Decimal | None = None,
-        taker_fee: decimal.Decimal | None = None,
         tick_scheme: str | None = None,
         info: dict | None = None,
     ) -> None: ...
@@ -6982,10 +6920,6 @@ class TokenizedAsset:
     def max_price(self) -> Price | None: ...
     @property
     def min_price(self) -> Price | None: ...
-    @property
-    def maker_fee(self) -> decimal.Decimal: ...
-    @property
-    def taker_fee(self) -> decimal.Decimal: ...
     @property
     def margin_maint(self) -> decimal.Decimal: ...
     @property
@@ -7569,6 +7503,8 @@ class WalletAccount:
         last_qty: Quantity,
         last_px: Price,
         liquidity_side: LiquiditySide,
+        maker_rate: decimal.Decimal,
+        taker_rate: decimal.Decimal,
         use_quote_for_inverse: bool | None = None,
     ) -> Money: ...
     def calculate_pnls(

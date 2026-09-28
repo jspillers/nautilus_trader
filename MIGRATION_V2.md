@@ -67,10 +67,10 @@ V2 shortens common strategy and cache names. The `QuoteTick`, `TradeTick`, and
 | `request_quote_ticks`                | `request_quotes`               |
 | `request_trade_ticks`                | `request_trades`               |
 | `subscribe_order_book_deltas`        | `subscribe_book_deltas`        |
-| `subscribe_order_book_depth`         | `subscribe_book_depth10`       |
+| `subscribe_order_book_depth`         | `subscribe_book_depth`         |
 | `subscribe_order_book_at_interval`   | `subscribe_book_at_interval`   |
 | `unsubscribe_order_book_deltas`      | `unsubscribe_book_deltas`      |
-| `unsubscribe_order_book_depth`       | `unsubscribe_book_depth10`     |
+| `unsubscribe_order_book_depth`       | `unsubscribe_book_depth`       |
 | `unsubscribe_order_book_at_interval` | `unsubscribe_book_at_interval` |
 | `request_order_book_snapshot`        | `request_book_snapshot`        |
 | `request_order_book_deltas`          | `request_book_deltas`          |
@@ -158,7 +158,7 @@ Historical requests use type-specific batch callbacks in v2:
 | Custom data                          | `on_historical_data`          | One `CustomData` or `Sequence[CustomData]` |
 | Book snapshot                        | `on_book`                     | One `OrderBook`                            |
 | Book deltas                          | `on_historical_book_deltas`   | `Sequence[OrderBookDelta]`                 |
-| Book depth                           | `on_historical_book_depth`    | `Sequence[OrderBookDepth10]`               |
+| Book depth                           | `on_historical_book_depth`    | `Sequence[OrderBookDepth]`                 |
 | Quote ticks                          | `on_historical_quotes`        | `Sequence[QuoteTick]`                      |
 | Trade ticks                          | `on_historical_trades`        | `Sequence[TradeTick]`                      |
 | Funding rates                        | `on_historical_funding_rates` | `Sequence[FundingRateUpdate]`              |
@@ -423,9 +423,8 @@ On `LiveNodeConfig`, timeout names now state their unit and the post-stop wait i
 `timeout_post_stop` becomes `delay_post_stop`.
 
 Execution factories now consume the corresponding execution client config directly. Remove
-`BitmexExecFactoryConfig`, `DeriveExecFactoryConfig`, and `HyperliquidExecFactoryConfig` wrappers,
-and pass `BitmexExecutionClientConfig`, `DeriveExecutionClientConfig`, or
-`HyperliquidExecutionClientConfig` to `add_exec_client`.
+`DeriveExecFactoryConfig` and `HyperliquidExecFactoryConfig` wrappers, and pass
+`DeriveExecutionClientConfig` or `HyperliquidExecutionClientConfig` to `add_exec_client`.
 
 The live node owns the trader identity. Remove `trader_id` from adapter execution client config
 construction; `LiveNodeConfig` or `LiveNode.builder(...)` supplies it to every execution factory.
@@ -825,6 +824,20 @@ ALTER TYPE AGGRESSOR_SIDE RENAME VALUE 'SELLER' TO 'SELL';
 ```
 
 Do not run those statements if the enum already contains `BUY` and `SELL`.
+
+The Postgres cache is scoped to the node's trader ID. `nautilus database init` qualifies the order
+and position snapshot keys and the order-position index key with the trader, and fails with the
+offending rows if any snapshot or index row has no resolvable trader.
+
+Account events persisted before trader scoping have no trader, and nothing establishes which trader
+owns them. While any exist, every node using the database fails to connect, and the error lists the
+affected accounts. Assign each one to its trader before starting a node:
+
+```bash
+nautilus database assign-account --account-id <ACCOUNT_ID> --trader-id <TRADER_ID>
+```
+
+The command connects to Postgres directly, so it works while nodes are blocked.
 
 ## Compare backtest performance
 

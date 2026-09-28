@@ -28,18 +28,23 @@ use nautilus_backtest::{
         AccountAdjustmentOutcome, ExchangeContext, SimulationModule, SimulationModuleHandle,
         SimulationModuleResult,
     },
+    result::CanonicalBacktestResult,
 };
 use nautilus_common::{
     actor::{
-        DataActor, DataActorCore, data_actor::DataActorConfig, registry::try_get_actor_unchecked,
+        CallbackDispatchError, DataActor, DataActorCore, callback_failure,
+        data_actor::DataActorConfig, drain_callbacks, registry::try_get_actor_unchecked,
     },
     component::Component,
     enums::ComponentState,
     msgbus, nautilus_actor,
-    timer::TimeEvent,
+    timer::{TimeEvent, TimeEventCallback},
 };
 use nautilus_core::{DurationNanos, UUID4, UnixNanos};
-use nautilus_execution::models::latency::{LatencyModelHandle, StaticLatencyModel};
+use nautilus_execution::models::{
+    fee::{FeeModelAny, FeeModelHandle, MakerTakerFeeModel},
+    latency::{LatencyModelHandle, StaticLatencyModel},
+};
 use nautilus_indicators::{
     average::ema::ExponentialMovingAverage,
     indicator::{Indicator, MovingAverage},
@@ -65,7 +70,7 @@ use nautilus_model::{
     },
     instruments::{
         CryptoPerpetual, Equity, IndexInstrument, Instrument, InstrumentAny, OptionContract,
-        stubs::{crypto_perpetual_ethusdt, default_fx_ccy},
+        stubs::{betting, crypto_perpetual_ethusdt, default_fx_ccy},
     },
     orders::{Order, OrderAny},
     position::Position,
@@ -79,6 +84,7 @@ use nautilus_trading::{
 };
 use rstest::*;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
+use rust_decimal_macros::dec;
 use ustr::Ustr;
 struct EmptyStrategy {
     core: StrategyCore,
@@ -109,10 +115,11 @@ impl DataActor for EmptyStrategy {}
 
 struct FailingStartStrategy {
     core: StrategyCore,
+    fail_dispatch: bool,
 }
 
 impl FailingStartStrategy {
-    fn new() -> Self {
+    fn new(fail_dispatch: bool) -> Self {
         let config = StrategyConfig {
             strategy_id: Some(StrategyId::from("FAILING-START-001")),
             order_id_tag: Some("001".to_string()),
@@ -120,6 +127,7 @@ impl FailingStartStrategy {
         };
         Self {
             core: StrategyCore::new(config),
+            fail_dispatch,
         }
     }
 }
@@ -134,6 +142,16 @@ impl Debug for FailingStartStrategy {
 
 impl DataActor for FailingStartStrategy {
     fn on_start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_quotes("ETHUSDT-PERP.BINANCE".into(), None, None);
+        anyhow::ensure!(
+            !nautilus_common::runner::data_cmd_queue_is_empty(),
+            "Expected startup subscription to remain queued",
+        );
+
+        if self.fail_dispatch {
+            latch_callback_failure();
+        }
+
         anyhow::bail!("simulated backtest strategy start failure")
     }
 }
@@ -1054,6 +1072,10 @@ fn test_add_strategy_while_running_registers_strategy_and_market_exit_control() 
 }
 
 fn create_engine() -> BacktestEngine {
+    create_engine_with_fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+}
+
+fn create_engine_with_fee_model(fee_model: FeeModelHandle) -> BacktestEngine {
     let config = BacktestEngineConfig::default();
     let mut engine = BacktestEngine::new(config).unwrap();
     let venue_config = SimulatedVenueConfig::builder()
@@ -1062,6 +1084,7 @@ fn create_engine() -> BacktestEngine {
         .account_type(AccountType::Margin)
         .book_type(BookType::L1_MBP)
         .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .fee_model(fee_model)
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -1125,6 +1148,7 @@ fn test_add_custom_data_bypasses_market_setup_and_replays_in_order(
         .account_type(AccountType::Margin)
         .book_type(BookType::L2_MBP)
         .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -1157,6 +1181,7 @@ fn create_eur_base_margin_engine() -> BacktestEngine {
         .book_type(BookType::L1_MBP)
         .starting_balances(vec![Money::from("1_000_000 EUR")])
         .base_currency(Currency::EUR())
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -1363,6 +1388,7 @@ fn test_run_rejects_depth_book_without_book_data(crypto_perpetual_ethusdt: Crypt
         .account_type(AccountType::Margin)
         .book_type(BookType::L2_MBP)
         .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -1524,6 +1550,7 @@ fn test_run_with_depth_venue_and_typed_book_batch_succeeds(
         .account_type(AccountType::Margin)
         .book_type(BookType::L2_MBP)
         .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -1554,6 +1581,7 @@ fn test_run_with_depth_venue_and_book_data_succeeds(crypto_perpetual_ethusdt: Cr
         .account_type(AccountType::Margin)
         .book_type(BookType::L2_MBP)
         .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -1585,6 +1613,7 @@ fn test_run_depth_check_fires_on_validate_false_path(crypto_perpetual_ethusdt: C
         .account_type(AccountType::Margin)
         .book_type(BookType::L2_MBP)
         .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -1688,6 +1717,7 @@ fn test_add_strategies_stops_at_first_error() {
         .account_type(AccountType::Margin)
         .book_type(BookType::L1_MBP)
         .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -1732,7 +1762,9 @@ fn test_run_processes_quote_ticks(crypto_perpetual_ethusdt: CryptoPerpetual) {
 
 #[rstest]
 fn test_run_processes_scheduled_funding_settlement(crypto_perpetual_ethusdt: CryptoPerpetual) {
-    let mut engine = create_engine();
+    let mut engine = create_engine_with_fee_model(
+        FeeModelAny::MakerTaker(MakerTakerFeeModel::new(dec!(0.0002), dec!(0.0004))).into(),
+    );
     let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
     let instrument_id = instrument.id();
     engine.add_instrument(&instrument).unwrap();
@@ -2144,15 +2176,16 @@ fn test_reset_cancels_funding_timer() {
 
 fn create_inverse_funding_engine() -> (BacktestEngine, InstrumentId) {
     let instrument =
-        InstrumentAny::CryptoPerpetual(nautilus_model::instruments::stubs::xbtusd_bitmex());
+        InstrumentAny::CryptoPerpetual(nautilus_model::instruments::stubs::btcusd_bybit());
     let instrument_id = instrument.id();
     let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
     let venue = SimulatedVenueConfig::builder()
-        .venue(Venue::from("BITMEX"))
+        .venue(Venue::from("BYBIT"))
         .oms_type(OmsType::Netting)
         .account_type(AccountType::Margin)
         .book_type(BookType::L1_MBP)
         .starting_balances(vec![Money::from("100 BTC")])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue).unwrap();
@@ -2164,6 +2197,312 @@ fn create_inverse_funding_engine() -> (BacktestEngine, InstrumentId) {
         ))
         .unwrap();
     (engine, instrument_id)
+}
+
+fn create_spot_engine(
+    account_type: AccountType,
+    base_currency: Option<Currency>,
+    starting_balance: &str,
+    taker_fee: Decimal,
+    allow_cash_borrowing: bool,
+    latency_model: Option<LatencyModelHandle>,
+) -> (BacktestEngine, InstrumentId) {
+    let instrument = option_underlying_equity(Venue::from("SIM"));
+    let instrument_id = instrument.id();
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    let venue = SimulatedVenueConfig::builder()
+        .venue(Venue::from("SIM"))
+        .oms_type(OmsType::Netting)
+        .account_type(account_type)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::from(starting_balance)])
+        .maybe_base_currency(base_currency)
+        .allow_cash_borrowing(allow_cash_borrowing)
+        .maybe_latency_model(latency_model)
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::new(taker_fee, taker_fee)).into())
+        .build()
+        .unwrap();
+    engine.add_venue(venue).unwrap();
+    engine.add_instrument(&instrument).unwrap();
+    engine
+        .add_strategy(OpenOnEveryQuote::new(instrument_id, Quantity::from(2500)))
+        .unwrap();
+    (engine, instrument_id)
+}
+
+fn order_fills(engine: &BacktestEngine) -> Vec<(Quantity, Price)> {
+    let cache = engine.kernel().cache.borrow();
+    let orders = cache.orders(None, None, None, None, None);
+    let [order] = orders.as_slice() else {
+        panic!("expected one order");
+    };
+    order
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some((fill.last_qty, fill.last_px)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn expected_equity_fills(ask_size: &str) -> Vec<(Quantity, Price)> {
+    if ask_size == "250" {
+        vec![
+            (Quantity::from(250), Price::from("100.00")),
+            (Quantity::from(2250), Price::from("100.01")),
+        ]
+    } else {
+        vec![(Quantity::from(2500), Price::from("100.00"))]
+    }
+}
+
+fn account_total(engine: &BacktestEngine, venue: &str, currency: Currency) -> Option<Money> {
+    engine
+        .kernel()
+        .cache
+        .borrow()
+        .account_for_venue(&Venue::from(venue))
+        .unwrap()
+        .balance_total(Some(currency))
+}
+
+#[rstest]
+#[case::slippage_multi_currency(
+    AccountType::Cash,
+    None,
+    "250_001 USD",
+    Decimal::ZERO,
+    "250",
+    "Cash account balance would become negative: -21.50 USD",
+    "225_001 USD"
+)]
+#[case::slippage_single_currency(
+    AccountType::Cash,
+    Some(Currency::USD()),
+    "250_001 USD",
+    Decimal::ZERO,
+    "250",
+    "Cash account balance would become negative: -21.50 USD",
+    "225_001 USD"
+)]
+#[case::commission_multi_currency(
+    AccountType::Cash,
+    None,
+    "250_001 USD",
+    dec!(0.0001),
+    "2500",
+    "Cash account balance would become negative: -24.00 USD",
+    "250_001 USD"
+)]
+#[case::commission_single_currency(
+    AccountType::Cash,
+    Some(Currency::USD()),
+    "250_001 USD",
+    dec!(0.0001),
+    "2500",
+    "Cash account balance would become negative: -24.00 USD",
+    "250_001 USD"
+)]
+#[case::commission_partial_fill(
+    AccountType::Cash,
+    None,
+    "250_030 USD",
+    dec!(0.0001),
+    "250",
+    "Cash account balance would become negative: -17.50 USD",
+    "225_027.50 USD"
+)]
+#[case::wallet_slippage(
+    AccountType::Wallet,
+    None,
+    "250_001 USD",
+    Decimal::ZERO,
+    "250",
+    "Wallet account balance total was negative",
+    "225_001 USD"
+)]
+fn test_run_fails_when_fill_cost_exceeds_account_balance(
+    #[case] account_type: AccountType,
+    #[case] base_currency: Option<Currency>,
+    #[case] starting_balance: &str,
+    #[case] taker_fee: Decimal,
+    #[case] ask_size: &str,
+    #[case] expected_error: &str,
+    #[case] booked_total: &str,
+) {
+    let (mut engine, instrument_id) = create_spot_engine(
+        account_type,
+        base_currency,
+        starting_balance,
+        taker_fee,
+        false,
+        None,
+    );
+    let data = vec![quote_with_size(
+        instrument_id,
+        "99.99",
+        "100.00",
+        ask_size,
+        1_000_000_000,
+    )];
+    engine.add_data(data, None, true, true).unwrap();
+
+    let error = engine.run(None, None, None, false).unwrap_err();
+    let retry_error = engine.run(None, None, None, false).unwrap_err();
+
+    assert!(
+        error.to_string().contains(expected_error),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(retry_error.to_string(), error.to_string());
+    assert!(engine.kernel().trader.borrow().is_stopped());
+    assert_eq!(order_fills(&engine), expected_equity_fills(ask_size));
+    assert_eq!(
+        account_total(&engine, "SIM", Currency::USD()),
+        Some(Money::from(booked_total))
+    );
+    let canonical = engine.get_canonical_result().unwrap().to_bytes().unwrap();
+    CanonicalBacktestResult::from_slice(&canonical).unwrap();
+    let canonical: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+    assert_eq!(canonical["run"]["outcome"], "failed");
+    assert_eq!(
+        canonical["diagnostics"],
+        serde_json::json!([{"code": "account-balance-rejected"}])
+    );
+
+    engine.reset().unwrap();
+
+    assert_eq!(engine.kernel().portfolio.borrow().balance_error(), None);
+}
+
+#[rstest]
+#[case::multi_currency(None)]
+#[case::single_currency(Some(Currency::GBP()))]
+fn test_run_fails_when_betting_fill_cost_exceeds_balance(#[case] base_currency: Option<Currency>) {
+    let instrument = InstrumentAny::Betting(betting());
+    let instrument_id = instrument.id();
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    let venue = SimulatedVenueConfig::builder()
+        .venue(Venue::from("BETFAIR"))
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Betting)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::from("200.50 GBP")])
+        .maybe_base_currency(base_currency)
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+        .build()
+        .unwrap();
+    engine.add_venue(venue).unwrap();
+    engine.add_instrument(&instrument).unwrap();
+    engine
+        .add_strategy(OpenOnEveryQuote::new(
+            instrument_id,
+            Quantity::from("100.00"),
+        ))
+        .unwrap();
+    let data = vec![quote_with_size(
+        instrument_id,
+        "1.99",
+        "2.00",
+        "10.00",
+        1_000_000_000,
+    )];
+    engine.add_data(data, None, true, true).unwrap();
+
+    let error = engine.run(None, None, None, false).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("Betting account balance would become negative: -0.40 GBP"),
+        "unexpected error: {error:#}"
+    );
+    assert!(engine.kernel().trader.borrow().is_stopped());
+    assert_eq!(
+        order_fills(&engine),
+        vec![
+            (Quantity::from("10.00"), Price::from("2.00")),
+            (Quantity::from("90.00"), Price::from("2.01")),
+        ]
+    );
+    assert_eq!(
+        account_total(&engine, "BETFAIR", Currency::GBP()),
+        Some(Money::from("180.50 GBP"))
+    );
+}
+
+#[rstest]
+fn test_end_fails_when_latent_fill_cost_exceeds_cash_balance() {
+    let latency_model = LatencyModelHandle::new(StaticLatencyModel::new(
+        DurationNanos::default(),
+        DurationNanos::new(1),
+        DurationNanos::default(),
+        DurationNanos::default(),
+    ));
+    let (mut engine, instrument_id) = create_spot_engine(
+        AccountType::Cash,
+        None,
+        "250_001 USD",
+        Decimal::ZERO,
+        false,
+        Some(latency_model),
+    );
+    let data = vec![quote_with_size(
+        instrument_id,
+        "99.99",
+        "100.00",
+        "250",
+        1_000_000_000,
+    )];
+    engine.add_data(data, None, true, true).unwrap();
+    engine.run(None, None, None, true).unwrap();
+
+    let error = engine.end().unwrap_err();
+    let retry_error = engine.end().unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("balance would become negative: -21.50 USD"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(retry_error.to_string(), error.to_string());
+    assert!(engine.kernel().trader.borrow().is_stopped());
+}
+
+#[rstest]
+#[case::affordable(false, "2500", "1.00 USD")]
+#[case::borrowing_enabled(true, "250", "-21.50 USD")]
+fn test_run_books_cash_fill_allowed_by_balance_or_borrowing(
+    #[case] allow_cash_borrowing: bool,
+    #[case] ask_size: &str,
+    #[case] expected_total: &str,
+) {
+    let (mut engine, instrument_id) = create_spot_engine(
+        AccountType::Cash,
+        None,
+        "250_001 USD",
+        Decimal::ZERO,
+        allow_cash_borrowing,
+        None,
+    );
+    let data = vec![quote_with_size(
+        instrument_id,
+        "99.99",
+        "100.00",
+        ask_size,
+        1_000_000_000,
+    )];
+    engine.add_data(data, None, true, true).unwrap();
+
+    engine.run(None, None, None, false).unwrap();
+
+    assert_eq!(order_fills(&engine), expected_equity_fills(ask_size));
+    assert_eq!(
+        account_total(&engine, "SIM", Currency::USD()),
+        Some(Money::from(expected_total))
+    );
 }
 
 #[rstest]
@@ -2184,6 +2523,7 @@ fn test_instrument_close_precedes_expiration_timer_at_same_timestamp(
         .account_type(AccountType::Margin)
         .book_type(BookType::L1_MBP)
         .starting_balances(vec![Money::from("1_000_000 USD")])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -2258,6 +2598,7 @@ fn test_option_expiry_uses_same_timestamp_index_price(
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -2727,12 +3068,19 @@ fn test_run_with_strategy(crypto_perpetual_ethusdt: CryptoPerpetual) {
 }
 
 #[rstest]
-fn test_run_propagates_strategy_start_failure(crypto_perpetual_ethusdt: CryptoPerpetual) {
+#[case(false)]
+#[case(true)]
+fn test_run_propagates_strategy_start_failure(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+    #[case] fail_dispatch: bool,
+) {
     let mut engine = create_engine();
     let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
     let instrument_id = instrument.id();
     engine.add_instrument(&instrument).unwrap();
-    engine.add_strategy(FailingStartStrategy::new()).unwrap();
+    engine
+        .add_strategy(FailingStartStrategy::new(fail_dispatch))
+        .unwrap();
     engine
         .add_data(
             vec![quote(instrument_id, "1000.00", "1000.10", 1_000_000_000)],
@@ -2746,6 +3094,9 @@ fn test_run_propagates_strategy_start_failure(crypto_perpetual_ethusdt: CryptoPe
         .run(None, None, None, false)
         .expect_err("strategy start should fail");
     let trader_stopped = engine.kernel().trader.borrow().is_stopped();
+    let data_queue_empty = nautilus_common::runner::data_cmd_queue_is_empty();
+    let data_command_count = engine.kernel().data_engine.borrow().command_count();
+    let dispatch_error = callback_failure();
     engine.dispose();
 
     assert!(
@@ -2754,8 +3105,153 @@ fn test_run_propagates_strategy_start_failure(crypto_perpetual_ethusdt: CryptoPe
         "unexpected error: {err:#}"
     );
     assert!(trader_stopped);
+    assert_eq!(
+        err.to_string().matches("Callback dispatch failed:").count(),
+        usize::from(fail_dispatch)
+    );
+    assert_eq!(
+        err.to_string().contains("Callback delivery unwound"),
+        fail_dispatch
+    );
+    assert_eq!(dispatch_error, None);
+    assert!(data_queue_empty);
+    assert_eq!(data_command_count, 0);
     assert!(engine.kernel().trader.borrow().is_disposed());
     assert_eq!(engine.kernel().trader.borrow().component_count(), 0);
+}
+
+#[rstest]
+#[case("run")]
+#[case("end")]
+#[case("reset")]
+fn test_latched_callback_failure_stops_backtest(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+    #[case] operation: &str,
+) {
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    engine.add_instrument(&instrument).unwrap();
+    engine.add_strategy(EmptyStrategy::new()).unwrap();
+    engine
+        .add_data(
+            vec![quote(instrument.id(), "1000.00", "1000.10", 1_000_000_000)],
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+    engine.run(None, None, None, true).unwrap();
+    assert!(engine.kernel().trader.borrow().is_running());
+    latch_callback_failure();
+
+    let error = match operation {
+        "run" => engine.run(None, None, None, true),
+        "end" => engine.end(),
+        "reset" => engine.reset(),
+        _ => unreachable!(),
+    }
+    .unwrap_err();
+    let trader_running = engine.kernel().trader.borrow().is_running();
+    let dispatch_error = callback_failure();
+    let data_queue_empty = nautilus_common::runner::data_cmd_queue_is_empty();
+    let trading_queue_empty = nautilus_common::runner::trading_cmd_queue_is_empty();
+    engine.dispose();
+
+    assert_eq!(
+        error.downcast_ref::<CallbackDispatchError>(),
+        Some(&CallbackDispatchError::DeliveryUnwound)
+    );
+    assert!(!trader_running);
+    assert_eq!(dispatch_error, None);
+    assert!(data_queue_empty);
+    assert!(trading_queue_empty);
+}
+
+#[rstest]
+fn test_timer_callback_failure_prevents_later_work(crypto_perpetual_ethusdt: CryptoPerpetual) {
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    engine.add_instrument(&instrument).unwrap();
+    engine.add_strategy(EmptyStrategy::new()).unwrap();
+    engine
+        .add_data(
+            vec![quote(instrument.id(), "1000.00", "1000.10", 1_000_000_000)],
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+    engine.run(None, None, None, true).unwrap();
+    engine.clear_data();
+    engine
+        .add_data(
+            vec![quote(instrument.id(), "1001.00", "1001.10", 2_000_000_000)],
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+    let fired = Rc::new(RefCell::new(Vec::new()));
+
+    for (name, timestamp, fail) in [
+        ("failure", 1_500_000_000, true),
+        ("later", 1_500_000_000, false),
+    ] {
+        let fired = fired.clone();
+        let callback = TimeEventCallback::RustLocal(Rc::new(move |_| {
+            fired.borrow_mut().push(name);
+
+            if fail {
+                latch_callback_failure();
+            }
+        }));
+        engine
+            .kernel()
+            .clock
+            .borrow_mut()
+            .set_time_alert_ns(name, timestamp.into(), Some(callback), None)
+            .unwrap();
+    }
+
+    let error = engine
+        .run(Some(UnixNanos::from(1_000_000_000)), None, None, true)
+        .unwrap_err();
+    let timestamp = engine.kernel().clock.borrow().timestamp_ns();
+    let data_count = engine.kernel().data_engine.borrow().data_count();
+    let trader_stopped = engine.kernel().trader.borrow().is_stopped();
+    let dispatch_error = callback_failure();
+    engine.dispose();
+
+    assert_eq!(
+        error.downcast_ref::<CallbackDispatchError>(),
+        Some(&CallbackDispatchError::DeliveryUnwound)
+    );
+    assert_eq!(*fired.borrow(), ["failure"]);
+    assert_eq!(timestamp, UnixNanos::from(1_500_000_000));
+    assert_eq!(data_count, 2);
+    assert!(trader_stopped);
+    assert_eq!(dispatch_error, None);
+}
+
+fn latch_callback_failure() {
+    struct DrainOnDrop;
+
+    impl Drop for DrainOnDrop {
+        fn drop(&mut self) {
+            assert_eq!(drain_callbacks(1), Ok(false));
+        }
+    }
+
+    let result = std::panic::catch_unwind(|| {
+        let _drain = DrainOnDrop;
+        panic!("simulated callback unwind");
+    });
+
+    assert!(result.is_err());
+    assert_eq!(
+        callback_failure(),
+        Some(CallbackDispatchError::DeliveryUnwound)
+    );
 }
 
 #[rstest]
@@ -3600,6 +4096,7 @@ fn test_multi_venue_data_routing(crypto_perpetual_ethusdt: CryptoPerpetual) {
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USDT")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -3608,11 +4105,12 @@ fn test_multi_venue_data_routing(crypto_perpetual_ethusdt: CryptoPerpetual) {
     engine
         .add_venue(
             SimulatedVenueConfig::builder()
-                .venue(Venue::from("BITMEX"))
+                .venue(Venue::from("BYBIT"))
                 .oms_type(OmsType::Netting)
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -3622,13 +4120,13 @@ fn test_multi_venue_data_routing(crypto_perpetual_ethusdt: CryptoPerpetual) {
     let eth_id = eth.id();
     engine.add_instrument(&eth).unwrap();
 
-    let btc = InstrumentAny::CryptoPerpetual(nautilus_model::instruments::stubs::xbtusd_bitmex());
+    let btc = InstrumentAny::CryptoPerpetual(nautilus_model::instruments::stubs::btcusd_bybit());
     let btc_id = btc.id();
     engine.add_instrument(&btc).unwrap();
 
     // Interleave quotes from both venues (respecting instrument precision)
     // ETHUSDT-PERP.BINANCE: price_prec=2, size_prec=3
-    // BTCUSDT.BITMEX: price_prec=1, size_prec=0
+    // BTCUSD.BYBIT: price_prec=1, size_prec=0
     let quotes = vec![
         quote(eth_id, "1000.00", "1000.10", 1_000_000_000),
         quote_with_size(btc_id, "50000.5", "50001.0", "1", 2_000_000_000),
@@ -4782,6 +5280,7 @@ fn test_list_venues_multiple() {
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USDT")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -4790,11 +5289,12 @@ fn test_list_venues_multiple() {
     engine
         .add_venue(
             SimulatedVenueConfig::builder()
-                .venue(Venue::from("BITMEX"))
+                .venue(Venue::from("BYBIT"))
                 .oms_type(OmsType::Netting)
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -4803,7 +5303,7 @@ fn test_list_venues_multiple() {
     let venues = engine.list_venues();
     assert_eq!(venues.len(), 2);
     assert_eq!(venues[0], Venue::from("BINANCE"));
-    assert_eq!(venues[1], Venue::from("BITMEX"));
+    assert_eq!(venues[1], Venue::from("BYBIT"));
 }
 
 #[rstest]
@@ -4839,6 +5339,7 @@ fn test_option_expiry_timer_closes_position_without_data_at_expiration() {
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -4954,6 +5455,7 @@ fn test_instruments_with_same_expiration_share_expiry_timer() {
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -5000,6 +5502,7 @@ fn test_instrument_update_cancels_previous_expiry_timer() {
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -5044,6 +5547,7 @@ fn run_call_option_expiry_timer(
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -5101,6 +5605,7 @@ fn test_add_venue_with_queue_position(crypto_perpetual_ethusdt: CryptoPerpetual)
             .book_type(BookType::L1_MBP)
             .starting_balances(vec![Money::from("1_000_000 USDT")])
             .queue_position(true)
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build()
             .unwrap(),
     );
@@ -5319,6 +5824,7 @@ fn test_end_reports_simulation_module_diagnostics_error() {
         .modules(vec![SimulationModuleHandle::new(
             FailingDiagnosticsSimulationModule,
         )])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -5356,6 +5862,7 @@ fn test_end_does_not_double_run_modules_at_same_timestamp(
         .book_type(BookType::L1_MBP)
         .starting_balances(vec![Money::from("1_000_000 USDT")])
         .modules(vec![SimulationModuleHandle::new(module)])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -5930,6 +6437,7 @@ fn test_streaming_end_settles_due_open_before_on_stop(crypto_perpetual_ethusdt: 
                     DurationNanos::default(),
                     DurationNanos::default(),
                 )))
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -6001,6 +6509,7 @@ fn test_close_all_positions_in_on_stop_is_processed_with_latency(
             DurationNanos::default(),
             DurationNanos::default(),
         )))
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -6293,6 +6802,7 @@ fn test_latency_order_settles_on_instrument_data_or_timer(
                     DurationNanos::default(),
                     DurationNanos::default(),
                 )))
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -6389,6 +6899,7 @@ fn test_trailing_final_tick_order_settles_with_latency(crypto_perpetual_ethusdt:
             DurationNanos::default(),
             DurationNanos::default(),
         )))
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -6461,6 +6972,7 @@ fn test_cancel_all_orders_in_on_stop_is_processed_with_latency(
             DurationNanos::default(),
             DurationNanos::from_millis(1_500),
         )))
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -6624,6 +7136,7 @@ fn test_close_all_positions_on_stop_multi_venue_latency_aggregates(
                     DurationNanos::default(),
                     DurationNanos::default(),
                 )))
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -6642,6 +7155,7 @@ fn test_close_all_positions_on_stop_multi_venue_latency_aggregates(
                     DurationNanos::default(),
                     DurationNanos::default(),
                 )))
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -6712,6 +7226,7 @@ fn test_add_venue_with_oto_full_trigger(crypto_perpetual_ethusdt: CryptoPerpetua
             .book_type(BookType::L1_MBP)
             .starting_balances(vec![Money::from("1_000_000 USDT")])
             .oto_full_trigger(true)
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build()
             .unwrap(),
     );

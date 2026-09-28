@@ -87,6 +87,7 @@ use nautilus_common::{
 };
 use nautilus_model::events::OrderEventAny;
 
+use crate::dispatch::drain_callbacks;
 #[cfg(feature = "node")]
 use crate::node::{LiveNodeHandle, NodeState};
 
@@ -422,19 +423,26 @@ impl AsyncRunner {
     ///
     /// This method processes time, system, execution, and data events in an async loop.
     /// It will run until a signal is received or the event streams are closed.
-    pub async fn run(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns a callback dispatch failure, retaining pending channel messages and the failure latch.
+    pub async fn run(&mut self) -> anyhow::Result<()> {
         self.bind_senders();
 
         log::info!("AsyncRunner starting");
 
         loop {
+            let callbacks_pending = drain_callbacks().await?;
+
             tokio::select! {
                 biased;
 
                 Some(()) = self.signal_rx.recv() => {
                     log::info!("AsyncRunner received signal, shutting down");
-                    return;
+                    return Ok(());
                 },
+                () = std::future::ready(()), if callbacks_pending => {},
                 Some(handler) = self.channels.time_evt_rx.recv() => {
                     let _ = Self::handle_time_event(handler);
                 },
@@ -458,7 +466,7 @@ impl AsyncRunner {
                 },
                 else => {
                     log::debug!("AsyncRunner all channels closed, exiting");
-                    return;
+                    return Ok(());
                 }
             };
         }
@@ -531,6 +539,14 @@ impl AsyncRunner {
             DataEvent::DeFi(data) => {
                 msgbus::send_defi_data(MessagingSwitchboard::data_engine_process_defi_data(), data);
             }
+            #[cfg(not(feature = "defi"))]
+            #[allow(
+                unreachable_patterns,
+                reason = "DeFi variants can exist without this crate's defi feature"
+            )]
+            other => log::error!(
+                "Cannot handle {other} data event, nautilus-live built without its `defi` feature"
+            ),
         }
     }
 
@@ -721,8 +737,9 @@ mod tests {
     #[cfg(not(all(feature = "simulation", madsim)))]
     use nautilus_common::live::LiveTimer;
     use nautilus_common::{
+        actor,
         cache::Cache,
-        clock::TestClock,
+        clock::VirtualClock,
         live::{
             dispatch::DispatchMessage,
             runner::{
@@ -771,6 +788,140 @@ mod tests {
     use ustr::Ustr;
 
     use super::*;
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn test_runner_callback_failure_stops_before_next_command(#[case] before_run: bool) {
+        actor::clear_callbacks().unwrap();
+        let mut runner = AsyncRunner::new();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let observed = received.clone();
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_execute(),
+            TypedIntoHandler::from(move |command: TradingCommand| {
+                observed.borrow_mut().push(command.ts_init());
+                crate::dispatch::tests::latch_callback_failure();
+            }),
+        );
+
+        let sender = AsyncTradingCommandSender::new(runner.exec_cmd_tx.clone());
+        let seed_endpoint = ustr::Ustr::from("test.callback-root-seed");
+        msgbus::register_trading_command_endpoint(
+            seed_endpoint.into(),
+            TypedIntoHandler::from(move |command: TradingCommand| {
+                sender.execute(TradingCommandMessage::new(
+                    MessagingSwitchboard::risk_engine_execute(),
+                    command,
+                ));
+            }),
+        );
+
+        for timestamp in [17, 23] {
+            SyncTradingCommandSender.execute(TradingCommandMessage::new(
+                seed_endpoint.into(),
+                TradingCommand::QueryAccount(QueryAccount::new(
+                    "TRADER-001".into(),
+                    None,
+                    "SIM-001".into(),
+                    UUID4::new(),
+                    timestamp.into(),
+                    None,
+                    None,
+                )),
+            ));
+        }
+
+        drain_trading_cmd_queue();
+        let first = runner.channels.exec_cmd_rx.try_recv().unwrap();
+        let second = runner.channels.exec_cmd_rx.try_recv().unwrap();
+        assert!(first.is_rooted());
+        assert!(second.is_rooted());
+        runner.exec_cmd_tx.send(first).unwrap();
+        runner.exec_cmd_tx.send(second).unwrap();
+
+        if before_run {
+            crate::dispatch::tests::latch_callback_failure();
+        }
+
+        let error = runner.run().await.unwrap_err();
+
+        assert_eq!(
+            error.downcast_ref::<actor::CallbackDispatchError>(),
+            Some(&actor::CallbackDispatchError::DeliveryUnwound)
+        );
+        assert_eq!(
+            *received.borrow(),
+            if before_run {
+                vec![]
+            } else {
+                vec![UnixNanos::from(17)]
+            }
+        );
+        assert_eq!(
+            runner.channels.exec_cmd_rx.len(),
+            if before_run { 2 } else { 1 }
+        );
+        assert!(!runner.exec_cmd_tx.is_closed());
+        assert_eq!(
+            actor::callback_failure(),
+            Some(actor::CallbackDispatchError::DeliveryUnwound)
+        );
+        drop(runner);
+        assert_eq!(actor::clear_callbacks(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn test_runner_stop_preserves_messages_and_channel_only_scheduling() {
+        let mut runner = AsyncRunner::new();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let stop = runner.signal_tx.clone();
+
+        for timestamp in 1..=65 {
+            let received = received.clone();
+            let stop = stop.clone();
+            runner
+                .time_evt_tx
+                .send(
+                    TimeEventMessage::new(
+                        TimeEvent::new(
+                            "runner-resume".into(),
+                            UUID4::new(),
+                            timestamp.into(),
+                            timestamp.into(),
+                        ),
+                        TimeEventCallback::RustLocal(Rc::new(move |_| {
+                            received.borrow_mut().push(timestamp);
+                            if timestamp == 65 {
+                                stop.send(()).unwrap();
+                            }
+                        })),
+                    )
+                    .into(),
+                )
+                .unwrap();
+        }
+
+        stop.send(()).unwrap();
+        runner.run().await.unwrap();
+
+        assert!(received.borrow().is_empty());
+        assert_eq!(runner.channels.time_evt_rx.len(), 65);
+        assert!(!runner.time_evt_tx.is_closed());
+
+        let (result, at_yield) = tokio::join!(biased;
+            runner.run(),
+            async { received.borrow().clone() },
+        );
+        result.unwrap();
+
+        let expected: Vec<u64> = (1..=65).collect();
+        assert_eq!(at_yield, expected);
+        assert_eq!(*received.borrow(), expected);
+        assert_eq!(runner.channels.time_evt_rx.len(), 0);
+        assert!(!runner.time_evt_tx.is_closed());
+    }
 
     // Test fixture for creating test quotes
     fn test_quote() -> QuoteTick {
@@ -1562,7 +1713,7 @@ mod tests {
 
         // Start runner
         let runner_handle = tokio::spawn(async move {
-            runner.run().await;
+            runner.run().await.unwrap();
         });
 
         // Send shutdown signal
@@ -1599,7 +1750,7 @@ mod tests {
 
         // Start runner
         let runner_handle = tokio::spawn(async move {
-            runner.run().await;
+            runner.run().await.unwrap();
         });
 
         drop(data_tx);
@@ -1662,7 +1813,7 @@ mod tests {
 
         // Start runner in background
         let runner_handle = tokio::spawn(async move {
-            runner.run().await;
+            runner.run().await.unwrap();
         });
 
         // Wait for all senders
@@ -1692,6 +1843,7 @@ mod tests {
 
         // Verify all received
         let mut received = 0;
+
         while rx.try_recv().is_ok() {
             received += 1;
         }
@@ -1784,7 +1936,7 @@ mod tests {
     fn test_async_runner_preserves_deferred_follow_up_order() {
         std::thread::spawn(|| {
             msgbus::get_message_bus().borrow_mut().dispose();
-            let clock = Rc::new(RefCell::new(TestClock::new()));
+            let clock = Rc::new(RefCell::new(VirtualClock::new()));
             let cache = Rc::new(RefCell::new(Cache::default()));
             let exec_engine = Rc::new(RefCell::new(ExecutionEngine::new(clock, cache, None)));
             ExecutionEngine::register_msgbus_handlers(&exec_engine);
@@ -1866,7 +2018,7 @@ mod tests {
     fn test_async_runner_dispatches_deferred_exec_command_once() {
         std::thread::spawn(|| {
             msgbus::get_message_bus().borrow_mut().dispose();
-            let clock = Rc::new(RefCell::new(TestClock::new()));
+            let clock = Rc::new(RefCell::new(VirtualClock::new()));
             let cache = Rc::new(RefCell::new(Cache::default()));
             let exec_engine = Rc::new(RefCell::new(ExecutionEngine::new(clock, cache, None)));
             ExecutionEngine::register_msgbus_handlers(&exec_engine);
@@ -1926,7 +2078,7 @@ mod tests {
         );
 
         let runner_handle = tokio::spawn(async move {
-            runner.run().await;
+            runner.run().await.unwrap();
         });
 
         let command = TradingCommand::CancelAllOrders(CancelAllOrders::new(
@@ -1979,7 +2131,7 @@ mod tests {
         );
 
         let runner_handle = tokio::spawn(async move {
-            runner.run().await;
+            runner.run().await.unwrap();
         });
 
         for i in 0..10 {
@@ -2190,7 +2342,7 @@ mod tests {
         );
 
         let runner_handle = tokio::spawn(async move {
-            runner.run().await;
+            runner.run().await.unwrap();
         });
 
         // Use stop via signal_tx directly
@@ -2225,7 +2377,7 @@ mod tests {
         );
 
         let runner_handle = tokio::spawn(async move {
-            runner.run().await;
+            runner.run().await.unwrap();
         });
 
         // Send data event
@@ -2379,7 +2531,7 @@ mod tests {
         let handle = runner.handle();
 
         let runner_handle = tokio::spawn(async move {
-            runner.run().await;
+            runner.run().await.unwrap();
         });
 
         // Use handle to stop
@@ -2436,7 +2588,7 @@ mod tests {
         }
 
         let runner_handle = tokio::spawn(async move {
-            runner.run().await;
+            runner.run().await.unwrap();
         });
 
         // Yield to let runner enter event loop before stop signal

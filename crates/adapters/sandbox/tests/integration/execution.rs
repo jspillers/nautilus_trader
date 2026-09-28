@@ -24,7 +24,7 @@ use std::{
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
-    clock::{Clock, TestClock},
+    clock::{Clock, VirtualClock},
     live::set_exec_event_sender,
     messages::{
         ExecutionEvent,
@@ -47,7 +47,7 @@ use nautilus_execution::{
     client::core::ExecutionClientCore,
     engine::ExecutionEngine,
     models::{
-        fee::{FeeModelAny, ProbabilityPriceFeeModel},
+        fee::{FeeModelAny, MakerTakerFeeModel, ProbabilityPriceFeeModel},
         fill::{DefaultFillModel, FillModel, FillModelAny, FillModelHandle},
         latency::{LatencyModelAny, StaticLatencyModel},
     },
@@ -123,7 +123,7 @@ fn create_config(
         default_leverage: Decimal::ONE,
         leverages: ahash::AHashMap::new(),
         book_type: BookType::L1_MBP,
-        fee_model: None,
+        fee_model: Some(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero())),
         fill_model: None,
         latency_model: None,
         frozen_account: false,
@@ -158,7 +158,7 @@ struct TestContext {
     client: SandboxExecutionClient,
     cache: Rc<RefCell<Cache>>,
     /// The clock the client was built on, retained so a test can advance it and fire its alerts.
-    test_clock: Rc<RefCell<TestClock>>,
+    test_clock: Rc<RefCell<VirtualClock>>,
 }
 
 fn create_test_context(trader_id: TraderId, account_id: AccountId, venue: Venue) -> TestContext {
@@ -182,7 +182,7 @@ fn create_test_context_with(
     customize: impl FnOnce(&mut SandboxExecutionClientConfig),
 ) -> TestContext {
     let cache = Rc::new(RefCell::new(Cache::default()));
-    let test_clock = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock = Rc::new(RefCell::new(VirtualClock::new()));
     let clock: Rc<RefCell<dyn Clock>> = test_clock.clone();
     let mut config = create_config(trader_id, account_id, venue);
     customize(&mut config);
@@ -198,7 +198,8 @@ fn create_test_context_with(
         cache.clone(),
     );
 
-    let client = SandboxExecutionClient::new(core, config, clock, cache.clone());
+    let client = SandboxExecutionClient::new(core, config, clock, cache.clone()).unwrap();
+
     TestContext {
         client,
         cache,
@@ -579,7 +580,7 @@ fn submit_market_open_order(
 struct BinaryOptionLifecycleHarness {
     client: SandboxExecutionClient,
     cache: Rc<RefCell<Cache>>,
-    test_clock: Rc<RefCell<TestClock>>,
+    test_clock: Rc<RefCell<VirtualClock>>,
     instrument: InstrumentAny,
     rx: tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
 }
@@ -595,7 +596,7 @@ fn setup_binary_option_lifecycle_harness(
     let instrument = make_binary_option_instrument(condition_id, token_id, outcome, expiration_ns);
     let venue = instrument.id().venue;
     let cache = Rc::new(RefCell::new(Cache::default()));
-    let test_clock = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock = Rc::new(RefCell::new(VirtualClock::new()));
     let clock: Rc<RefCell<dyn Clock>> = test_clock.clone();
     let config = create_config(trader_id, account_id, venue);
     let core = ExecutionClientCore::new(
@@ -608,7 +609,7 @@ fn setup_binary_option_lifecycle_harness(
         config.base_currency,
         cache.clone(),
     );
-    let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone());
+    let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone()).unwrap();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
 
     set_exec_event_sender(tx);
@@ -631,7 +632,7 @@ fn setup_binary_option_lifecycle_harness(
 }
 
 fn publish_expired_close(
-    test_clock: &Rc<RefCell<TestClock>>,
+    test_clock: &Rc<RefCell<VirtualClock>>,
     instrument: &InstrumentAny,
     close_price: Price,
     ts_ns: u64,
@@ -671,7 +672,7 @@ fn setup_pending_resolution_harness(
     let instrument = InstrumentAny::BinaryOption(binary);
     let venue = instrument.id().venue;
     let cache = Rc::new(RefCell::new(Cache::default()));
-    let test_clock = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock = Rc::new(RefCell::new(VirtualClock::new()));
     let clock: Rc<RefCell<dyn Clock>> = test_clock.clone();
 
     let mut config = create_config(trader_id, account_id, venue);
@@ -687,7 +688,8 @@ fn setup_pending_resolution_harness(
         config.base_currency,
         cache.clone(),
     );
-    let mut client = SandboxExecutionClient::new(core, config, clock.clone(), cache.clone());
+    let mut client =
+        SandboxExecutionClient::new(core, config, clock.clone(), cache.clone()).unwrap();
 
     cache
         .borrow_mut()
@@ -883,7 +885,7 @@ fn static_latency_model(insert_ns: u64, update_ns: u64, delete_ns: u64) -> Laten
 /// Advances the test clock to `to`, running any inbound-drain alerts that fire exactly as the live
 /// runner would (`advance_time` -> `match_handlers` -> `handler.run()`), and returns the number of
 /// alert handlers that ran.
-fn advance_and_fire(test_clock: &Rc<RefCell<TestClock>>, to: UnixNanos) -> usize {
+fn advance_and_fire(test_clock: &Rc<RefCell<VirtualClock>>, to: UnixNanos) -> usize {
     let events = test_clock.borrow_mut().advance_time(to, true);
     let handlers = test_clock.borrow().match_handlers(events);
     let count = handlers.len();
@@ -1050,7 +1052,7 @@ impl DeferredCommand {
 struct EngineHarness {
     engine: Rc<RefCell<ExecutionEngine>>,
     cache: Rc<RefCell<Cache>>,
-    test_clock: Rc<RefCell<TestClock>>,
+    test_clock: Rc<RefCell<VirtualClock>>,
     rx: tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
     /// Every order event the engine published, in the order it processed them.
     published: Rc<RefCell<Vec<OrderEventAny>>>,
@@ -1085,7 +1087,7 @@ fn setup_engine_harness(
     let venue = instrument.id().venue;
     let client_id = ClientId::new("SANDBOX");
     let cache = Rc::new(RefCell::new(Cache::default()));
-    let test_clock = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock = Rc::new(RefCell::new(VirtualClock::new()));
     let clock: Rc<RefCell<dyn Clock>> = test_clock.clone();
     cache
         .borrow_mut()
@@ -1127,7 +1129,7 @@ fn setup_engine_harness(
         config.base_currency,
         cache.clone(),
     );
-    let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone());
+    let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone()).unwrap();
     client.start().unwrap();
     engine
         .borrow_mut()
@@ -1444,8 +1446,10 @@ fn test_probability_price_fee_model_config_drives_sandbox_commission(
     account_id: AccountId,
 ) {
     assert_fee_model_config_drives_sandbox_commission(
-        FeeModelAny::ProbabilityPrice(ProbabilityPriceFeeModel),
-        taker_fee,
+        FeeModelAny::ProbabilityPrice(ProbabilityPriceFeeModel::new(
+            Decimal::ZERO,
+            Decimal::from_str_exact(taker_fee).unwrap(),
+        )),
         price,
         expected,
         trader_id,
@@ -1488,13 +1492,12 @@ fn test_python_fee_model_config_drives_sandbox_commission(
     });
 
     assert_fee_model_config_drives_sandbox_commission(
-        fee_model, "0.03", "0.500", expected, trader_id, account_id,
+        fee_model, "0.500", expected, trader_id, account_id,
     );
 }
 
 fn assert_fee_model_config_drives_sandbox_commission(
     fee_model: FeeModelAny,
-    taker_fee: &str,
     price: &str,
     expected: &str,
     trader_id: TraderId,
@@ -1502,12 +1505,10 @@ fn assert_fee_model_config_drives_sandbox_commission(
 ) {
     setup_order_event_handler();
 
-    let mut binary = binary_option();
-    binary.taker_fee = Decimal::from_str_exact(taker_fee).unwrap();
-    let instrument = InstrumentAny::BinaryOption(binary);
+    let instrument = InstrumentAny::BinaryOption(binary_option());
     let venue = instrument.id().venue;
     let cache = Rc::new(RefCell::new(Cache::default()));
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
 
     let mut config = create_config(trader_id, account_id, venue);
     config.base_currency = Some(Currency::USDC());
@@ -1524,7 +1525,7 @@ fn assert_fee_model_config_drives_sandbox_commission(
         config.base_currency,
         cache.clone(),
     );
-    let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone());
+    let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone()).unwrap();
 
     cache
         .borrow_mut()
@@ -2036,6 +2037,7 @@ fn test_client_initial_state(execution_client: SandboxExecutionClient, venue: Ve
     assert!(!execution_client.is_connected());
     assert_eq!(execution_client.venue(), venue);
     assert_eq!(execution_client.oms_type(), OmsType::Netting);
+    assert!(execution_client.settles_contract_expirations());
     assert_eq!(execution_client.matching_engine_count(), 0);
 }
 
@@ -3021,7 +3023,7 @@ fn test_instrument_close_sync_cleanup_handles_synchronous_position_closed_reentr
         let account_id = AccountId::from("BINANCE-001");
         let client_id = ClientId::new("SANDBOX");
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let test_clock = Rc::new(RefCell::new(TestClock::new()));
+        let test_clock = Rc::new(RefCell::new(VirtualClock::new()));
         let clock: Rc<RefCell<dyn Clock>> = test_clock.clone();
 
         let mut binary = binary_option();
@@ -3104,7 +3106,7 @@ fn test_instrument_close_sync_cleanup_handles_synchronous_position_closed_reentr
             default_leverage: Decimal::ONE,
             leverages: ahash::AHashMap::new(),
             book_type: BookType::L1_MBP,
-            fee_model: None,
+            fee_model: Some(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero())),
             fill_model: None,
             latency_model: None,
             frozen_account: false,
@@ -3133,7 +3135,7 @@ fn test_instrument_close_sync_cleanup_handles_synchronous_position_closed_reentr
             config.base_currency,
             cache.clone(),
         );
-        let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone());
+        let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone()).unwrap();
         client.start().unwrap();
 
         let order = OrderTestBuilder::new(OrderType::Market)
@@ -3371,7 +3373,7 @@ fn test_paper_binary_option_multiple_instruments_close_settlement_via_data_engin
     ];
     let venue = instruments[0].0.id().venue;
     let cache = Rc::new(RefCell::new(Cache::default()));
-    let test_clock = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock = Rc::new(RefCell::new(VirtualClock::new()));
     let clock: Rc<RefCell<dyn Clock>> = test_clock.clone();
 
     let mut config = create_config(trader_id, account_id, venue);
@@ -3387,7 +3389,8 @@ fn test_paper_binary_option_multiple_instruments_close_settlement_via_data_engin
         config.base_currency,
         cache.clone(),
     );
-    let mut client = SandboxExecutionClient::new(core, config, clock.clone(), cache.clone());
+    let mut client =
+        SandboxExecutionClient::new(core, config, clock.clone(), cache.clone()).unwrap();
 
     let data_engine = Rc::new(RefCell::new(DataEngine::new(clock, cache.clone(), None)));
     DataEngine::register_msgbus_handlers(&data_engine);
@@ -3736,7 +3739,7 @@ fn test_process_bar_drops_precision_mismatch(
     setup_order_event_handler();
 
     let cache = Rc::new(RefCell::new(Cache::default()));
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let mut config = create_config(trader_id, account_id, venue);
     config.bar_execution = true;
 
@@ -3750,7 +3753,7 @@ fn test_process_bar_drops_precision_mismatch(
         config.base_currency,
         cache.clone(),
     );
-    let client = SandboxExecutionClient::new(core, config, clock, cache.clone());
+    let client = SandboxExecutionClient::new(core, config, clock, cache.clone()).unwrap();
 
     cache
         .borrow_mut()
@@ -3784,7 +3787,7 @@ fn test_message_handler_drops_precision_mismatched_bar(
     setup_order_event_handler();
 
     let cache = Rc::new(RefCell::new(Cache::default()));
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let mut config = create_config(trader_id, account_id, instrument.id().venue);
     config.bar_execution = true;
 
@@ -3798,7 +3801,7 @@ fn test_message_handler_drops_precision_mismatched_bar(
         config.base_currency,
         cache.clone(),
     );
-    let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone());
+    let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone()).unwrap();
 
     cache
         .borrow_mut()
@@ -4015,7 +4018,7 @@ fn test_cancel_all_orders_routes_by_client_account_and_side(
     let account_a_id = AccountId::from("BINANCE-001");
     let account_b_id = AccountId::from("BINANCE-002");
     let cache = Rc::new(RefCell::new(Cache::default()));
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
 
     {
         let mut cache = cache.borrow_mut();
@@ -4041,7 +4044,7 @@ fn test_cancel_all_orders_routes_by_client_account_and_side(
             config.base_currency,
             cache.clone(),
         );
-        SandboxExecutionClient::new(core, config, clock.clone(), cache.clone())
+        SandboxExecutionClient::new(core, config, clock.clone(), cache.clone()).unwrap()
     };
     let mut client_a = create_client(client_a_id, account_a_id);
     let mut client_b = create_client(client_b_id, account_b_id);
@@ -4188,6 +4191,9 @@ fn test_cancel_all_orders_routes_by_client_account_and_side(
 
     let mut engine = ExecutionEngine::new(clock, cache.clone(), None);
     engine.register_client(Box::new(client_a)).unwrap();
+    engine
+        .register_venue_routing(client_a_id, instrument_id.venue)
+        .unwrap();
     engine.register_default_client(Box::new(client_b));
     let command_client = selected_client.map(ClientId::new);
     let routed_client = command_client.unwrap_or(client_a_id);
@@ -4280,7 +4286,7 @@ fn test_submit_order_through_exec_engine_no_reentrant_panic(
     let client_id = ClientId::new("SANDBOX");
 
     let cache = Rc::new(RefCell::new(Cache::default()));
-    let test_clock = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock = Rc::new(RefCell::new(VirtualClock::new()));
     let clock: Rc<RefCell<dyn Clock>> = test_clock.clone();
 
     cache
@@ -4316,7 +4322,7 @@ fn test_submit_order_through_exec_engine_no_reentrant_panic(
         default_leverage: Decimal::ONE,
         leverages: ahash::AHashMap::new(),
         book_type: BookType::L1_MBP,
-        fee_model: None,
+        fee_model: Some(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero())),
         fill_model: None,
         latency_model,
         frozen_account: false,
@@ -4346,7 +4352,7 @@ fn test_submit_order_through_exec_engine_no_reentrant_panic(
         cache.clone(),
     );
     let mut sandbox_client =
-        SandboxExecutionClient::new(core, config, clock.clone(), cache.clone());
+        SandboxExecutionClient::new(core, config, clock.clone(), cache.clone()).unwrap();
     sandbox_client.start().unwrap();
     engine
         .borrow_mut()
@@ -4497,6 +4503,65 @@ fn test_command_response_cannot_overtake_a_fill_through_exec_engine(
     );
     assert_eq!(cached_status(&harness.cache, &resting), OrderStatus::Filled);
     assert_eq!(cached_status(&harness.cache, &next), OrderStatus::Accepted);
+}
+
+/// An immediately marketable IOC must apply its accepted event once through the async execution
+/// channel before the fill event reaches the execution engine.
+#[rstest]
+fn test_async_immediate_limit_ioc_publishes_accepted_before_fill(
+    trader_id: TraderId,
+    instrument: InstrumentAny,
+) {
+    const INSERT_LATENCY_NS: u64 = 1_000_000_000;
+
+    let mut harness = setup_engine_harness(
+        trader_id,
+        &instrument,
+        Some(static_latency_model(INSERT_LATENCY_NS, 0, 0)),
+    );
+
+    let quote = create_quote_tick(instrument.id(), 1000.00, 1001.00);
+    msgbus::publish_quote(
+        format!("data.quotes.{}.{}", instrument.id().venue, instrument.id()).into(),
+        &quote,
+    );
+
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.000"))
+        .price(Price::from("1001.00"))
+        .time_in_force(TimeInForce::Ioc)
+        .client_order_id("O-ASYNC-IOC-1".into())
+        .ts_init(harness.test_clock.borrow().timestamp_ns())
+        .build();
+    cache_order(&harness, &order);
+    submit_cached_through_engine(&harness, trader_id, &order);
+
+    assert_eq!(
+        harness
+            .settle()
+            .iter()
+            .map(order_event_kind)
+            .collect::<Vec<_>>(),
+        vec!["submitted"],
+    );
+
+    let due = UnixNanos::from(*order.ts_init() + INSERT_LATENCY_NS);
+    assert_eq!(advance_and_fire(&harness.test_clock, due), 1);
+
+    let settled: Vec<&str> = harness.settle().iter().map(order_event_kind).collect();
+    assert_eq!(settled, vec!["accepted", "filled"]);
+
+    let published: Vec<&str> = harness
+        .published
+        .borrow()
+        .iter()
+        .filter(|event| event.client_order_id() == order.client_order_id())
+        .map(order_event_kind)
+        .collect();
+    assert_eq!(published, vec!["submitted", "accepted", "filled"]);
+    assert_eq!(cached_status(&harness.cache, &order), OrderStatus::Filled);
 }
 
 /// Commands sharing one due time apply in arrival order: the monotonic `inbound_seq` tie-break
@@ -5891,8 +5956,11 @@ fn test_batch_reduce_only_modifies_share_pending_position_quantity(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     nautilus_common::live::runner::replace_exec_event_sender(tx);
     client.start().unwrap();
-    let mut engine =
-        ExecutionEngine::new(Rc::new(RefCell::new(TestClock::new())), cache.clone(), None);
+    let mut engine = ExecutionEngine::new(
+        Rc::new(RefCell::new(VirtualClock::new())),
+        cache.clone(),
+        None,
+    );
     engine.register_client(Box::new(client)).unwrap();
 
     // Releases whatever the client holds in flight, then processes the channel in arrival order,
@@ -6928,4 +6996,29 @@ fn test_cancel_all_after_first_duplicate_submit_receipt(
         .map(|event| (order_event_kind(event), event.client_order_id()))
         .collect();
     assert_eq!(events, vec![("canceled", order.client_order_id())]);
+}
+
+#[rstest]
+fn test_new_rejects_missing_fee_model(trader_id: TraderId, account_id: AccountId, venue: Venue) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut config = create_config(trader_id, account_id, venue);
+    config.fee_model = None;
+
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+
+    let err = SandboxExecutionClient::new(core, config, clock, cache).unwrap_err();
+    assert!(
+        err.to_string().contains("explicit fee_model"),
+        "unexpected error: {err}"
+    );
 }

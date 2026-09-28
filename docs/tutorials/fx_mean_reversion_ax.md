@@ -78,7 +78,12 @@ for AX EURUSD-PERP backtests.
 ## Prerequisites
 
 - Python 3.12+
-- [NautilusTrader installed](../getting_started/installation.md).
+- [NautilusTrader installed](../getting_started/installation.md) with the
+  [`visualization` extra](../getting_started/installation.md#extras), which
+  provides pandas.
+- A source checkout of the repository. The backtest imports
+  `BBMeanReversion` from `examples/live/architect_ax/strategies.py`, which
+  the installed package does not include.
 - A free TrueFX account, used to download a monthly tick archive.
 
 ## Data preparation
@@ -171,8 +176,6 @@ EURUSD_PERP = PerpetualContract(
     lot_size=Quantity.from_int(1),
     margin_init=Decimal("0.05"),
     margin_maint=Decimal("0.025"),
-    maker_fee=Decimal("0.0002"),
-    taker_fee=Decimal("0.0005"),
     ts_event=0,
     ts_init=0,
 )
@@ -204,12 +207,14 @@ From the repository root:
 
 ```python
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 from nautilus_trader.backtest import BacktestEngine
 from nautilus_trader.common import LogLevel
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.config import LoggerConfig
+from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.model import AccountType
 from nautilus_trader.model import BarType
 from nautilus_trader.model import Money
@@ -236,6 +241,10 @@ engine.add_venue(
     account_type=AccountType.MARGIN,
     base_currency=USD,
     starting_balances=[Money.from_str("100000 USD")],
+    fee_model=MakerTakerFeeModel(
+        maker_rate=Decimal("0.0002"),
+        taker_rate=Decimal("0.0005"),
+    ),
 )
 
 engine.add_instrument(EURUSD_PERP)
@@ -345,6 +354,10 @@ The same `BBMeanReversion` strategy runs live against AX Exchange. The
 launch script swaps the `BacktestEngine` for a `LiveNode` with the AX
 data and execution clients configured. See the live example:
 [`ax_mean_reversion.py`](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/architect_ax/ax_mean_reversion.py).
+The script targets the AX sandbox (`AxEnvironment.SANDBOX` on both client
+configs) and places live sandbox orders. It also sets
+`LiveRiskEngineConfig(bypass=True)`, which skips pre-trade risk checks and
+order rate limits.
 
 For connection setup and API key configuration, see the
 [AX Exchange integration guide](../integrations/architect_ax.md).

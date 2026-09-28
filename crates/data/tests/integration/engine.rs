@@ -34,7 +34,7 @@ use nautilus_common::messages::defi::{
 use nautilus_common::{
     cache::Cache,
     clients::DataClient,
-    clock::{Clock, TestClock},
+    clock::{Clock, VirtualClock},
     messages::data::{
         BarsResponse, BookDeltasResponse, BookDepthResponse, BookResponse, CustomDataResponse,
         DataCommand, DataResponse, FundingRatesResponse, InstrumentResponse, InstrumentsResponse,
@@ -42,16 +42,15 @@ use nautilus_common::{
         RequestBookDeltas, RequestBookDepth, RequestBookSnapshot, RequestCommand,
         RequestCustomData, RequestFundingRates, RequestInstrument, RequestInstruments, RequestJoin,
         RequestOptionChainReferencePrice, RequestQuotes, RequestTrades, SubscribeBars,
-        SubscribeBookDeltas, SubscribeBookDepth10, SubscribeBookSnapshots, SubscribeCommand,
+        SubscribeBookDeltas, SubscribeBookDepth, SubscribeBookSnapshots, SubscribeCommand,
         SubscribeCustomData, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
         SubscribeInstrumentClose, SubscribeInstrumentStatus, SubscribeInstruments,
         SubscribeMarkPrices, SubscribeOptionChain, SubscribeOptionGreeks, SubscribeQuotes,
         SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
-        UnsubscribeBookDepth10, UnsubscribeBookSnapshots, UnsubscribeCommand,
-        UnsubscribeCustomData, UnsubscribeFundingRates, UnsubscribeIndexPrices,
-        UnsubscribeInstrument, UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus,
-        UnsubscribeMarkPrices, UnsubscribeOptionChain, UnsubscribeOptionGreeks, UnsubscribeQuotes,
-        UnsubscribeTrades,
+        UnsubscribeBookDepth, UnsubscribeBookSnapshots, UnsubscribeCommand, UnsubscribeCustomData,
+        UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrument,
+        UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus, UnsubscribeMarkPrices,
+        UnsubscribeOptionChain, UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
     },
     msgbus::{
         self, BusPayloadType, BusTap, Endpoint, MStr, MessageBus, Topic, TypedHandler,
@@ -87,7 +86,7 @@ use nautilus_model::{
     data::{
         Bar, BarType, BookOrder, CustomData, DEPTH10_LEN, Data, DataRef, DataType,
         FundingRateUpdate, IndexPriceUpdate, InstrumentClose, InstrumentStatus, MarkPriceUpdate,
-        OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
+        OrderBookDelta, OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
         greeks::OptionGreekValues,
         option_chain::{OptionChainSlice, OptionGreeks, StrikeRange},
         stubs::{
@@ -109,14 +108,14 @@ use nautilus_model::{
     types::{Currency, Price, Quantity},
 };
 #[cfg(feature = "streaming")]
-use nautilus_persistence::backend::catalog::{ParquetDataCatalog, timestamps_to_filename};
+use nautilus_persistence::backend::parquet::{
+    catalog::ParquetDataCatalog, paths::timestamps_to_filename,
+};
 #[cfg(feature = "streaming")]
 use nautilus_persistence::test_data::RustTestCustomData;
 #[cfg(feature = "streaming")]
 use nautilus_serialization::ensure_custom_data_registered;
 use rstest::*;
-#[cfg(feature = "defi")]
-use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use ustr::Ustr;
 
@@ -133,8 +132,8 @@ fn venue() -> Venue {
 }
 
 #[fixture]
-fn clock() -> Rc<RefCell<TestClock>> {
-    Rc::new(RefCell::new(TestClock::new()))
+fn clock() -> Rc<RefCell<VirtualClock>> {
+    Rc::new(RefCell::new(VirtualClock::new()))
 }
 
 #[fixture]
@@ -170,7 +169,7 @@ fn data_client(
     client_id: ClientId,
     venue: Venue,
     cache: Rc<RefCell<Cache>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
 ) -> DataClientAdapter {
     let client = Box::new(MockDataClient::new(clock, cache, client_id, Some(venue)));
     DataClientAdapter::new(client_id, Some(venue), true, true, client)
@@ -190,7 +189,7 @@ fn dispatch_data(data_engine: &mut DataEngine, data: Data, borrowed: bool) {
 
 // Registers a mock data client for tests
 fn register_mock_client(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -210,7 +209,7 @@ fn register_mock_client(
 }
 
 fn register_failing_subscribe_client(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -389,7 +388,7 @@ impl Drop for CatalogTempDir {
 fn register_empty_catalog(data_engine: &mut DataEngine, label: &str) -> CatalogTempDir {
     let catalog_dir = CatalogTempDir::new(label);
     let catalog = ParquetDataCatalog::new(catalog_dir.path(), None, None, None, None);
-    data_engine.register_catalog(catalog, None);
+    data_engine.register_catalog(Box::new(catalog), None);
     catalog_dir
 }
 
@@ -417,7 +416,7 @@ fn register_quote_catalog(
             None,
         )
         .unwrap();
-    data_engine.register_catalog(catalog, None);
+    data_engine.register_catalog(Box::new(catalog), None);
     catalog_dir
 }
 
@@ -445,7 +444,7 @@ fn register_trade_catalog(
             None,
         )
         .unwrap();
-    data_engine.register_catalog(catalog, None);
+    data_engine.register_catalog(Box::new(catalog), None);
     catalog_dir
 }
 
@@ -474,7 +473,7 @@ fn register_bar_catalog(
             None,
         )
         .unwrap();
-    data_engine.register_catalog(catalog, None);
+    data_engine.register_catalog(Box::new(catalog), None);
     catalog_dir
 }
 
@@ -517,14 +516,14 @@ fn register_custom_catalog(
         last_timestamp,
     );
 
-    data_engine.register_catalog(catalog, None);
+    data_engine.register_catalog(Box::new(catalog), None);
     catalog_dir
 }
 
 #[cfg(feature = "streaming")]
 fn register_recording_client(
     data_engine: &mut DataEngine,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -557,7 +556,7 @@ fn recorded_subscribe_command_with_correlation(
 #[should_panic]
 fn test_register_default_client_twice_panics(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let mut data_engine = data_engine.borrow_mut();
@@ -597,7 +596,7 @@ fn test_register_default_client_twice_panics(
 #[should_panic]
 fn test_register_client_duplicate_id_panics(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let mut data_engine = data_engine.borrow_mut();
@@ -637,7 +636,7 @@ fn test_register_client_duplicate_id_panics(
 #[rstest]
 fn test_register_and_deregister_client(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let mut data_engine = data_engine.borrow_mut();
@@ -688,7 +687,7 @@ fn test_register_and_deregister_client(
 #[rstest]
 fn test_register_default_client(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let mut data_engine = data_engine.borrow_mut();
@@ -718,7 +717,7 @@ fn test_register_default_client(
 #[rstest]
 fn test_execute_subscribe_custom_data(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -773,7 +772,7 @@ fn test_execute_subscribe_custom_data(
 fn test_execute_subscribe_book_deltas(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -837,7 +836,7 @@ fn test_execute_subscribe_book_deltas(
 fn test_execute_subscribe_routes_to_default_client_when_no_client_id(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let mut data_engine = data_engine.borrow_mut();
@@ -881,7 +880,7 @@ fn test_execute_subscribe_routes_to_default_client_when_no_client_id(
 #[rstest]
 fn test_register_venue_routing_routes_exchange_venue_to_client(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let mut data_engine = data_engine.borrow_mut();
@@ -923,7 +922,7 @@ fn test_register_venue_routing_routes_exchange_venue_to_client(
 #[rstest]
 fn test_default_and_venue_routing_apply_independently_for_venue_less_client(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let mut data_engine = data_engine.borrow_mut();
@@ -984,7 +983,7 @@ fn test_default_and_venue_routing_apply_independently_for_venue_less_client(
 fn test_unsubscribe_book_deltas_removes_book_updater(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1045,7 +1044,7 @@ fn test_unsubscribe_book_deltas_removes_book_updater(
 fn test_subscribe_book_deltas_unmanaged_skips_book_updater(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1063,7 +1062,7 @@ fn test_subscribe_book_deltas_unmanaged_skips_book_updater(
     );
 
     let deltas_topic = switchboard::get_book_deltas_topic(audusd_sim.id);
-    let depth_topic = switchboard::get_book_depth10_topic(audusd_sim.id);
+    let depth_topic = switchboard::get_book_depth_topic(audusd_sim.id);
 
     let sub_deltas =
         DataCommand::Subscribe(SubscribeCommand::BookDeltas(SubscribeBookDeltas::new(
@@ -1080,34 +1079,37 @@ fn test_subscribe_book_deltas_unmanaged_skips_book_updater(
         )));
     data_engine.execute(sub_deltas);
 
-    let sub_depth =
-        DataCommand::Subscribe(SubscribeCommand::BookDepth10(SubscribeBookDepth10::new(
-            audusd_sim.id,
-            BookType::L2_MBP,
-            Some(client_id),
-            Some(venue),
-            UUID4::new(),
-            UnixNanos::default(),
-            None,
-            false, // unmanaged
-            None,
-            None,
-        )));
+    let sub_depth = DataCommand::Subscribe(SubscribeCommand::BookDepth(SubscribeBookDepth::new(
+        audusd_sim.id,
+        BookType::L2_MBP,
+        Some(client_id),
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        false, // unmanaged
+        None,
+        None,
+    )));
     data_engine.execute(sub_depth);
 
     assert_eq!(msgbus::subscriber_count_deltas(deltas_topic), 0);
-    assert_eq!(msgbus::subscriber_count_depth10(depth_topic), 0);
+    assert_eq!(msgbus::subscriber_count_depth(depth_topic), 0);
     assert!(
-        data_engine.get_cache().order_book(&audusd_sim.id).is_none(),
+        data_engine
+            .cache()
+            .borrow()
+            .order_book(&audusd_sim.id)
+            .is_none(),
         "unmanaged subscriptions must not auto-create an order book",
     );
 }
 
 #[rstest]
-fn test_unsubscribe_depth10_keeps_deltas_book_updater(
+fn test_unsubscribe_depth_keeps_deltas_book_updater(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1125,9 +1127,9 @@ fn test_unsubscribe_depth10_keeps_deltas_book_updater(
     );
 
     let deltas_topic = switchboard::get_book_deltas_topic(audusd_sim.id);
-    let depth_topic = switchboard::get_book_depth10_topic(audusd_sim.id);
+    let depth_topic = switchboard::get_book_depth_topic(audusd_sim.id);
 
-    // Subscribe to both deltas and depth10
+    // Subscribe to both deltas and depth
     let sub_deltas =
         DataCommand::Subscribe(SubscribeCommand::BookDeltas(SubscribeBookDeltas::new(
             audusd_sim.id,
@@ -1143,42 +1145,40 @@ fn test_unsubscribe_depth10_keeps_deltas_book_updater(
         )));
     data_engine.execute(sub_deltas);
 
-    let sub_depth =
-        DataCommand::Subscribe(SubscribeCommand::BookDepth10(SubscribeBookDepth10::new(
+    let sub_depth = DataCommand::Subscribe(SubscribeCommand::BookDepth(SubscribeBookDepth::new(
+        audusd_sim.id,
+        BookType::L2_MBP,
+        Some(client_id),
+        Some(venue),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        false,
+        None,
+        None,
+    )));
+    data_engine.execute(sub_depth);
+
+    // Only managed deltas own a book updater
+    assert_eq!(msgbus::subscriber_count_deltas(deltas_topic), 1);
+    assert_eq!(msgbus::subscriber_count_depth(depth_topic), 0);
+
+    // Unsubscribe from depth only
+    let unsub_depth =
+        DataCommand::Unsubscribe(UnsubscribeCommand::BookDepth(UnsubscribeBookDepth::new(
             audusd_sim.id,
-            BookType::L2_MBP,
             Some(client_id),
             Some(venue),
             UUID4::new(),
             UnixNanos::default(),
-            None,
-            true,
             None,
             None,
         )));
-    data_engine.execute(sub_depth);
-
-    // BookUpdater subscribed to both topics
-    assert_eq!(msgbus::subscriber_count_deltas(deltas_topic), 1);
-    assert_eq!(msgbus::subscriber_count_depth10(depth_topic), 1);
-
-    // Unsubscribe from depth10 only
-    let unsub_depth = DataCommand::Unsubscribe(UnsubscribeCommand::BookDepth10(
-        UnsubscribeBookDepth10::new(
-            audusd_sim.id,
-            Some(client_id),
-            Some(venue),
-            UUID4::new(),
-            UnixNanos::default(),
-            None,
-            None,
-        ),
-    ));
     data_engine.execute(unsub_depth);
 
-    // BookUpdater should remain subscribed to deltas but not depth10
+    // BookUpdater should remain subscribed to deltas but not depth
     assert_eq!(msgbus::subscriber_count_deltas(deltas_topic), 1);
-    assert_eq!(msgbus::subscriber_count_depth10(depth_topic), 0);
+    assert_eq!(msgbus::subscriber_count_depth(depth_topic), 0);
 
     // Now unsubscribe from deltas - BookUpdater should be fully removed
     let unsub_deltas =
@@ -1194,14 +1194,14 @@ fn test_unsubscribe_depth10_keeps_deltas_book_updater(
     data_engine.execute(unsub_deltas);
 
     assert_eq!(msgbus::subscriber_count_deltas(deltas_topic), 0);
-    assert_eq!(msgbus::subscriber_count_depth10(depth_topic), 0);
+    assert_eq!(msgbus::subscriber_count_depth(depth_topic), 0);
 }
 
 #[rstest]
-fn test_book_depth10_releases_after_final_route_owner(
+fn test_book_depth_releases_after_final_route_owner(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1217,11 +1217,11 @@ fn test_book_depth10_releases_after_final_route_owner(
         &recorder,
         &mut data_engine,
     );
-    let depth_topic = switchboard::get_book_depth10_topic(audusd_sim.id);
+    let depth_topic = switchboard::get_book_depth_topic(audusd_sim.id);
 
     for _ in 0..2 {
-        data_engine.execute(DataCommand::Subscribe(SubscribeCommand::BookDepth10(
-            SubscribeBookDepth10::new(
+        data_engine.execute(DataCommand::Subscribe(SubscribeCommand::BookDepth(
+            SubscribeBookDepth::new(
                 audusd_sim.id,
                 BookType::L2_MBP,
                 Some(client_id),
@@ -1236,32 +1236,30 @@ fn test_book_depth10_releases_after_final_route_owner(
         )));
     }
     assert_eq!(recorder.borrow().len(), 1);
-    assert_eq!(msgbus::subscriber_count_depth10(depth_topic), 1);
+    assert_eq!(msgbus::subscriber_count_depth(depth_topic), 1);
 
     let unsubscribe = || {
-        DataCommand::Unsubscribe(UnsubscribeCommand::BookDepth10(
-            UnsubscribeBookDepth10::new(
-                audusd_sim.id,
-                Some(client_id),
-                Some(venue),
-                UUID4::new(),
-                UnixNanos::default(),
-                None,
-                None,
-            ),
-        ))
+        DataCommand::Unsubscribe(UnsubscribeCommand::BookDepth(UnsubscribeBookDepth::new(
+            audusd_sim.id,
+            Some(client_id),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        )))
     };
     data_engine.execute(unsubscribe());
     assert_eq!(recorder.borrow().len(), 1);
-    assert_eq!(msgbus::subscriber_count_depth10(depth_topic), 1);
+    assert_eq!(msgbus::subscriber_count_depth(depth_topic), 1);
 
     data_engine.execute(unsubscribe());
     assert_eq!(recorder.borrow().len(), 2);
     assert!(matches!(
         &recorder.borrow()[1],
-        DataCommand::Unsubscribe(UnsubscribeCommand::BookDepth10(_))
+        DataCommand::Unsubscribe(UnsubscribeCommand::BookDepth(_))
     ));
-    assert_eq!(msgbus::subscriber_count_depth10(depth_topic), 0);
+    assert_eq!(msgbus::subscriber_count_depth(depth_topic), 0);
 }
 
 fn make_es_future(instrument_id: &str, symbol: &str) -> FuturesContract {
@@ -1309,7 +1307,7 @@ fn make_es_option(instrument_id: &str, symbol: &str, kind: OptionKind) -> Option
 #[rstest]
 fn test_emit_quotes_from_book_depths_publishes_top_of_book(stub_msgbus: Rc<RefCell<MessageBus>>) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let config = DataEngineConfig {
@@ -1325,7 +1323,7 @@ fn test_emit_quotes_from_book_depths_publishes_top_of_book(stub_msgbus: Rc<RefCe
     let quote_topic = switchboard::get_quotes_topic(instrument_id);
     msgbus::subscribe_quotes(quote_topic.into(), handler, None);
 
-    data_engine.process_data(Data::BookDepth10(Box::new(depth)));
+    data_engine.process_data(Data::BookDepth(Box::new(depth.clone())));
 
     let messages = saver.get_messages();
     assert_eq!(
@@ -1337,11 +1335,11 @@ fn test_emit_quotes_from_book_depths_publishes_top_of_book(stub_msgbus: Rc<RefCe
     assert!(cached_quote.is_some(), "synthetic quote should be cached",);
 
     // Same top-of-book: must not republish
-    data_engine.process_data(Data::BookDepth10(Box::new(depth)));
+    data_engine.process_data(Data::BookDepth(Box::new(depth.clone())));
     assert_eq!(saver.get_messages().len(), 1);
 
     // Shifted top-of-book: must republish
-    let mut shifted = depth;
+    let mut shifted = depth.clone();
     shifted.bids[0] = BookOrder::new(
         depth.bids[0].side,
         Price::new(98.50, 2),
@@ -1350,7 +1348,7 @@ fn test_emit_quotes_from_book_depths_publishes_top_of_book(stub_msgbus: Rc<RefCe
     );
     shifted.ts_event = UnixNanos::from(depth.ts_event.as_u64() + 1);
     shifted.ts_init = UnixNanos::from(depth.ts_init.as_u64() + 1);
-    data_engine.process_data(Data::BookDepth10(Box::new(shifted)));
+    data_engine.process_data(Data::BookDepth(Box::new(shifted)));
 
     let messages = saver.get_messages();
     assert_eq!(
@@ -1366,7 +1364,7 @@ fn test_emit_quotes_from_book_depths_skips_no_order_side_padding(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let config = DataEngineConfig {
@@ -1378,7 +1376,7 @@ fn test_emit_quotes_from_book_depths_skips_no_order_side_padding(
     let instrument_id = InstrumentId::from("AAPL.XNAS");
     let padded_bids: [BookOrder; DEPTH10_LEN] = [BookOrder::default(); DEPTH10_LEN];
     let padded_asks: [BookOrder; DEPTH10_LEN] = [BookOrder::default(); DEPTH10_LEN];
-    let depth = OrderBookDepth10::new(
+    let depth = OrderBookDepth::new(
         instrument_id,
         padded_bids,
         padded_asks,
@@ -1394,7 +1392,7 @@ fn test_emit_quotes_from_book_depths_skips_no_order_side_padding(
     let quote_topic = switchboard::get_quotes_topic(instrument_id);
     msgbus::subscribe_quotes(quote_topic.into(), handler, None);
 
-    data_engine.process_data(Data::BookDepth10(Box::new(depth)));
+    data_engine.process_data(Data::BookDepth(Box::new(depth)));
 
     assert!(
         saver.get_messages().is_empty(),
@@ -1419,7 +1417,7 @@ fn test_validate_data_sequence_drops_out_of_order_bar(
     #[case] expect_overwrite: bool,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let config = DataEngineConfig {
@@ -1462,7 +1460,7 @@ fn test_aggregator_emitted_bar_drops_out_of_sequence(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let instrument_id = audusd_sim.id;
@@ -1477,7 +1475,7 @@ fn test_aggregator_emitted_bar_drops_out_of_sequence(
     };
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), Some(config));
 
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -1545,7 +1543,7 @@ fn test_request_scoped_bar_aggregator_runs_alongside_live_subscription(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let instrument_id = audusd_sim.id;
@@ -1555,7 +1553,7 @@ fn test_request_scoped_bar_aggregator_runs_alongside_live_subscription(
         .unwrap();
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -1656,7 +1654,7 @@ fn test_request_scoped_quote_bar_aggregators_handle_multiple_bar_types(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let instrument_id = audusd_sim.id;
@@ -1666,7 +1664,7 @@ fn test_request_scoped_quote_bar_aggregators_handle_multiple_bar_types(
         .unwrap();
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -1738,7 +1736,7 @@ fn test_request_scoped_bar_aggregation_deduplicates_bar_types(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let instrument_id = audusd_sim.id;
@@ -1748,7 +1746,7 @@ fn test_request_scoped_bar_aggregation_deduplicates_bar_types(
         .unwrap();
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -1847,7 +1845,7 @@ fn test_request_scoped_bar_aggregation_does_not_publish_to_live_topic(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let instrument_id = audusd_sim.id;
@@ -1857,7 +1855,7 @@ fn test_request_scoped_bar_aggregation_does_not_publish_to_live_topic(
         .unwrap();
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -1927,7 +1925,7 @@ fn test_request_scoped_time_bar_aggregation_handles_trade_response(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let instrument_id = audusd_sim.id;
@@ -1937,7 +1935,7 @@ fn test_request_scoped_time_bar_aggregation_handles_trade_response(
         .unwrap();
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -2012,7 +2010,7 @@ fn test_request_scoped_composite_bar_aggregator_handles_bar_response(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let instrument_id = audusd_sim.id;
@@ -2022,7 +2020,7 @@ fn test_request_scoped_composite_bar_aggregator_handles_bar_response(
         .unwrap();
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -2187,11 +2185,11 @@ fn response_data_count(response: &BarsResponse) -> Option<u64> {
 }
 
 fn data_engine_clock_at(now: u64) -> Rc<RefCell<dyn Clock>> {
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     clock
         .borrow_mut()
         .as_any_mut()
-        .downcast_mut::<TestClock>()
+        .downcast_mut::<VirtualClock>()
         .unwrap()
         .advance_time(UnixNanos::from(now), true);
     clock
@@ -2212,7 +2210,7 @@ fn test_continuous_future_request_adjusts_external_bars_across_transitions(
 
     let venue = Venue::from("GLBX");
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -2386,7 +2384,7 @@ fn test_continuous_future_request_applies_ratio_to_external_bars(
 
     let venue = Venue::from("GLBX");
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -2502,7 +2500,7 @@ fn test_continuous_future_request_preserves_bar_type_chain(
 
     let venue = Venue::from("GLBX");
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -2619,7 +2617,7 @@ fn test_continuous_future_request_uses_quote_tick_source(
 
     let venue = Venue::from("GLBX");
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -2719,7 +2717,7 @@ fn test_continuous_future_request_start_after_end_emits_empty_parent_response(
 
     let venue = Venue::from("GLBX");
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -2779,11 +2777,11 @@ fn test_continuous_future_request_walks_segments_and_applies_adjustments(
     client_id: ClientId,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     clock
         .borrow_mut()
         .as_any_mut()
-        .downcast_mut::<TestClock>()
+        .downcast_mut::<VirtualClock>()
         .unwrap()
         .advance_time(UnixNanos::from(20), true);
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
@@ -2803,7 +2801,7 @@ fn test_continuous_future_request_walks_segments_and_applies_adjustments(
 
     let venue = Venue::from("GLBX");
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -3005,7 +3003,7 @@ fn test_continuous_future_request_cleans_up_after_first_dispatch_error(
     );
 
     data_engine.deregister_client(&client_id);
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -3049,7 +3047,7 @@ fn test_continuous_future_request_emits_parent_response_on_later_dispatch_error(
 
     let venue = Venue::from("GLBX");
     let mut data_engine = DataEngine::new(clock, cache, None);
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -3119,7 +3117,7 @@ fn test_continuous_future_params_require_request_bars(
     audusd_sim: CurrencyPair,
     client_id: ClientId,
 ) {
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
     let params: Params = serde_json::from_value(json!({
@@ -3171,10 +3169,10 @@ fn register_continuous_future_subscription_engine(
     initial_ns: u64,
 ) -> (
     Rc<RefCell<DataEngine>>,
-    Rc<RefCell<TestClock>>,
+    Rc<RefCell<VirtualClock>>,
     Rc<RefCell<Vec<DataCommand>>>,
 ) {
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     test_clock
         .borrow_mut()
         .advance_time(UnixNanos::from(initial_ns), true);
@@ -3612,7 +3610,7 @@ fn test_continuous_future_subscription_walks_multiple_transitions(
         .borrow_mut()
         .execute(DataCommand::Subscribe(SubscribeCommand::Bars(sub)));
 
-    let fire_timers = |clock: &Rc<RefCell<TestClock>>, to_ns: u64| {
+    let fire_timers = |clock: &Rc<RefCell<VirtualClock>>, to_ns: u64| {
         let events = clock
             .borrow_mut()
             .advance_time(UnixNanos::from(to_ns), true);
@@ -3743,7 +3741,7 @@ fn test_continuous_future_subscription_rejected_when_roller_missing(
     let pre_id = add_es_contract(&cache, "ESH24.GLBX", "ESH24");
     let post_id = add_es_contract(&cache, "ESM24.GLBX", "ESM24");
 
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let engine_clock: Rc<RefCell<dyn Clock>> = test_clock.clone();
     let mut data_engine = DataEngine::new(engine_clock, cache.clone(), None);
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
@@ -3795,7 +3793,7 @@ fn test_update_subscriptions_request_aggregator_can_be_started_live_after_respon
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let instrument_id = audusd_sim.id;
@@ -3805,7 +3803,7 @@ fn test_update_subscriptions_request_aggregator_can_be_started_live_after_respon
         .unwrap();
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -3894,7 +3892,7 @@ fn test_update_subscriptions_request_aggregator_can_subscribe_before_response(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let instrument_id = audusd_sim.id;
@@ -3904,7 +3902,7 @@ fn test_update_subscriptions_request_aggregator_can_subscribe_before_response(
         .unwrap();
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -3998,7 +3996,7 @@ fn test_request_bar_aggregation_rejects_running_update_subscription_aggregator(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let instrument_id = audusd_sim.id;
@@ -4008,7 +4006,7 @@ fn test_request_bar_aggregation_rejects_running_update_subscription_aggregator(
         .unwrap();
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -4063,7 +4061,7 @@ fn test_request_bar_aggregation_rejects_external_bar_type(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let instrument_id = audusd_sim.id;
@@ -4073,7 +4071,7 @@ fn test_request_bar_aggregation_rejects_external_bar_type(
         .unwrap();
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -4120,7 +4118,7 @@ fn test_request_bar_aggregation_cleans_up_after_dispatch_failure(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let instrument_id = audusd_sim.id;
@@ -4153,7 +4151,7 @@ fn test_request_bar_aggregation_cleans_up_after_dispatch_failure(
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("no client found"));
 
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -4203,7 +4201,7 @@ fn test_request_bar_aggregation_reset_clears_pending_aggregators(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let instrument_id = audusd_sim.id;
@@ -4213,7 +4211,7 @@ fn test_request_bar_aggregation_reset_clears_pending_aggregators(
         .unwrap();
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -4296,7 +4294,7 @@ fn test_subscribe_book_deltas_composite_creates_books_per_underlying(
     client_id: ClientId,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let venue = Venue::new("XCME");
 
@@ -4318,7 +4316,7 @@ fn test_subscribe_book_deltas_composite_creates_books_per_underlying(
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
 
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     register_mock_client(
         test_clock,
         cache.clone(),
@@ -4364,7 +4362,7 @@ fn test_composite_book_deltas_route_to_per_underlying_book(
     client_id: ClientId,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let venue = Venue::new("XCME");
 
@@ -4386,7 +4384,7 @@ fn test_composite_book_deltas_route_to_per_underlying_book(
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     register_mock_client(
         test_clock,
         cache.clone(),
@@ -4439,7 +4437,7 @@ fn test_composite_book_deltas_route_each_underlying_independently(
     client_id: ClientId,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let venue = Venue::new("XCME");
 
@@ -4461,7 +4459,7 @@ fn test_composite_book_deltas_route_each_underlying_independently(
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     register_mock_client(
         test_clock,
         cache.clone(),
@@ -4513,7 +4511,7 @@ fn test_reset_unsubscribes_composite_book_deltas(
     client_id: ClientId,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let venue = Venue::new("XCME");
 
@@ -4528,7 +4526,7 @@ fn test_reset_unsubscribes_composite_book_deltas(
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     register_mock_client(
         test_clock,
         cache.clone(),
@@ -4578,7 +4576,7 @@ fn test_composite_and_exact_book_deltas_apply_once_per_publish(
     client_id: ClientId,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let venue = Venue::new("XCME");
 
@@ -4600,7 +4598,7 @@ fn test_composite_and_exact_book_deltas_apply_once_per_publish(
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     register_mock_client(
         test_clock,
         cache.clone(),
@@ -4664,7 +4662,7 @@ fn test_unsubscribe_composite_keeps_overlapping_exact_alive(
     client_id: ClientId,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let venue = Venue::new("XCME");
 
@@ -4686,7 +4684,7 @@ fn test_unsubscribe_composite_keeps_overlapping_exact_alive(
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     register_mock_client(
         test_clock,
         cache.clone(),
@@ -4760,12 +4758,12 @@ fn test_unsubscribe_composite_keeps_overlapping_exact_alive(
 }
 
 #[rstest]
-fn test_unsubscribe_composite_deltas_keeps_composite_depth10_alive(
+fn test_unsubscribe_composite_deltas_keeps_composite_depth_alive(
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let venue = Venue::new("XCME");
 
@@ -4778,7 +4776,7 @@ fn test_unsubscribe_composite_deltas_keeps_composite_depth10_alive(
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     register_mock_client(
         test_clock,
         cache.clone(),
@@ -4799,13 +4797,13 @@ fn test_unsubscribe_composite_deltas_keeps_composite_depth10_alive(
             UUID4::new(),
             UnixNanos::default(),
             None,
-            true,
+            false,
             None,
             Some(parent_params()),
         ),
     )));
-    data_engine.execute(DataCommand::Subscribe(SubscribeCommand::BookDepth10(
-        SubscribeBookDepth10::new(
+    data_engine.execute(DataCommand::Subscribe(SubscribeCommand::BookDepth(
+        SubscribeBookDepth::new(
             composite_id,
             BookType::L2_MBP,
             Some(client_id),
@@ -4833,26 +4831,33 @@ fn test_unsubscribe_composite_deltas_keeps_composite_depth10_alive(
 
     let mut depth = stub_depth10();
     depth.instrument_id = esz1_id;
-    data_engine.process_data(Data::BookDepth10(Box::new(depth)));
+    let mut expected = OrderBook::new(esz1_id, BookType::L2_MBP);
+    expected.apply_depth(&depth).unwrap();
+    data_engine.process_data(Data::BookDepth(Box::new(depth)));
 
     let cache_view = cache.borrow();
     let esz1_book = cache_view
         .order_book(&esz1_id)
-        .expect("ESZ1 book must exist while composite depth10 sub is active");
-    assert!(
-        esz1_book.update_count >= 1,
-        "depth10 publish must reach the per-underlying book; \
-         composite depth10 sub kept alive after deltas unsubscribed",
+        .expect("ESZ1 book must exist while composite depth sub is active");
+    assert_eq!(esz1_book.bids_as_map(None), expected.bids_as_map(None));
+    assert_eq!(esz1_book.asks_as_map(None), expected.asks_as_map(None));
+    assert_eq!(
+        msgbus::subscriber_count_deltas(switchboard::get_book_deltas_topic(esz1_id)),
+        0
+    );
+    assert_eq!(
+        msgbus::subscriber_count_depth(switchboard::get_book_depth_topic(esz1_id)),
+        1
     );
 }
 
 #[rstest]
-fn test_unsubscribe_composite_deltas_keeps_exact_depth10_deltas_handler_alive(
+fn test_unsubscribe_composite_deltas_keeps_exact_depth_handler_alive(
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let venue = Venue::new("XCME");
 
@@ -4871,7 +4876,7 @@ fn test_unsubscribe_composite_deltas_keeps_exact_depth10_deltas_handler_alive(
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     register_mock_client(
         test_clock,
         cache.clone(),
@@ -4883,8 +4888,8 @@ fn test_unsubscribe_composite_deltas_keeps_exact_depth10_deltas_handler_alive(
     );
 
     let composite_id = InstrumentId::from("ES.FUT.XCME");
-    data_engine.execute(DataCommand::Subscribe(SubscribeCommand::BookDepth10(
-        SubscribeBookDepth10::new(
+    data_engine.execute(DataCommand::Subscribe(SubscribeCommand::BookDepth(
+        SubscribeBookDepth::new(
             esz1_id,
             BookType::L2_MBP,
             Some(client_id),
@@ -4906,7 +4911,7 @@ fn test_unsubscribe_composite_deltas_keeps_exact_depth10_deltas_handler_alive(
             UUID4::new(),
             UnixNanos::default(),
             None,
-            true,
+            false,
             None,
             Some(parent_params()),
         ),
@@ -4928,21 +4933,34 @@ fn test_unsubscribe_composite_deltas_keeps_exact_depth10_deltas_handler_alive(
         OrderBookDeltaTestBuilder::new(esz1_id).build(),
     ));
 
+    assert_eq!(cache.borrow().order_book(&esz1_id).unwrap().update_count, 0);
+    let mut depth = stub_depth10();
+    depth.instrument_id = esz1_id;
+    let mut expected = OrderBook::new(esz1_id, BookType::L2_MBP);
+    expected.apply_depth(&depth).unwrap();
+    data_engine.process_data(Data::BookDepth(Box::new(depth)));
+
     let cache_view = cache.borrow();
+    let book = cache_view.order_book(&esz1_id).unwrap();
+    assert_eq!(book.bids_as_map(None), expected.bids_as_map(None));
+    assert_eq!(book.asks_as_map(None), expected.asks_as_map(None));
     assert_eq!(
-        cache_view.order_book(&esz1_id).unwrap().update_count,
-        1,
-        "exact depth10 sub keeps the per-underlying deltas handler alive after composite deltas unsubscribed",
+        msgbus::subscriber_count_deltas(switchboard::get_book_deltas_topic(esz1_id)),
+        0
+    );
+    assert_eq!(
+        msgbus::subscriber_count_depth(switchboard::get_book_depth_topic(esz1_id)),
+        1
     );
 }
 
 #[rstest]
-fn test_snapshot_after_deltas_keeps_depth10_handler_alive(
+fn test_snapshot_after_deltas_keeps_delta_handler_alive(
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let venue = Venue::new("XCME");
 
@@ -4955,7 +4973,7 @@ fn test_snapshot_after_deltas_keeps_depth10_handler_alive(
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     register_mock_client(
         test_clock,
         cache.clone(),
@@ -5009,16 +5027,23 @@ fn test_snapshot_after_deltas_keeps_depth10_handler_alive(
 
     let mut depth = stub_depth10();
     depth.instrument_id = esz1_id;
-    data_engine.process_data(Data::BookDepth10(Box::new(depth)));
+    data_engine.process_data(Data::BookDepth(Box::new(depth)));
+
+    assert_eq!(cache.borrow().order_book(&esz1_id).unwrap().update_count, 0);
+    data_engine.process_data(Data::BookDelta(
+        OrderBookDeltaTestBuilder::new(esz1_id).build(),
+    ));
 
     let cache_view = cache.borrow();
-    let book = cache_view
-        .order_book(&esz1_id)
-        .expect("ESZ1 book must exist while snapshot sub is active");
-    assert!(
-        book.update_count >= 1,
-        "depth10 publish must reach the per-underlying book; \
-         deltas-then-snapshots path now registers the depth10 handler",
+    let book = cache_view.order_book(&esz1_id).unwrap();
+    assert_eq!(book.update_count, 1);
+    assert_eq!(
+        msgbus::subscriber_count_deltas(switchboard::get_book_deltas_topic(esz1_id)),
+        1
+    );
+    assert_eq!(
+        msgbus::subscriber_count_depth(switchboard::get_book_depth_topic(esz1_id)),
+        0
     );
 }
 
@@ -5028,14 +5053,14 @@ fn test_subscribe_book_deltas_composite_with_no_underlyings_is_noop(
     client_id: ClientId,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let venue = Venue::new("XCME");
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     register_mock_client(
         test_clock,
         cache.clone(),
@@ -5080,7 +5105,7 @@ fn test_parent_book_deltas_filters_by_instrument_class(
     client_id: ClientId,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let venue = Venue::new("XCME");
 
@@ -5106,7 +5131,7 @@ fn test_parent_book_deltas_filters_by_instrument_class(
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     register_mock_client(
         test_clock,
         cache.clone(),
@@ -5149,7 +5174,7 @@ fn test_parent_book_deltas_filters_by_instrument_class(
 
 #[rstest]
 fn test_parent_book_snapshots_filter_by_instrument_class(client_id: ClientId) {
-    let clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let venue = Venue::new("XCME");
 
@@ -5246,13 +5271,13 @@ fn test_parent_subscribe_with_unparsable_id_returns_error(
     client_id: ClientId,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let venue = Venue::new("BETFAIR");
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     register_mock_client(
         test_clock,
         cache.clone(),
@@ -5313,18 +5338,18 @@ fn test_parent_subscribe_with_unparsable_id_returns_error(
 }
 
 #[rstest]
-fn test_depth10_parent_subscribe_with_unparsable_id_returns_error(
+fn test_depth_parent_subscribe_with_unparsable_id_returns_error(
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let venue = Venue::new("BETFAIR");
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     register_mock_client(
         test_clock,
         cache.clone(),
@@ -5336,7 +5361,7 @@ fn test_depth10_parent_subscribe_with_unparsable_id_returns_error(
     );
 
     let runner = InstrumentId::from("1.211334112-31570229.BETFAIR");
-    let sub = DataCommand::Subscribe(SubscribeCommand::BookDepth10(SubscribeBookDepth10::new(
+    let sub = DataCommand::Subscribe(SubscribeCommand::BookDepth(SubscribeBookDepth::new(
         runner,
         BookType::L2_MBP,
         Some(client_id),
@@ -5354,16 +5379,16 @@ fn test_depth10_parent_subscribe_with_unparsable_id_returns_error(
         let cache_view = cache.borrow();
         assert!(
             cache_view.order_book(&runner).is_none(),
-            "parent depth10 subscribe with an unparsable Betfair runner id must NOT create a book",
+            "parent depth subscribe with an unparsable Betfair runner id must NOT create a book",
         );
     }
     assert!(
-        !data_engine.subscribed_book_depth10().contains(&runner),
-        "rejected parent depth10 subscribe must NOT leave the id in book_depth10_subs",
+        !data_engine.subscribed_book_depth().contains(&runner),
+        "rejected parent depth subscribe must NOT leave the id in book_depth_subs",
     );
 
     // Retrying without the parent flag on the same id must succeed.
-    let retry = DataCommand::Subscribe(SubscribeCommand::BookDepth10(SubscribeBookDepth10::new(
+    let retry = DataCommand::Subscribe(SubscribeCommand::BookDepth(SubscribeBookDepth::new(
         runner,
         BookType::L2_MBP,
         Some(client_id),
@@ -5378,7 +5403,7 @@ fn test_depth10_parent_subscribe_with_unparsable_id_returns_error(
     data_engine.execute(retry);
     assert!(
         cache.borrow().order_book(&runner).is_some(),
-        "concrete depth10 subscribe after a rejected parent attempt must still create the exact-id book",
+        "concrete depth subscribe after a rejected parent attempt must still create the exact-id book",
     );
 }
 
@@ -5388,13 +5413,13 @@ fn test_snapshots_parent_subscribe_with_unparsable_id_returns_error(
     client_id: ClientId,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let venue = Venue::new("BETFAIR");
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     register_mock_client(
         test_clock,
         cache,
@@ -5458,7 +5483,7 @@ fn test_concrete_subscribe_does_not_register_parent_expansion(
     client_id: ClientId,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let venue = Venue::new("XCME");
 
@@ -5479,7 +5504,7 @@ fn test_concrete_subscribe_does_not_register_parent_expansion(
 
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     register_mock_client(
         test_clock,
         cache.clone(),
@@ -5521,7 +5546,7 @@ fn test_concrete_subscribe_does_not_register_parent_expansion(
 fn test_backtest_client_overrides_subscribe_routing(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     venue: Venue,
 ) {
@@ -5578,7 +5603,7 @@ fn test_backtest_client_overrides_subscribe_routing(
 fn test_backtest_client_overrides_when_registered_as_default(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     venue: Venue,
 ) {
@@ -5640,7 +5665,7 @@ fn test_emit_quotes_from_book_publishes_on_delta_apply(
     client_id: ClientId,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let config = DataEngineConfig {
@@ -5653,7 +5678,7 @@ fn test_emit_quotes_from_book_publishes_on_delta_apply(
     let instrument_id = deltas.instrument_id;
     let venue = instrument_id.venue;
 
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -5703,7 +5728,7 @@ fn test_emit_quotes_from_book_publishes_on_depth_apply(
     client_id: ClientId,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let config = DataEngineConfig {
@@ -5716,7 +5741,7 @@ fn test_emit_quotes_from_book_publishes_on_depth_apply(
     let instrument_id = depth.instrument_id;
     let venue = instrument_id.venue;
 
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -5728,7 +5753,7 @@ fn test_emit_quotes_from_book_publishes_on_depth_apply(
         &mut data_engine,
     );
 
-    let sub = DataCommand::Subscribe(SubscribeCommand::BookDepth10(SubscribeBookDepth10::new(
+    let sub = DataCommand::Subscribe(SubscribeCommand::BookDepth(SubscribeBookDepth::new(
         instrument_id,
         BookType::L2_MBP,
         Some(client_id),
@@ -5746,7 +5771,7 @@ fn test_emit_quotes_from_book_publishes_on_depth_apply(
     let quote_topic = switchboard::get_quotes_topic(instrument_id);
     msgbus::subscribe_quotes(quote_topic.into(), handler, None);
 
-    data_engine.process_data(Data::BookDepth10(Box::new(depth)));
+    data_engine.process_data(Data::BookDepth(Box::new(depth)));
 
     let messages = saver.get_messages();
     assert_eq!(
@@ -5759,26 +5784,26 @@ fn test_emit_quotes_from_book_publishes_on_depth_apply(
 #[derive(Clone, Copy, Debug)]
 enum BookSubscriptionKind {
     Deltas,
-    Depth10,
+    Depth,
 }
 
 impl BookSubscriptionKind {
     fn failure(self) -> MockSubscribeFailure {
         match self {
             Self::Deltas => MockSubscribeFailure::BookDeltas,
-            Self::Depth10 => MockSubscribeFailure::BookDepth10,
+            Self::Depth => MockSubscribeFailure::BookDepth,
         }
     }
 }
 
 #[rstest]
 #[case::deltas(BookSubscriptionKind::Deltas)]
-#[case::depth10(BookSubscriptionKind::Depth10)]
+#[case::depth(BookSubscriptionKind::Depth)]
 fn test_shared_book_subscription_retries_after_client_failure(
     #[case] kind: BookSubscriptionKind,
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -5808,7 +5833,7 @@ fn test_shared_book_subscription_retries_after_client_failure(
             None,
             None,
         )),
-        BookSubscriptionKind::Depth10 => SubscribeCommand::BookDepth10(SubscribeBookDepth10::new(
+        BookSubscriptionKind::Depth => SubscribeCommand::BookDepth(SubscribeBookDepth::new(
             audusd_sim.id,
             BookType::L2_MBP,
             Some(client_id),
@@ -5845,17 +5870,15 @@ fn test_shared_book_subscription_retries_after_client_failure(
             None,
             None,
         )),
-        BookSubscriptionKind::Depth10 => {
-            UnsubscribeCommand::BookDepth10(UnsubscribeBookDepth10::new(
-                audusd_sim.id,
-                Some(client_id),
-                Some(venue),
-                command_id,
-                UnixNanos::from(2),
-                None,
-                None,
-            ))
-        }
+        BookSubscriptionKind::Depth => UnsubscribeCommand::BookDepth(UnsubscribeBookDepth::new(
+            audusd_sim.id,
+            Some(client_id),
+            Some(venue),
+            command_id,
+            UnixNanos::from(2),
+            None,
+            None,
+        )),
     };
     data_engine.execute(DataCommand::Unsubscribe(unsubscribe(UUID4::new())));
     assert_eq!(
@@ -5875,7 +5898,7 @@ fn test_shared_book_subscription_retries_after_client_failure(
 fn test_shared_book_snapshot_retries_source_after_client_failure(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -5969,7 +5992,7 @@ fn test_shared_book_snapshot_retries_source_after_client_failure(
 fn test_book_snapshot_retains_existing_deltas_source(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -6060,7 +6083,7 @@ fn test_book_snapshot_retains_existing_deltas_source(
 fn test_reset_clears_book_state_and_timers(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -6078,7 +6101,7 @@ fn test_reset_clears_book_state_and_timers(
     );
 
     let deltas_topic = switchboard::get_book_deltas_topic(audusd_sim.id);
-    let depth_topic = switchboard::get_book_depth10_topic(audusd_sim.id);
+    let depth_topic = switchboard::get_book_depth_topic(audusd_sim.id);
 
     let sub_deltas =
         DataCommand::Subscribe(SubscribeCommand::BookDeltas(SubscribeBookDeltas::new(
@@ -6114,14 +6137,14 @@ fn test_reset_clears_book_state_and_timers(
     assert_eq!(msgbus::subscriber_count_deltas(deltas_topic), 1);
     assert_eq!(recorder.borrow().len(), 1);
     assert!(!data_engine.subscribed_book_snapshots().is_empty());
-    assert!(!data_engine.get_clock().timer_names().is_empty());
+    assert!(!data_engine.clock().borrow().timer_names().is_empty());
 
     data_engine.reset();
 
     assert_eq!(msgbus::subscriber_count_deltas(deltas_topic), 0);
-    assert_eq!(msgbus::subscriber_count_depth10(depth_topic), 0);
+    assert_eq!(msgbus::subscriber_count_depth(depth_topic), 0);
     assert!(data_engine.subscribed_book_snapshots().is_empty());
-    assert!(data_engine.get_clock().timer_names().is_empty());
+    assert!(data_engine.clock().borrow().timer_names().is_empty());
     assert_eq!(data_engine.command_count(), 0);
     assert_eq!(data_engine.data_count(), 0);
 
@@ -6146,7 +6169,7 @@ fn test_reset_clears_book_state_and_timers(
 #[rstest]
 fn test_reset_clears_book_and_option_chain_state_and_allows_resubscribe(
     audusd_sim: CurrencyPair,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -6186,7 +6209,7 @@ fn test_reset_clears_book_and_option_chain_state_and_allows_resubscribe(
 
     let book_id = audusd_sim.id;
     let deltas_topic = switchboard::get_book_deltas_topic(book_id);
-    let depth_topic = switchboard::get_book_depth10_topic(book_id);
+    let depth_topic = switchboard::get_book_depth_topic(book_id);
     let greeks_topic = switchboard::get_option_greeks_topic(call_id);
     let series_id = make_series_id();
 
@@ -6234,18 +6257,32 @@ fn test_reset_clears_book_and_option_chain_state_and_allows_resubscribe(
     subscribe_all(&data_engine);
 
     assert_eq!(msgbus::subscriber_count_deltas(deltas_topic), 1);
-    assert_eq!(msgbus::subscriber_count_depth10(depth_topic), 1);
+    assert_eq!(msgbus::subscriber_count_depth(depth_topic), 0);
     assert!(!data_engine.borrow().subscribed_book_snapshots().is_empty());
-    assert!(!data_engine.borrow().get_clock().timer_names().is_empty());
+    assert!(
+        !data_engine
+            .borrow()
+            .clock()
+            .borrow()
+            .timer_names()
+            .is_empty()
+    );
     assert!(data_engine.borrow().has_option_chain_manager(&series_id));
     assert!(msgbus::exact_subscriber_count_option_greeks(greeks_topic) >= 1);
 
     data_engine.borrow_mut().reset();
 
     assert_eq!(msgbus::subscriber_count_deltas(deltas_topic), 0);
-    assert_eq!(msgbus::subscriber_count_depth10(depth_topic), 0);
+    assert_eq!(msgbus::subscriber_count_depth(depth_topic), 0);
     assert!(data_engine.borrow().subscribed_book_snapshots().is_empty());
-    assert!(data_engine.borrow().get_clock().timer_names().is_empty());
+    assert!(
+        data_engine
+            .borrow()
+            .clock()
+            .borrow()
+            .timer_names()
+            .is_empty()
+    );
     assert!(!data_engine.borrow().has_option_chain_manager(&series_id));
     assert_eq!(data_engine.borrow().pending_option_chain_request_count(), 0);
     assert_eq!(
@@ -6256,9 +6293,16 @@ fn test_reset_clears_book_and_option_chain_state_and_allows_resubscribe(
     subscribe_all(&data_engine);
 
     assert_eq!(msgbus::subscriber_count_deltas(deltas_topic), 1);
-    assert_eq!(msgbus::subscriber_count_depth10(depth_topic), 1);
+    assert_eq!(msgbus::subscriber_count_depth(depth_topic), 0);
     assert!(!data_engine.borrow().subscribed_book_snapshots().is_empty());
-    assert!(!data_engine.borrow().get_clock().timer_names().is_empty());
+    assert!(
+        !data_engine
+            .borrow()
+            .clock()
+            .borrow()
+            .timer_names()
+            .is_empty()
+    );
     assert!(data_engine.borrow().has_option_chain_manager(&series_id));
     assert!(msgbus::exact_subscriber_count_option_greeks(greeks_topic) >= 1);
 }
@@ -6267,7 +6311,7 @@ fn test_reset_clears_book_and_option_chain_state_and_allows_resubscribe(
 fn test_execute_subscribe_instrument(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -6329,7 +6373,7 @@ fn test_execute_subscribe_instrument(
 fn test_execute_subscribe_quotes(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -6384,7 +6428,7 @@ fn test_execute_subscribe_quotes(
 fn test_catalog_start_ns_prefill_quotes_from_catalog(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -6424,7 +6468,7 @@ fn test_catalog_start_ns_prefill_quotes_from_catalog(
 fn test_catalog_start_ns_prefill_quotes_preserves_existing_start_ns(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -6465,7 +6509,7 @@ fn test_catalog_start_ns_prefill_quotes_preserves_existing_start_ns(
 fn test_catalog_start_ns_prefill_quotes_sets_null_without_catalog_hit(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -6506,7 +6550,7 @@ fn test_catalog_start_ns_prefill_quotes_sets_null_without_catalog_hit(
 fn test_catalog_start_ns_prefill_trades_from_catalog(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -6545,7 +6589,7 @@ fn test_catalog_start_ns_prefill_trades_from_catalog(
 #[rstest]
 fn test_catalog_start_ns_prefill_external_bars_from_catalog(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -6586,7 +6630,7 @@ fn test_catalog_start_ns_prefill_external_bars_from_catalog(
 fn test_catalog_start_ns_prefill_skips_internal_bars(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -6631,7 +6675,7 @@ fn test_catalog_start_ns_prefill_skips_internal_bars(
 #[rstest]
 fn test_catalog_start_ns_prefill_custom_data_from_catalog(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -6671,7 +6715,7 @@ fn test_catalog_start_ns_prefill_custom_data_from_catalog(
 #[rstest]
 fn test_catalog_start_ns_prefill_custom_data_sets_null_without_catalog_hit(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -6712,7 +6756,7 @@ fn test_catalog_start_ns_prefill_custom_data_sets_null_without_catalog_hit(
 #[rstest]
 fn test_catalog_start_ns_prefill_custom_data_without_identifier_merges_catalog_intervals(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -6738,7 +6782,7 @@ fn test_catalog_start_ns_prefill_custom_data_without_identifier_merges_catalog_i
         5_000,
         6_000,
     );
-    data_engine.register_catalog(catalog, None);
+    data_engine.register_catalog(Box::new(catalog), None);
     let data_type = DataType::new(type_name, None, None);
     let correlation_id = UUID4::new();
 
@@ -6771,7 +6815,7 @@ fn test_catalog_start_ns_prefill_custom_data_without_identifier_merges_catalog_i
 #[rstest]
 fn test_catalog_start_ns_prefill_custom_data_preserves_existing_start_ns(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -6812,7 +6856,7 @@ fn test_catalog_start_ns_prefill_custom_data_preserves_existing_start_ns(
 #[rstest]
 fn test_catalog_start_ns_prefill_custom_data_preserves_command_metadata(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -6897,7 +6941,7 @@ impl BusTap for RecordingSendTap {
 
 #[rstest]
 fn test_subscribe_spread_quotes_default_interval_publishes_on_timer(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -6946,7 +6990,8 @@ fn test_subscribe_spread_quotes_default_interval_publishes_on_timer(
     let timer_name = format!("SPREAD_QUOTE_{spread_id}");
     assert!(
         data_engine
-            .get_clock()
+            .clock()
+            .borrow()
             .timer_names()
             .iter()
             .any(|name| *name == timer_name)
@@ -6996,7 +7041,7 @@ fn test_subscribe_spread_quotes_default_interval_publishes_on_timer(
 #[rstest]
 fn test_subscribe_spread_quotes_with_zero_interval_publishes_spread_quote(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -7089,7 +7134,7 @@ fn test_subscribe_spread_quotes_with_zero_interval_publishes_spread_quote(
 
 #[rstest]
 fn test_subscribe_spread_quotes_without_exchange_endpoint_publishes_spread_quote(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -7174,7 +7219,7 @@ fn test_subscribe_spread_quotes_without_exchange_endpoint_publishes_spread_quote
 #[rstest]
 fn test_unsubscribe_spread_quotes_stops_default_interval_timer(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -7211,7 +7256,8 @@ fn test_unsubscribe_spread_quotes_stops_default_interval_timer(
     let timer_name = format!("SPREAD_QUOTE_{spread_id}");
     assert!(
         data_engine
-            .get_clock()
+            .clock()
+            .borrow()
             .timer_names()
             .iter()
             .any(|name| *name == timer_name)
@@ -7229,7 +7275,7 @@ fn test_unsubscribe_spread_quotes_stops_default_interval_timer(
     data_engine.execute(DataCommand::Unsubscribe(UnsubscribeCommand::Quotes(unsub)));
 
     let (leg_a, leg_b) = generic_futures_spread_legs();
-    assert!(data_engine.get_clock().timer_names().is_empty());
+    assert!(data_engine.clock().borrow().timer_names().is_empty());
     assert_eq!(
         msgbus::exact_subscriber_count_quotes(switchboard::get_quotes_topic(leg_a)),
         0
@@ -7243,7 +7289,7 @@ fn test_unsubscribe_spread_quotes_stops_default_interval_timer(
 #[rstest]
 fn test_unsubscribe_spread_quotes_removes_leg_handlers(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -7332,7 +7378,7 @@ fn test_unsubscribe_spread_quotes_removes_leg_handlers(
 #[rstest]
 fn test_spread_quotes_release_after_final_owner_with_first_route(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -7422,7 +7468,7 @@ fn test_spread_quotes_release_after_final_owner_with_first_route(
 #[rstest]
 fn test_shared_spread_quotes_retry_failed_leg(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -7521,7 +7567,7 @@ fn test_shared_spread_quotes_retry_failed_leg(
 #[rstest]
 fn test_spread_quotes_retain_existing_leg_sources(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -7620,7 +7666,7 @@ fn test_spread_quotes_retain_existing_leg_sources(
 #[rstest]
 fn test_reset_stops_spread_quote_timer_and_removes_leg_handlers(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -7657,7 +7703,8 @@ fn test_reset_stops_spread_quote_timer_and_removes_leg_handlers(
     let timer_name = format!("SPREAD_QUOTE_{spread_id}");
     assert!(
         data_engine
-            .get_clock()
+            .clock()
+            .borrow()
             .timer_names()
             .iter()
             .any(|name| *name == timer_name)
@@ -7665,7 +7712,7 @@ fn test_reset_stops_spread_quote_timer_and_removes_leg_handlers(
 
     data_engine.reset();
 
-    assert!(data_engine.get_clock().timer_names().is_empty());
+    assert!(data_engine.clock().borrow().timer_names().is_empty());
     assert_eq!(
         msgbus::exact_subscriber_count_quotes(switchboard::get_quotes_topic(leg_a)),
         0
@@ -7680,7 +7727,7 @@ fn test_reset_stops_spread_quote_timer_and_removes_leg_handlers(
 fn test_unsubscribe_quotes_keeps_client_subscribed_until_final_owner(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -7778,7 +7825,7 @@ fn test_unsubscribe_quotes_keeps_client_subscribed_until_final_owner(
 fn test_unsubscribe_quotes_ignores_wildcard_observers(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -7830,7 +7877,7 @@ fn test_unsubscribe_quotes_ignores_wildcard_observers(
 fn test_execute_subscribe_trades(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -7884,7 +7931,7 @@ fn test_execute_subscribe_trades(
 fn test_unsubscribe_trades_ignores_wildcard_observers(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -7934,7 +7981,7 @@ fn test_unsubscribe_trades_ignores_wildcard_observers(
 fn test_execute_subscribe_internal_bars_stays_local(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -8015,7 +8062,7 @@ fn test_execute_subscribe_internal_bars_stays_local(
 fn test_shared_internal_bars_retry_failed_source(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -8072,7 +8119,7 @@ fn test_shared_internal_bars_retry_failed_source(
 fn test_unsubscribe_internal_bars_stays_local_with_remaining_exact_subscribers(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -8169,7 +8216,7 @@ fn test_external_client_internal_bar_subscription_skips_local_aggregator(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let instrument = InstrumentAny::CurrencyPair(audusd_sim);
@@ -8181,7 +8228,7 @@ fn test_external_client_internal_bar_subscription_skips_local_aggregator(
     };
     let mut data_engine = DataEngine::new(clock, cache.clone(), Some(config));
 
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -8219,7 +8266,7 @@ fn test_external_client_subscribe_registers_streamable_payload_types(
     client_id: ClientId,
     venue: Venue,
 ) {
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let config = DataEngineConfig {
         external_clients: Some(vec![client_id]),
@@ -8242,7 +8289,7 @@ fn test_external_client_forwards_subscribe_and_unsubscribe_commands(
     client_id: ClientId,
     venue: Venue,
 ) {
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let config = DataEngineConfig {
         external_clients: Some(vec![client_id]),
@@ -8299,7 +8346,7 @@ fn test_external_client_releases_after_final_owner(
     client_id: ClientId,
     venue: Venue,
 ) {
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let config = DataEngineConfig {
         external_clients: Some(vec![client_id]),
@@ -8387,7 +8434,7 @@ fn test_external_option_chain_releases_after_final_owner(
     client_id: ClientId,
     venue: Venue,
 ) {
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let config = DataEngineConfig {
         external_clients: Some(vec![client_id]),
@@ -8468,7 +8515,7 @@ fn test_external_option_chain_edit_moves_owner_to_new_client(
     venue: Venue,
 ) {
     let edited_client_id = ClientId::from("EDITED-EXTERNAL-CLIENT");
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let config = DataEngineConfig {
         external_clients: Some(vec![client_id, edited_client_id]),
@@ -8566,11 +8613,11 @@ fn test_regular_client_subscribe_does_not_register_streaming_payload_type(
     client_id: ClientId,
     venue: Venue,
 ) {
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
-    let test_clock: Rc<RefCell<TestClock>> = Rc::new(RefCell::new(TestClock::new()));
+    let test_clock: Rc<RefCell<VirtualClock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         test_clock,
@@ -8605,7 +8652,7 @@ fn test_external_client_subscribe_keeps_non_streamable_payload_types_closed(
     client_id: ClientId,
     venue: Venue,
 ) {
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let config = DataEngineConfig {
         external_clients: Some(vec![client_id]),
@@ -8702,8 +8749,8 @@ fn streamable_subscribe_cases(
             BusPayloadType::OrderBookDeltas,
         ),
         (
-            "book depth10",
-            SubscribeCommand::BookDepth10(SubscribeBookDepth10::new(
+            "book depth",
+            SubscribeCommand::BookDepth(SubscribeBookDepth::new(
                 instrument_id,
                 BookType::L2_MBP,
                 Some(client_id),
@@ -8715,7 +8762,7 @@ fn streamable_subscribe_cases(
                 None,
                 None,
             )),
-            BusPayloadType::OrderBookDepth10,
+            BusPayloadType::OrderBookDepth,
         ),
         (
             "quotes",
@@ -8890,7 +8937,7 @@ fn data_streaming_payload_types() -> Vec<BusPayloadType> {
         BusPayloadType::Custom(Ustr::from("RustTestCustomData")),
         BusPayloadType::Instrument,
         BusPayloadType::OrderBookDeltas,
-        BusPayloadType::OrderBookDepth10,
+        BusPayloadType::OrderBookDepth,
         BusPayloadType::QuoteTick,
         BusPayloadType::TradeTick,
         BusPayloadType::Bar,
@@ -8905,7 +8952,7 @@ fn data_streaming_payload_types() -> Vec<BusPayloadType> {
 fn test_bar_aggregator_quote_subscription_priority_is_between_4_and_6(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -8978,7 +9025,7 @@ fn test_bar_aggregator_quote_subscription_priority_is_between_4_and_6(
 fn test_bar_aggregator_trade_subscription_priority_is_between_4_and_6(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -9051,7 +9098,7 @@ fn test_bar_aggregator_trade_subscription_priority_is_between_4_and_6(
 fn test_composite_bar_aggregator_source_bar_subscription_uses_default_priority(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -9121,7 +9168,7 @@ fn test_composite_bar_aggregator_source_bar_subscription_uses_default_priority(
 fn test_execute_subscribe_mark_prices(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -9183,7 +9230,7 @@ fn test_execute_subscribe_mark_prices(
 fn test_unsubscribe_mark_prices_keeps_client_subscribed_until_final_owner(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -9266,7 +9313,7 @@ fn test_unsubscribe_mark_prices_keeps_client_subscribed_until_final_owner(
 fn test_unsubscribe_mark_prices_ignores_wildcard_observers(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -9317,7 +9364,7 @@ fn test_unsubscribe_mark_prices_ignores_wildcard_observers(
 fn test_execute_subscribe_index_prices(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -9381,7 +9428,7 @@ fn test_execute_subscribe_index_prices(
 fn test_unsubscribe_index_prices_ignores_wildcard_observers(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -9433,7 +9480,7 @@ fn test_unsubscribe_index_prices_ignores_wildcard_observers(
 fn test_execute_subscribe_funding_rates(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -9495,7 +9542,7 @@ fn test_execute_subscribe_funding_rates(
 fn test_unsubscribe_funding_rates_ignores_wildcard_observers(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -9548,7 +9595,7 @@ fn test_unsubscribe_funding_rates_ignores_wildcard_observers(
 fn test_execute_subscribe_instrument_status(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -9610,7 +9657,7 @@ fn test_execute_subscribe_instrument_status(
 fn test_execute_subscribe_instrument_close(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -9672,7 +9719,7 @@ fn test_execute_subscribe_instrument_close(
 fn test_execute_subscribe_option_greeks(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -9724,7 +9771,7 @@ fn test_execute_subscribe_option_greeks(
 fn test_unsubscribe_option_greeks_ignores_wildcard_observers(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -9775,7 +9822,7 @@ fn test_unsubscribe_option_greeks_ignores_wildcard_observers(
 
 #[rstest]
 fn test_execute_request_data(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     data_engine: Rc<RefCell<DataEngine>>,
     client_id: ClientId,
@@ -9811,7 +9858,7 @@ fn test_execute_request_data(
 
 #[rstest]
 fn test_execute_request_instrument(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     data_engine: Rc<RefCell<DataEngine>>,
     audusd_sim: CurrencyPair,
@@ -9847,7 +9894,7 @@ fn test_execute_request_instrument(
 
 #[rstest]
 fn test_execute_request_instruments(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     data_engine: Rc<RefCell<DataEngine>>,
     client_id: ClientId,
@@ -9882,7 +9929,7 @@ fn test_execute_request_instruments(
 
 #[rstest]
 fn test_execute_request_book_snapshot(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     data_engine: Rc<RefCell<DataEngine>>,
     audusd_sim: CurrencyPair,
@@ -9917,7 +9964,7 @@ fn test_execute_request_book_snapshot(
 
 #[rstest]
 fn test_execute_request_quotes(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     data_engine: Rc<RefCell<DataEngine>>,
     audusd_sim: CurrencyPair,
@@ -9954,7 +10001,7 @@ fn test_execute_request_quotes(
 
 #[rstest]
 fn test_execute_request_trades(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     data_engine: Rc<RefCell<DataEngine>>,
     audusd_sim: CurrencyPair,
@@ -9991,7 +10038,7 @@ fn test_execute_request_trades(
 
 #[rstest]
 fn test_execute_request_funding_rates(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     data_engine: Rc<RefCell<DataEngine>>,
     audusd_sim: CurrencyPair,
@@ -10028,7 +10075,7 @@ fn test_execute_request_funding_rates(
 
 #[rstest]
 fn test_execute_request_bars(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     data_engine: Rc<RefCell<DataEngine>>,
     client_id: ClientId,
@@ -10064,7 +10111,7 @@ fn test_execute_request_bars(
 
 #[rstest]
 fn test_execute_request_order_book_depth(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     data_engine: Rc<RefCell<DataEngine>>,
     audusd_sim: CurrencyPair,
@@ -10132,7 +10179,7 @@ fn test_process_instrument(
 
     let mut data_engine = data_engine.borrow_mut();
     data_engine.process(&audusd_sim as &dyn Any);
-    let cache = &data_engine.get_cache();
+    let cache = &data_engine.cache().borrow();
     let messages = saving_handler.get_messages();
 
     assert_eq!(cache.instrument(&audusd_sim.id()).unwrap(), &audusd_sim);
@@ -10176,7 +10223,7 @@ fn test_process_book_delta(
 
     let mut data_engine = data_engine.borrow_mut();
     dispatch_data(&mut data_engine, Data::BookDelta(delta), borrowed);
-    let _cache = &data_engine.get_cache();
+    let _cache = &data_engine.cache().borrow();
     let messages = saver.get_messages();
 
     assert_eq!(messages.len(), 1);
@@ -10189,7 +10236,7 @@ fn test_process_book_delta_buffers_until_f_last(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let config = DataEngineConfig {
         buffer_deltas: true,
@@ -10247,7 +10294,7 @@ fn test_process_book_deltas_buffers_until_f_last(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let config = DataEngineConfig {
         buffer_deltas: true,
@@ -10331,7 +10378,7 @@ fn test_process_book_deltas(
 
     let mut data_engine = data_engine.borrow_mut();
     dispatch_data(&mut data_engine, Data::BookDeltas(deltas.clone()), borrowed);
-    let _cache = &data_engine.get_cache();
+    let _cache = &data_engine.cache().borrow();
     let messages = saver.get_messages();
 
     assert_eq!(messages.len(), 1);
@@ -10341,7 +10388,7 @@ fn test_process_book_deltas(
 #[rstest]
 #[case::owned(false)]
 #[case::borrowed(true)]
-fn test_process_book_depth10(
+fn test_process_book_depth(
     #[case] borrowed: bool,
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
@@ -10351,7 +10398,7 @@ fn test_process_book_depth10(
     let venue = data_client.venue;
     data_engine.borrow_mut().register_client(data_client, None);
 
-    let sub = SubscribeBookDepth10::new(
+    let sub = SubscribeBookDepth::new(
         audusd_sim.id,
         BookType::L3_MBO,
         Some(client_id),
@@ -10363,18 +10410,18 @@ fn test_process_book_depth10(
         None,
         None,
     );
-    let cmd = DataCommand::Subscribe(SubscribeCommand::BookDepth10(sub));
+    let cmd = DataCommand::Subscribe(SubscribeCommand::BookDepth(sub));
 
     data_engine.borrow_mut().execute(cmd);
 
     let depth = stub_depth10();
-    let (handler, saver) = get_typed_message_saving_handler::<OrderBookDepth10>(None);
-    let topic = switchboard::get_book_depth10_topic(depth.instrument_id);
-    msgbus::subscribe_book_depth10(topic.into(), handler, None);
+    let (handler, saver) = get_typed_message_saving_handler::<OrderBookDepth>(None);
+    let topic = switchboard::get_book_depth_topic(depth.instrument_id);
+    msgbus::subscribe_book_depth(topic.into(), handler, None);
 
     let mut data_engine = data_engine.borrow_mut();
-    dispatch_data(&mut data_engine, Data::from(depth), borrowed);
-    let _cache = &data_engine.get_cache();
+    dispatch_data(&mut data_engine, Data::from(depth.clone()), borrowed);
+    let _cache = &data_engine.cache().borrow();
     let messages = saver.get_messages();
 
     assert_eq!(messages.len(), 1);
@@ -10414,7 +10461,7 @@ fn test_process_quote_tick(
 
     let mut data_engine = data_engine.borrow_mut();
     dispatch_data(&mut data_engine, Data::Quote(quote), borrowed);
-    let cache = &data_engine.get_cache();
+    let cache = &data_engine.cache().borrow();
     let messages = saver.get_messages();
 
     assert_eq!(cache.quote(&quote.instrument_id), Some(quote).as_ref());
@@ -10455,7 +10502,7 @@ fn test_process_trade_tick(
 
     let mut data_engine = data_engine.borrow_mut();
     dispatch_data(&mut data_engine, Data::Trade(trade), borrowed);
-    let cache = &data_engine.get_cache();
+    let cache = &data_engine.cache().borrow();
     let messages = saver.get_messages();
 
     assert_eq!(cache.trade(&trade.instrument_id), Some(trade).as_ref());
@@ -10468,7 +10515,7 @@ fn test_synthetic_quote_subscription_publishes_from_component_quotes(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
@@ -10536,7 +10583,7 @@ fn test_synthetic_trade_subscription_publishes_from_component_trades(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
@@ -10606,7 +10653,7 @@ fn test_synthetic_quote_and_trade_commands_do_not_forward_to_client(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let engine_clock: Rc<RefCell<dyn Clock>> = clock.clone();
     let mut data_engine = DataEngine::new(engine_clock, cache.clone(), None);
@@ -10693,7 +10740,7 @@ fn test_duplicate_synthetic_quote_subscription_publishes_once(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
@@ -10724,7 +10771,7 @@ fn test_duplicate_synthetic_trade_subscription_publishes_once(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
@@ -10755,7 +10802,7 @@ fn test_synthetic_quote_subscription_waits_for_all_component_quotes(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
@@ -10784,7 +10831,7 @@ fn test_synthetic_trade_subscription_waits_for_all_component_trades(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
@@ -10811,7 +10858,7 @@ fn test_synthetic_trade_subscription_waits_for_all_component_trades(
 #[rstest]
 fn test_subscribe_missing_synthetic_does_not_register(stub_msgbus: Rc<RefCell<MessageBus>>) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -10836,7 +10883,7 @@ fn test_unsubscribe_synthetic_quote_keeps_shared_component_feed(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
@@ -10899,7 +10946,7 @@ fn test_unsubscribe_synthetic_trade_keeps_shared_component_feed(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
@@ -10960,7 +11007,7 @@ fn test_unsubscribe_synthetic_trade_keeps_shared_component_feed(
 #[rstest]
 fn test_reset_clears_synthetic_subscriptions(stub_msgbus: Rc<RefCell<MessageBus>>) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
@@ -11001,7 +11048,7 @@ fn test_reset_clears_synthetic_subscriptions(stub_msgbus: Rc<RefCell<MessageBus>
 #[rstest]
 fn test_synthetic_quotes_release_after_final_owner(stub_msgbus: Rc<RefCell<MessageBus>>) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
     let (synthetic, _, _) = synthetic_index();
@@ -11030,7 +11077,7 @@ fn test_synthetic_quotes_release_after_final_owner(stub_msgbus: Rc<RefCell<Messa
 #[rstest]
 fn test_synthetic_trades_release_after_final_owner(stub_msgbus: Rc<RefCell<MessageBus>>) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
     let (synthetic, _, _) = synthetic_index();
@@ -11094,7 +11141,7 @@ fn test_process_mark_price(
 
     let mut data_engine = data_engine.borrow_mut();
     dispatch_data(&mut data_engine, Data::MarkPrice(mark_price), borrowed);
-    let cache = &data_engine.get_cache();
+    let cache = &data_engine.cache().borrow();
     let messages = saving_handler.get_messages();
 
     assert_eq!(
@@ -11152,7 +11199,7 @@ fn test_process_index_price(
 
     let mut data_engine = data_engine.borrow_mut();
     dispatch_data(&mut data_engine, Data::IndexPrice(index_price), borrowed);
-    let cache = &data_engine.get_cache();
+    let cache = &data_engine.cache().borrow();
     let messages = saving_handler.get_messages();
 
     assert_eq!(
@@ -11206,7 +11253,7 @@ fn test_process_funding_rate_through_any(
     let mut data_engine = data_engine.borrow_mut();
     // Test through the process() method with &dyn Any
     data_engine.process(&funding_rate as &dyn Any);
-    let cache = &data_engine.get_cache();
+    let cache = &data_engine.cache().borrow();
     let messages = saving_handler.get_messages();
 
     assert_eq!(
@@ -11255,7 +11302,7 @@ fn test_process_funding_rate(
 
     let mut data_engine = data_engine.borrow_mut();
     data_engine.handle_funding_rate(funding_rate);
-    let cache = &data_engine.get_cache();
+    let cache = &data_engine.cache().borrow();
     let messages = saving_handler.get_messages();
 
     assert_eq!(
@@ -11307,7 +11354,7 @@ fn test_process_funding_rate_data_variant(
 
     let mut data_engine = data_engine.borrow_mut();
     dispatch_data(&mut data_engine, Data::FundingRate(funding_rate), borrowed);
-    let cache = &data_engine.get_cache();
+    let cache = &data_engine.cache().borrow();
     let messages = saving_handler.get_messages();
 
     assert_eq!(
@@ -11362,7 +11409,7 @@ fn test_process_funding_rate_updates_existing(
     let mut data_engine = data_engine.borrow_mut();
     data_engine.handle_funding_rate(funding_rate1);
     data_engine.handle_funding_rate(funding_rate2);
-    let cache = &data_engine.get_cache();
+    let cache = &data_engine.cache().borrow();
 
     // Should only have the latest funding rate
     assert_eq!(
@@ -11404,7 +11451,7 @@ fn test_process_bar(
 
     let mut data_engine = data_engine.borrow_mut();
     dispatch_data(&mut data_engine, Data::Bar(bar), borrowed);
-    let cache = &data_engine.get_cache();
+    let cache = &data_engine.cache().borrow();
     let messages = saver.get_messages();
 
     assert_eq!(cache.bar(&bar.bar_type), Some(bar).as_ref());
@@ -11455,7 +11502,7 @@ fn test_process_instrument_status(
 
     let mut data_engine = data_engine.borrow_mut();
     dispatch_data(&mut data_engine, Data::InstrumentStatus(status), borrowed);
-    let cache = data_engine.get_cache();
+    let cache = data_engine.cache().borrow();
     let messages = msgbus::stubs::get_saved_messages::<InstrumentStatus>(&handler);
 
     assert_eq!(messages.len(), 1);
@@ -11535,7 +11582,7 @@ fn test_process_instrument_status_through_any(
     let mut data_engine = data_engine.borrow_mut();
     // Drive through the process() entrypoint with `&dyn Any`
     data_engine.process(&status as &dyn Any);
-    let cache = data_engine.get_cache();
+    let cache = data_engine.cache().borrow();
     let messages = msgbus::stubs::get_saved_messages::<InstrumentStatus>(&handler);
 
     assert_eq!(messages.len(), 1);
@@ -11591,7 +11638,7 @@ fn test_process_instrument_status_updates_existing(
     let mut data_engine = data_engine.borrow_mut();
     data_engine.process_data(Data::InstrumentStatus(status1));
     data_engine.process_data(Data::InstrumentStatus(status2));
-    let cache = data_engine.get_cache();
+    let cache = data_engine.cache().borrow();
 
     assert_eq!(cache.instrument_status(&audusd_sim.id), Some(&status2));
     assert_eq!(
@@ -11604,7 +11651,7 @@ fn test_process_instrument_status_updates_existing(
 #[rstest]
 fn test_execute_subscribe_blocks(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -11654,7 +11701,7 @@ fn test_execute_subscribe_blocks(
 #[rstest]
 fn test_execute_subscribe_pool_swaps(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -11820,7 +11867,7 @@ fn test_process_pool_swap(data_engine: Rc<RefCell<DataEngine>>, data_client: Dat
     // Add pool to cache so setup_pool_updater doesn't request snapshot
     data_engine
         .borrow()
-        .cache_rc()
+        .cache()
         .borrow_mut()
         .add_pool(pool.clone())
         .unwrap();
@@ -11872,7 +11919,7 @@ fn test_process_pool_swap(data_engine: Rc<RefCell<DataEngine>>, data_client: Dat
 #[rstest]
 fn test_execute_subscribe_pool_liquidity_updates(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -11959,7 +12006,7 @@ fn test_execute_subscribe_pool_liquidity_updates(
 #[rstest]
 fn test_execute_subscribe_pool_fee_collects(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -12046,7 +12093,7 @@ fn test_execute_subscribe_pool_fee_collects(
 #[rstest]
 fn test_execute_subscribe_pool_flash_events(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -12178,7 +12225,7 @@ fn test_process_pool_liquidity_update(
     // Add pool to cache so setup_pool_updater doesn't request snapshot
     data_engine
         .borrow()
-        .cache_rc()
+        .cache()
         .borrow_mut()
         .add_pool(pool.clone())
         .unwrap();
@@ -12285,7 +12332,7 @@ fn test_process_pool_fee_collect(
     // Add pool to cache so setup_pool_updater doesn't request snapshot
     data_engine
         .borrow()
-        .cache_rc()
+        .cache()
         .borrow_mut()
         .add_pool(pool.clone())
         .unwrap();
@@ -12385,7 +12432,7 @@ fn test_process_pool_flash(data_engine: Rc<RefCell<DataEngine>>, data_client: Da
     // Add pool to cache so setup_pool_updater doesn't request snapshot
     data_engine
         .borrow()
-        .cache_rc()
+        .cache()
         .borrow_mut()
         .add_pool(pool.clone())
         .unwrap();
@@ -12441,7 +12488,7 @@ fn test_pool_updater_processes_swap_updates_profiler(
     data_client: DataClientAdapter,
 ) {
     let client_id = data_client.client_id;
-    let cache = data_engine.borrow().cache_rc();
+    let cache = data_engine.borrow().cache().clone();
     data_engine.borrow_mut().register_client(data_client, None);
 
     // Create pool test data
@@ -12614,7 +12661,7 @@ fn test_pool_updater_processes_mint_updates_profiler(
     data_client: DataClientAdapter,
 ) {
     let client_id = data_client.client_id;
-    let cache = data_engine.borrow().cache_rc();
+    let cache = data_engine.borrow().cache().clone();
     data_engine.borrow_mut().register_client(data_client, None);
 
     // Create pool test data
@@ -12734,7 +12781,7 @@ fn test_pool_updater_processes_burn_updates_profiler(
     data_client: DataClientAdapter,
 ) {
     let client_id = data_client.client_id;
-    let cache = data_engine.borrow().cache_rc();
+    let cache = data_engine.borrow().cache().clone();
     data_engine.borrow_mut().register_client(data_client, None);
 
     // Create pool test data
@@ -12879,7 +12926,7 @@ fn test_pool_updater_processes_collect_updates_profiler(
     data_client: DataClientAdapter,
 ) {
     let client_id = data_client.client_id;
-    let cache = data_engine.borrow().cache_rc();
+    let cache = data_engine.borrow().cache().clone();
     data_engine.borrow_mut().register_client(data_client, None);
 
     // Create pool test data
@@ -12988,7 +13035,7 @@ fn test_pool_updater_processes_flash_updates_profiler(
     data_client: DataClientAdapter,
 ) {
     let client_id = data_client.client_id;
-    let cache = data_engine.borrow().cache_rc();
+    let cache = data_engine.borrow().cache().clone();
     data_engine.borrow_mut().register_client(data_client, None);
 
     // Create pool test data
@@ -13194,7 +13241,6 @@ fn test_process_defi_pools_publishes_distinct_tradable_instruments(
                 .size_precision(8)
                 .price_increment(Price::from("0.000001"))
                 .size_increment(Quantity::from("0.00000001"))
-                .maybe_taker_fee(pool.fee.map(|fee| Decimal::new(i64::from(fee), 6)))
                 .ts_event(pool.ts_event)
                 .ts_init(pool.ts_init)
                 .build()
@@ -13214,7 +13260,7 @@ fn test_process_defi_pools_publishes_distinct_tradable_instruments(
         engine.process_defi_data(DefiData::Pool(pool_invalid));
     }
 
-    let cache = data_engine.borrow().cache_rc();
+    let cache = data_engine.borrow().cache().clone();
     let cache = cache.borrow();
     let messages = saving_handler.get_messages();
     let selected = cache.instrument(&id_b);
@@ -13234,7 +13280,7 @@ fn test_process_defi_pools_publishes_distinct_tradable_instruments(
 #[rstest]
 fn test_execute_defi_request_pool_snapshot(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -13274,7 +13320,7 @@ fn test_execute_defi_request_pool_snapshot(
 #[rstest]
 fn test_setup_pool_updater_requests_snapshot(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -13335,7 +13381,7 @@ fn test_setup_pool_updater_requests_snapshot(
 #[rstest]
 fn test_setup_pool_updater_skips_snapshot_when_pool_in_cache(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -13399,7 +13445,7 @@ fn test_setup_pool_updater_skips_snapshot_when_pool_in_cache(
 
     // Add pool to the data_engine's cache (not the fixture cache!)
     // This ensures setup_pool_updater finds the pool when it checks the cache
-    data_engine.cache_rc().borrow_mut().add_pool(pool).unwrap();
+    data_engine.cache().borrow_mut().add_pool(pool).unwrap();
 
     let subscribe_pool = SubscribePool::new(
         instrument_id,
@@ -13433,7 +13479,7 @@ fn test_setup_pool_updater_skips_snapshot_when_pool_in_cache(
 #[rstest]
 fn test_setup_pool_updater_does_not_cache_profiler_on_initialize_failure(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -13500,10 +13546,10 @@ fn test_setup_pool_updater_does_not_cache_profiler_on_initialize_failure(
     pool.initial_tick = Some(real_tick + 100);
     let instrument_id = pool.instrument_id;
 
-    data_engine.cache_rc().borrow_mut().add_pool(pool).unwrap();
+    data_engine.cache().borrow_mut().add_pool(pool).unwrap();
     assert!(
         data_engine
-            .cache_rc()
+            .cache()
             .borrow()
             .pool_profiler(&instrument_id)
             .is_none()
@@ -13521,7 +13567,7 @@ fn test_setup_pool_updater_does_not_cache_profiler_on_initialize_failure(
 
     assert!(
         data_engine
-            .cache_rc()
+            .cache()
             .borrow()
             .pool_profiler(&instrument_id)
             .is_none(),
@@ -13533,7 +13579,7 @@ fn test_setup_pool_updater_does_not_cache_profiler_on_initialize_failure(
 #[rstest]
 fn test_pool_arrival_with_snapshot_pending_does_not_create_profiler(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -13622,16 +13668,12 @@ fn test_pool_arrival_with_snapshot_pending_does_not_create_profiler(
     data_engine.process_defi_data(DefiData::Pool(pool.clone()));
 
     assert!(
-        data_engine
-            .cache_rc()
-            .borrow()
-            .pool(&instrument_id)
-            .is_some(),
+        data_engine.cache().borrow().pool(&instrument_id).is_some(),
         "pool must be added to cache when Pool data arrives"
     );
     assert!(
         data_engine
-            .cache_rc()
+            .cache()
             .borrow()
             .pool_profiler(&instrument_id)
             .is_none(),
@@ -13648,7 +13690,7 @@ fn test_pool_arrival_with_snapshot_pending_does_not_create_profiler(
 #[rstest]
 fn test_pool_snapshot_handler_refuses_empty_stub_at_creation_block(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -13737,18 +13779,14 @@ fn test_pool_snapshot_handler_refuses_empty_stub_at_creation_block(
 
     assert!(
         data_engine
-            .cache_rc()
+            .cache()
             .borrow()
             .pool_profiler(&instrument_id)
             .is_none(),
         "stub snapshot must not result in an installed profiler"
     );
     assert!(
-        data_engine
-            .cache_rc()
-            .borrow()
-            .pool(&instrument_id)
-            .is_some(),
+        data_engine.cache().borrow().pool(&instrument_id).is_some(),
         "pool entry must be preserved even when its stub snapshot is refused"
     );
 }
@@ -13757,7 +13795,7 @@ fn test_pool_snapshot_handler_refuses_empty_stub_at_creation_block(
 #[rstest]
 fn test_pool_snapshot_request_routing_by_client_id(
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let mut data_engine = data_engine.borrow_mut();
@@ -13834,7 +13872,7 @@ async fn test_data_engine_connect_continues_with_failing_client(
 #[tokio::test]
 #[expect(clippy::await_holding_refcell_ref)] // Single-threaded test
 async fn test_data_engine_connect_succeeds_with_working_client(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     #[from(data_engine)] data_engine: Rc<RefCell<DataEngine>>,
 ) {
@@ -13853,7 +13891,7 @@ async fn test_data_engine_connect_succeeds_with_working_client(
 #[rstest]
 fn test_process_book_snapshot_publish(
     audusd_sim: CurrencyPair,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -13946,7 +13984,7 @@ fn test_process_book_snapshot_publish(
 fn test_process_book_snapshot_publish_for_multiple_instruments_same_interval(
     audusd_sim: CurrencyPair,
     gbpusd_sim: CurrencyPair,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -13995,7 +14033,7 @@ fn test_process_book_snapshot_publish_for_multiple_instruments_same_interval(
 fn test_subscribed_book_snapshots_preserve_subscription_order(
     audusd_sim: CurrencyPair,
     gbpusd_sim: CurrencyPair,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -14035,7 +14073,7 @@ fn test_subscribed_book_snapshots_preserve_subscription_order(
 #[rstest]
 fn test_process_book_snapshot_publish_for_multiple_intervals_same_instrument(
     audusd_sim: CurrencyPair,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -14100,7 +14138,7 @@ fn test_process_book_snapshot_publish_for_multiple_intervals_same_instrument(
 #[rstest]
 fn test_duplicate_book_snapshot_subscriptions_require_matching_unsubscribes(
     audusd_sim: CurrencyPair,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -14162,7 +14200,7 @@ fn test_duplicate_book_snapshot_subscriptions_require_matching_unsubscribes(
 #[rstest]
 fn test_unsubscribe_book_snapshots_removes_only_requested_interval(
     audusd_sim: CurrencyPair,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -14253,7 +14291,7 @@ fn test_unsubscribe_book_snapshots_removes_only_requested_interval(
 #[rstest]
 fn test_unsubscribe_book_snapshots_during_publish_does_not_panic(
     audusd_sim: CurrencyPair,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -14313,7 +14351,7 @@ fn test_unsubscribe_book_snapshots_during_publish_does_not_panic(
 #[rstest]
 fn test_unsubscribe_book_deltas_keeps_snapshot_subscriptions_active(
     audusd_sim: CurrencyPair,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -14395,7 +14433,7 @@ fn test_unsubscribe_book_deltas_keeps_snapshot_subscriptions_active(
 #[rstest]
 fn test_duplicate_book_deltas_unsubscribe_keeps_remaining_subscription_active(
     audusd_sim: CurrencyPair,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -14464,7 +14502,7 @@ fn test_duplicate_book_deltas_unsubscribe_keeps_remaining_subscription_active(
 #[rstest]
 fn test_distinct_book_deltas_keys_share_physical_subscription(
     audusd_sim: CurrencyPair,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -14703,7 +14741,7 @@ fn process_book_delta(data_engine: &Rc<RefCell<DataEngine>>, instrument_id: Inst
         .process_data(Data::BookDeltas(deltas));
 }
 
-fn advance_clock_and_dispatch(clock: &Rc<RefCell<TestClock>>, advance_ns: u64) {
+fn advance_clock_and_dispatch(clock: &Rc<RefCell<VirtualClock>>, advance_ns: u64) {
     let to_time_ns = clock.borrow().timestamp_ns().as_u64() + advance_ns;
     let events = clock.borrow_mut().advance_time(to_time_ns.into(), true);
     let handlers = clock.borrow().match_handlers(events);
@@ -14714,7 +14752,7 @@ fn advance_clock_and_dispatch(clock: &Rc<RefCell<TestClock>>, advance_ns: u64) {
 }
 
 fn create_snapshot_test_engine(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) -> Rc<RefCell<DataEngine>> {
     let _ =
@@ -14889,7 +14927,7 @@ fn option_chain_reference_price_request_id(recorder: &Rc<RefCell<Vec<DataCommand
 
 /// Creates a data engine that shares the provided cache and clock.
 fn make_option_chain_engine(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) -> Rc<RefCell<DataEngine>> {
     let data_engine = Rc::new(RefCell::new(DataEngine::new(clock, cache, None)));
@@ -14900,7 +14938,7 @@ fn make_option_chain_engine(
 
 #[rstest]
 fn test_subscribe_option_chain_fixed_range_creates_manager(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -14958,7 +14996,7 @@ fn test_subscribe_option_chain_fixed_range_creates_manager(
 
 #[rstest]
 fn test_subscribe_option_chain_filters_by_underlying(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -15014,7 +15052,7 @@ fn test_subscribe_option_chain_filters_by_underlying(
 
 #[rstest]
 fn test_option_chain_new_instrument_uses_subscription_client(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -15118,7 +15156,7 @@ fn test_option_chain_new_instrument_uses_subscription_client(
 
 #[rstest]
 fn test_unsubscribe_option_chain_tears_down(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -15183,7 +15221,7 @@ fn test_unsubscribe_option_chain_tears_down(
 
 #[rstest]
 fn test_option_chain_manager_survives_partial_retirement(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -15263,7 +15301,7 @@ fn test_option_chain_manager_survives_partial_retirement(
 #[case::retire(false)]
 #[case::edit(true)]
 fn test_option_chain_settles_rebalance_before_retirement(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     #[case] edit: bool,
 ) {
@@ -15391,7 +15429,7 @@ fn test_option_chain_settles_rebalance_before_retirement(
 
 #[rstest]
 fn test_pending_option_chain_survives_partial_retirement(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -15465,7 +15503,7 @@ fn test_pending_option_chain_survives_partial_retirement(
 
 #[rstest]
 fn test_option_chain_client_edit_releases_old_and_active_routes(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -15545,7 +15583,7 @@ fn test_option_chain_client_edit_releases_old_and_active_routes(
 
 #[rstest]
 fn test_unsubscribe_option_chain_not_subscribed_does_not_panic(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -15560,7 +15598,7 @@ fn test_unsubscribe_option_chain_not_subscribed_does_not_panic(
 
 #[rstest]
 fn test_subscribe_option_chain_resubscribe_replaces_manager(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -15637,7 +15675,7 @@ fn test_process_instrument_status_expires_option_chain_instrument(
     #[case] action: MarketStatusAction,
     #[case] expected_quote_unsubs: usize,
     #[case] expected_greeks_unsubs: usize,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -15709,7 +15747,11 @@ fn test_process_instrument_status_expires_option_chain_instrument(
 
     // Cache write happens regardless of action
     assert_eq!(
-        data_engine.borrow().get_cache().instrument_status(&call_id),
+        data_engine
+            .borrow()
+            .cache()
+            .borrow()
+            .instrument_status(&call_id),
         Some(&status),
     );
     assert_eq!(quote_unsubs, expected_quote_unsubs);
@@ -15721,7 +15763,7 @@ fn test_process_instrument_status_expires_option_chain_instrument(
 #[case::greeks("greeks")]
 fn test_option_chain_market_data_at_expiry_expires_instrument(
     #[case] data_kind: &str,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -15827,7 +15869,7 @@ fn test_option_chain_market_data_at_expiry_expires_instrument(
 
 #[rstest]
 fn test_process_option_greeks_caches_and_publishes(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     use nautilus_model::{
@@ -15899,7 +15941,7 @@ fn test_process_option_greeks_caches_and_publishes(
 
 #[rstest]
 fn test_subscribe_option_chain_atm_relative_requests_reference_price(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -16005,7 +16047,7 @@ fn test_subscribe_option_chain_atm_relative_requests_reference_price(
 })]
 fn test_option_chain_reference_price_response_bootstraps_dynamic_range(
     #[case] strike_range: StrikeRange,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -16076,7 +16118,7 @@ fn test_option_chain_reference_price_response_bootstraps_dynamic_range(
 
 #[rstest]
 fn test_option_chain_without_sample_bootstraps_from_live_data(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -16107,7 +16149,7 @@ fn test_option_chain_without_sample_bootstraps_from_live_data(
 
 #[rstest]
 fn test_unsubscribe_option_chain_cancels_pending_reference_price_request(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -16181,7 +16223,7 @@ fn test_unsubscribe_option_chain_cancels_pending_reference_price_request(
 
 #[rstest]
 fn test_option_chain_reference_price_timeout_bootstraps_from_live_data(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -16238,7 +16280,7 @@ fn test_option_chain_reference_price_timeout_bootstraps_from_live_data(
 
 #[rstest]
 fn test_option_chain_reference_price_request_error_subscribes_bootstrap_greeks(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -16279,7 +16321,7 @@ fn test_option_chain_reference_price_request_error_subscribes_bootstrap_greeks(
 
 #[rstest]
 fn test_option_chain_reference_price_timeout_tracks_concurrent_requests(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -16380,7 +16422,7 @@ fn test_option_chain_reference_price_timeout_tracks_concurrent_requests(
 
 #[rstest]
 fn test_option_chain_greeks_bootstrap_releases_inactive_sample(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -16486,7 +16528,7 @@ fn test_option_chain_greeks_bootstrap_releases_inactive_sample(
 
 #[rstest]
 fn test_option_chain_greeks_bootstrap_holds_subscription_ownership(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -16577,7 +16619,7 @@ fn test_option_chain_greeks_bootstrap_holds_subscription_ownership(
 
 #[rstest]
 fn test_unsubscribe_option_chain_preserves_user_owned_bootstrap_greeks(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -16663,7 +16705,7 @@ enum OptionGreeksDispatch {
 #[case::data_borrowed(OptionGreeksDispatch::DataBorrowed)]
 fn test_option_chain_deferred_bootstrap_from_greeks_keeps_bootstrap_event(
     #[case] dispatch: OptionGreeksDispatch,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -16930,7 +16972,7 @@ fn trade_tick(instrument_id: InstrumentId, price: &str, trade_id: &str, ts: u64)
 fn test_counters_increment_per_dispatch(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -17015,7 +17057,7 @@ fn test_counters_increment_per_dispatch(
 fn test_reset_resets_counters(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -17168,7 +17210,7 @@ fn build_synthetic_unsubscribe(
 fn test_subscribe_synthetic_instrument_rejected(
     #[case] variant: &str,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -17220,7 +17262,7 @@ fn test_subscribe_synthetic_instrument_rejected(
 fn test_unsubscribe_synthetic_instrument_rejected(
     #[case] variant: &str,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -17514,7 +17556,7 @@ fn test_process_pipeline_quote_publishes_on_pipeline_topic_only(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let instrument_id = audusd_sim.id;
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -17548,7 +17590,7 @@ fn test_process_pipeline_quote_writes_cache_by_default(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let instrument_id = audusd_sim.id;
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
@@ -17565,7 +17607,7 @@ fn test_process_pipeline_skips_cache_when_disabled(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let instrument_id = audusd_sim.id;
     let config = DataEngineConfig {
@@ -17600,7 +17642,7 @@ fn test_process_pipeline_skips_cache_when_disabled(
 #[rstest]
 fn test_process_pipeline_bar_publishes_on_pipeline_topic(stub_msgbus: Rc<RefCell<MessageBus>>) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
@@ -17638,7 +17680,7 @@ fn test_process_pipeline_increments_data_count(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -17661,7 +17703,7 @@ fn test_process_pipeline_trade_publishes_on_pipeline_topic_only(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let instrument_id = audusd_sim.id;
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
@@ -17700,7 +17742,7 @@ fn test_process_pipeline_mark_price_publishes_on_pipeline_topic_only(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let instrument_id = audusd_sim.id;
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
@@ -17745,7 +17787,7 @@ fn test_process_pipeline_index_price_publishes_on_pipeline_topic_only(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let instrument_id = audusd_sim.id;
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
@@ -17791,7 +17833,7 @@ fn test_process_pipeline_funding_rate_publishes_on_pipeline_topic_only(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let instrument_id = audusd_sim.id;
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
@@ -17839,7 +17881,7 @@ fn test_process_pipeline_instrument_status_publishes_on_pipeline_topic_only(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let instrument_id = audusd_sim.id;
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
@@ -17888,7 +17930,7 @@ fn test_process_pipeline_instrument_close_publishes_on_pipeline_topic_only(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let instrument_id = audusd_sim.id;
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -17927,7 +17969,7 @@ fn test_process_pipeline_delta_publishes_on_pipeline_topic_only(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -17964,7 +18006,7 @@ fn test_process_pipeline_deltas_publishes_on_pipeline_topic_only(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -17995,34 +18037,33 @@ fn test_process_pipeline_deltas_publishes_on_pipeline_topic_only(
 }
 
 #[rstest]
-fn test_process_pipeline_depth10_publishes_on_pipeline_topic_only(
+fn test_process_pipeline_depth_publishes_on_pipeline_topic_only(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
     let depth = stub_depth10();
     let instrument_id = depth.instrument_id;
-    let live_topic = switchboard::get_book_depth10_topic(instrument_id);
+    let live_topic = switchboard::get_book_depth_topic(instrument_id);
     let pipeline_topic_str = pipeline_topic_of(live_topic.as_ref());
     let pipeline_topic: MStr<Topic> = pipeline_topic_str.as_str().into();
 
-    let (live_handler, live_saver) = get_typed_message_saving_handler::<OrderBookDepth10>(Some(
-        Ustr::from("pipeline-depth-live"),
-    ));
-    let (pipeline_handler, pipeline_saver) = get_typed_message_saving_handler::<OrderBookDepth10>(
+    let (live_handler, live_saver) =
+        get_typed_message_saving_handler::<OrderBookDepth>(Some(Ustr::from("pipeline-depth-live")));
+    let (pipeline_handler, pipeline_saver) = get_typed_message_saving_handler::<OrderBookDepth>(
         Some(Ustr::from("pipeline-depth-pipeline")),
     );
-    msgbus::subscribe_book_depth10(live_topic.into(), live_handler, None);
-    msgbus::subscribe_book_depth10(pipeline_topic.into(), pipeline_handler, None);
+    msgbus::subscribe_book_depth(live_topic.into(), live_handler, None);
+    msgbus::subscribe_book_depth(pipeline_topic.into(), pipeline_handler, None);
 
-    data_engine.process_pipeline(Data::BookDepth10(Box::new(depth)));
+    data_engine.process_pipeline(Data::BookDepth(Box::new(depth.clone())));
 
     assert!(
         live_saver.get_messages().is_empty(),
-        "pipeline depth10 must not publish on the live topic",
+        "pipeline depth must not publish on the live topic",
     );
     let pipeline_messages = pipeline_saver.get_messages();
     assert_eq!(pipeline_messages.len(), 1);
@@ -18034,7 +18075,7 @@ fn test_process_pipeline_custom_data_publishes_on_pipeline_topic_only(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -18069,7 +18110,7 @@ fn test_process_pipeline_custom_data_publishes_on_pipeline_topic_only(
 #[rstest]
 fn test_process_pipeline_bar_drops_out_of_sequence(stub_msgbus: Rc<RefCell<MessageBus>>) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     let config = DataEngineConfig {
@@ -18109,7 +18150,7 @@ fn test_process_pipeline_bar_drops_out_of_sequence(stub_msgbus: Rc<RefCell<Messa
 #[rstest]
 fn test_process_pipeline_skips_synthetic_quote_republish(stub_msgbus: Rc<RefCell<MessageBus>>) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
@@ -18150,7 +18191,7 @@ fn test_process_pipeline_skips_synthetic_quote_republish(stub_msgbus: Rc<RefCell
 #[rstest]
 fn test_process_pipeline_skips_synthetic_trade_republish(stub_msgbus: Rc<RefCell<MessageBus>>) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
@@ -18179,11 +18220,9 @@ fn test_process_pipeline_skips_synthetic_trade_republish(stub_msgbus: Rc<RefCell
 }
 
 #[rstest]
-fn test_process_pipeline_depth10_skips_derived_quote_emission(
-    stub_msgbus: Rc<RefCell<MessageBus>>,
-) {
+fn test_process_pipeline_depth_skips_derived_quote_emission(stub_msgbus: Rc<RefCell<MessageBus>>) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
 
     // Live path would derive a quote from depth top-of-book with this flag
@@ -18201,21 +18240,21 @@ fn test_process_pipeline_depth10_skips_derived_quote_emission(
     let quote_topic = switchboard::get_quotes_topic(instrument_id);
     msgbus::subscribe_quotes(quote_topic.into(), handler, None);
 
-    data_engine.process_pipeline(Data::BookDepth10(Box::new(depth)));
+    data_engine.process_pipeline(Data::BookDepth(Box::new(depth)));
 
     assert!(
         saver.get_messages().is_empty(),
-        "pipeline depth10 must not emit a derived quote even when emit_quotes_from_book_depths is set",
+        "pipeline depth must not emit a derived quote even when emit_quotes_from_book_depths is set",
     );
     assert!(
         cache.borrow().quote(&instrument_id).is_none(),
-        "no derived quote should be cached for pipeline depth10",
+        "no derived quote should be cached for pipeline depth",
     );
 }
 
 #[rstest]
 fn test_process_pipeline_instrument_status_skips_option_chain_expiry(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
 ) {
     let _ = msgbus::get_message_bus();
@@ -18297,7 +18336,7 @@ fn quote_at(instrument_id: InstrumentId, ts: u64) -> QuoteTick {
     )
 }
 
-fn book_depth_at(instrument_id: InstrumentId, ts: u64) -> OrderBookDepth10 {
+fn book_depth_at(instrument_id: InstrumentId, ts: u64) -> OrderBookDepth {
     let mut depth = stub_depth10();
     depth.instrument_id = instrument_id;
     depth.ts_event = UnixNanos::from(ts);
@@ -18758,7 +18797,7 @@ fn time_range_book_depth_response(
     instrument_id: InstrumentId,
     client_id: ClientId,
     data_count: u64,
-    depths: Vec<OrderBookDepth10>,
+    depths: Vec<OrderBookDepth>,
 ) -> DataResponse {
     DataResponse::BookDepth(BookDepthResponse::new(
         request.request_id,
@@ -18879,7 +18918,7 @@ fn advance_test_clock_to(clock: &Rc<RefCell<dyn Clock>>, ns: u64) {
     clock
         .borrow_mut()
         .as_any_mut()
-        .downcast_mut::<TestClock>()
+        .downcast_mut::<VirtualClock>()
         .unwrap()
         .advance_time(UnixNanos::from(ns), true);
 }
@@ -18957,7 +18996,7 @@ fn test_time_range_pipeline_issues_one_child_at_a_time(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -19027,7 +19066,7 @@ fn test_time_range_pipeline_uses_data_count_feedback(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -19099,7 +19138,7 @@ fn test_time_range_pipeline_point_data_uses_single_point_windows(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -19225,7 +19264,7 @@ fn test_time_range_pipeline_updates_parent_request_bar_aggregation(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     cache
         .borrow_mut()
@@ -19330,7 +19369,7 @@ fn test_time_range_pipeline_emits_empty_parent_response(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -19387,7 +19426,7 @@ fn test_reset_clears_time_range_pipeline_state(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -19451,7 +19490,7 @@ fn test_time_range_pipeline_request_join_runs_end_to_end(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
@@ -19553,7 +19592,7 @@ fn test_time_range_pipeline_request_join_rejects_empty_window(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -19595,7 +19634,7 @@ fn test_time_range_pipeline_child_uses_catalog_client_fanin(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -19695,7 +19734,7 @@ fn test_time_range_pipeline_supports_bars_variant(
 ) {
     let _ = stub_msgbus;
     let bar_type = BarType::from(format!("{}-1-MINUTE-LAST-EXTERNAL", audusd_sim.id).as_str());
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -19749,7 +19788,7 @@ fn test_time_range_pipeline_supports_book_deltas_variant(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -19819,7 +19858,7 @@ fn test_time_range_pipeline_supports_book_depth_variant(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -19829,13 +19868,13 @@ fn test_time_range_pipeline_supports_book_depth_variant(
     let (handler, saver) =
         get_any_saving_handler::<BookDepthResponse>(Some(Ustr::from("time-range-depth-parent")));
     msgbus::register_response_handler(&parent_id, handler);
-    let live_topic = switchboard::get_book_depth10_topic(instrument_id);
+    let live_topic = switchboard::get_book_depth_topic(instrument_id);
     let pipeline_topic_str = pipeline_topic_of(live_topic.as_ref());
     let pipeline_topic: MStr<Topic> = pipeline_topic_str.as_str().into();
-    let (pipeline_handler, pipeline_saver) = get_typed_message_saving_handler::<OrderBookDepth10>(
+    let (pipeline_handler, pipeline_saver) = get_typed_message_saving_handler::<OrderBookDepth>(
         Some(Ustr::from("time-range-depth-payload")),
     );
-    msgbus::subscribe_book_depth10(pipeline_topic.into(), pipeline_handler, None);
+    msgbus::subscribe_book_depth(pipeline_topic.into(), pipeline_handler, None);
 
     let params: Params = serde_json::from_value(json!({"time_range_generator": ""})).unwrap();
     let depth = NonZeroUsize::new(10).unwrap();
@@ -19860,7 +19899,7 @@ fn test_time_range_pipeline_supports_book_depth_variant(
         instrument_id,
         client_id,
         1,
-        vec![depth_msg],
+        vec![depth_msg.clone()],
     ));
 
     let pipeline_messages = pipeline_saver.get_messages();
@@ -19890,7 +19929,7 @@ fn test_time_range_pipeline_supports_funding_rates_variant(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -19950,7 +19989,7 @@ fn test_pipeline_single_response_passes_through(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -19987,7 +20026,7 @@ fn test_pipeline_two_legs_emits_one_rebuilt_response(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -20051,7 +20090,7 @@ fn test_pipeline_three_legs_fires_on_third_arrival(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -20102,7 +20141,7 @@ fn test_pipeline_trims_bounds_on_each_leg(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -20170,14 +20209,14 @@ fn test_request_join_two_phase_emits_parent_response(
     client_id: ClientId,
 ) {
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     // Advance the test clock past the leg ts_init values so the join's
     // `_bound_dates` clamping does not collapse the parent window to 0.
     clock
         .borrow_mut()
         .as_any_mut()
-        .downcast_mut::<TestClock>()
+        .downcast_mut::<VirtualClock>()
         .unwrap()
         .advance_time(UnixNanos::from(10_000_000_000_u64), true);
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
@@ -20300,12 +20339,12 @@ fn test_request_join_trims_to_parent_window(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     clock
         .borrow_mut()
         .as_any_mut()
-        .downcast_mut::<TestClock>()
+        .downcast_mut::<VirtualClock>()
         .unwrap()
         .advance_time(UnixNanos::from(10_000_000_000_u64), true);
     let mut data_engine = DataEngine::new(clock.clone(), cache, None);
@@ -20372,7 +20411,7 @@ fn test_pipeline_two_legs_trims_against_parent_window(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -20439,7 +20478,7 @@ fn test_pipeline_two_legs_inherits_parent_bars_window(
 ) {
     let _ = stub_msgbus;
     let bar_type = BarType::from(format!("{}-1-MINUTE-LAST-EXTERNAL", audusd_sim.id).as_str());
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -20500,7 +20539,7 @@ fn test_pipeline_two_legs_with_no_parent_window_preserves_leg_bounds(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -20563,7 +20602,7 @@ fn test_pipeline_trims_when_only_parent_start_is_set(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -20631,7 +20670,7 @@ fn test_pipeline_trims_when_only_parent_end_is_set(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -20698,7 +20737,7 @@ fn test_reset_clears_pipeline_and_join_state(
     client_id: ClientId,
 ) {
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -20804,7 +20843,7 @@ fn test_pipeline_unsupported_variant_drops_response(
 ) {
     let _ = stub_msgbus;
     let _ = audusd_sim;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -20966,7 +21005,7 @@ fn test_response_trims_before_cache_write(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     cache
         .borrow_mut()
@@ -21005,7 +21044,7 @@ fn test_pipeline_reset_mid_buffer_clears_partial_state(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -21073,12 +21112,12 @@ fn test_request_join_single_leg_fires_immediately(
     client_id: ClientId,
 ) {
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     clock
         .borrow_mut()
         .as_any_mut()
-        .downcast_mut::<TestClock>()
+        .downcast_mut::<VirtualClock>()
         .unwrap()
         .advance_time(UnixNanos::from(10_000_000_000_u64), true);
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -21164,7 +21203,7 @@ fn test_request_join_rebuilds_same_instrument_book_deltas_legs(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     // Past the leg ts_init values, so the join's bound-date clamping does not
     // collapse the parent window to 0.
@@ -21235,7 +21274,7 @@ fn test_request_join_mixed_instrument_book_deltas_cleans_up_join_staging(
     client_id: ClientId,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     // Past the leg ts_init values, so the deltas survive the parent-window trim and
     // reach the response handler when the rebuild is not refused.
@@ -21308,7 +21347,7 @@ fn test_request_join_mixed_variants_cleans_up_join_staging(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -21388,7 +21427,7 @@ fn test_pipeline_one_empty_leg_still_emits_parent(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -21452,7 +21491,7 @@ fn test_request_join_all_empty_legs_emits_empty_parent(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -21515,7 +21554,7 @@ fn register_quote_catalog_with_quotes(
         None => (None, None),
     };
     catalog.write_to_parquet(quotes, start, end, None).unwrap();
-    data_engine.register_catalog(catalog, None);
+    data_engine.register_catalog(Box::new(catalog), None);
     catalog_dir
 }
 
@@ -21533,7 +21572,7 @@ fn register_trade_catalog_with_trades(
         None => (None, None),
     };
     catalog.write_to_parquet(trades, start, end, None).unwrap();
-    data_engine.register_catalog(catalog, None);
+    data_engine.register_catalog(Box::new(catalog), None);
     catalog_dir
 }
 
@@ -21551,7 +21590,7 @@ fn register_bar_catalog_with_bars(
         None => (None, None),
     };
     catalog.write_to_parquet(bars, start, end, None).unwrap();
-    data_engine.register_catalog(catalog, None);
+    data_engine.register_catalog(Box::new(catalog), None);
     catalog_dir
 }
 
@@ -21560,7 +21599,7 @@ fn advance_clock_to(clock: &Rc<RefCell<dyn Clock>>, ns: u64) {
     clock
         .borrow_mut()
         .as_any_mut()
-        .downcast_mut::<TestClock>()
+        .downcast_mut::<VirtualClock>()
         .unwrap()
         .advance_time(UnixNanos::from(ns), true);
 }
@@ -21682,7 +21721,7 @@ fn register_funding_catalog_with_rates(
         None => (None, None),
     };
     catalog.write_to_parquet(rates, start, end, None).unwrap();
-    data_engine.register_catalog(catalog, None);
+    data_engine.register_catalog(Box::new(catalog), None);
     catalog_dir
 }
 
@@ -21739,7 +21778,7 @@ fn register_custom_catalog_with_data(
     catalog
         .write_custom_data_batch(data, start, end, None)
         .unwrap();
-    data_engine.register_catalog(catalog, None);
+    data_engine.register_catalog(Box::new(catalog), None);
     catalog_dir
 }
 
@@ -21775,7 +21814,7 @@ fn register_instrument_catalog_with_instruments(
     let catalog_dir = CatalogTempDir::new(label);
     let catalog = ParquetDataCatalog::new(catalog_dir.path(), None, None, None, None);
     catalog.write_instruments(instruments).unwrap();
-    data_engine.register_catalog(catalog, None);
+    data_engine.register_catalog(Box::new(catalog), None);
     catalog_dir
 }
 
@@ -21788,7 +21827,7 @@ fn test_request_quotes_catalog_only_serves_from_disk(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -21842,7 +21881,7 @@ fn test_request_quotes_client_only_when_catalog_has_no_data(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -21890,7 +21929,7 @@ fn test_request_quotes_catalog_plus_client_split(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -21995,7 +22034,7 @@ fn test_request_quotes_skip_catalog_data_param_honored(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -22051,7 +22090,7 @@ fn test_request_quotes_no_client_and_no_catalog_data_emits_empty(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -22091,7 +22130,7 @@ fn test_request_bars_catalog_lookup_uses_bar_type_identifier(
 ) {
     let _ = stub_msgbus;
     let bar_type = BarType::from(format!("{}-1-MINUTE-LAST-EXTERNAL", audusd_sim.id).as_str());
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -22143,7 +22182,7 @@ fn test_request_trades_catalog_plus_client_split(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -22227,7 +22266,7 @@ fn test_request_quotes_dispatches_straight_to_client_with_no_catalog_registered(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -22283,7 +22322,7 @@ fn test_request_pipeline_count_resets_after_catalog_split_fanin(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -22349,7 +22388,7 @@ fn test_request_quotes_dispatch_failure_aborts_pipeline(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -22408,7 +22447,7 @@ fn test_request_trades_with_bar_types_param_sets_up_aggregation_through_streamin
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     cache
         .borrow_mut()
@@ -22462,7 +22501,7 @@ fn test_request_bars_catalog_plus_client_split(
 ) {
     let _ = stub_msgbus;
     let bar_type = BarType::from(format!("{}-1-MINUTE-LAST-EXTERNAL", audusd_sim.id).as_str());
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -22553,7 +22592,7 @@ fn test_request_funding_rates_catalog_only_serves_from_disk(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -22608,7 +22647,7 @@ fn test_request_funding_rates_catalog_plus_client_split(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -22687,7 +22726,7 @@ fn test_request_funding_rates_no_client_no_catalog_emits_empty(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -22728,7 +22767,7 @@ fn test_request_funding_rates_dispatches_straight_to_client_with_no_catalog_regi
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
 
@@ -22771,7 +22810,7 @@ fn test_request_custom_data_catalog_only_serves_from_disk(
     let _ = stub_msgbus;
     let instrument_id = InstrumentId::from("RUST.TEST");
     let data_type = rust_test_custom_data_type("RUST.TEST");
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -22834,7 +22873,7 @@ fn test_request_custom_data_without_identifier_catalog_only_serves_from_disk(
         Some(serde_json::from_value(json!({"source": "catalog-test"})).unwrap()),
         None,
     );
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -22887,7 +22926,7 @@ fn test_request_custom_data_catalog_plus_client_split(
     let _ = stub_msgbus;
     let instrument_id = InstrumentId::from("RUST.TEST");
     let data_type = rust_test_custom_data_type("RUST.TEST");
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -22962,7 +23001,7 @@ fn test_request_custom_data_no_client_no_catalog_emits_empty(
 ) {
     let _ = stub_msgbus;
     let data_type = rust_test_custom_data_type("RUST.TEST");
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -23003,7 +23042,7 @@ fn test_request_custom_data_dispatches_straight_to_client_with_no_catalog_regist
 ) {
     let _ = stub_msgbus;
     let data_type = rust_test_custom_data_type("RUST.TEST");
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
 
@@ -23045,7 +23084,7 @@ fn test_request_instruments_no_client_no_catalog_emits_empty(
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -23087,7 +23126,7 @@ fn test_request_instrument_catalog_uses_latest_record(
     earlier.ts_init = UnixNanos::from(1_000);
     audusd_sim.ts_init = UnixNanos::from(2_000);
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -23141,7 +23180,7 @@ fn test_request_instruments_catalog_applies_only_last(
     gbpusd_sim.ts_init = UnixNanos::from(3_000);
     let audusd_id = audusd_sim.id;
     let gbpusd_id = gbpusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -23198,7 +23237,7 @@ fn test_request_instrument_dispatches_straight_to_client_with_no_catalog_registe
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
 
@@ -23239,7 +23278,7 @@ fn test_request_instruments_dispatches_straight_to_client_with_no_catalog_regist
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
 
@@ -23282,7 +23321,7 @@ fn test_request_instrument_force_update_dispatches_to_client_with_catalog_regist
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
 
@@ -23331,7 +23370,7 @@ fn test_request_instruments_update_catalog_dispatches_to_client_with_catalog_reg
     venue: Venue,
 ) {
     let _ = stub_msgbus;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
 
@@ -23383,7 +23422,7 @@ fn test_subscription_name_param_disables_now_clamping(
     let instrument_id = audusd_sim.id;
     // Clock at 1_000; the request asks for data up to 5_000. Without the
     // subscription_name bypass, bound_request_dates clamps end to 1_000.
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 1_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -23456,7 +23495,7 @@ fn test_book_response_skips_cache_write_when_subscription_active(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
 
@@ -23518,7 +23557,7 @@ fn test_book_response_writes_to_cache_when_no_active_subscription(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
@@ -23547,7 +23586,7 @@ fn test_book_response_writes_to_cache_with_unmanaged_subscription(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
 
@@ -23597,7 +23636,7 @@ fn test_book_response_always_delivers_to_requester(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
 
@@ -23662,7 +23701,7 @@ fn register_deltas_catalog_with_deltas(
         None => (None, None),
     };
     catalog.write_to_parquet(deltas, start, end, None).unwrap();
-    data_engine.register_catalog(catalog, None);
+    data_engine.register_catalog(Box::new(catalog), None);
     catalog_dir
 }
 
@@ -23684,7 +23723,7 @@ fn recorded_request_book_deltas(
 fn register_depth_catalog_with_depths(
     data_engine: &mut DataEngine,
     label: &str,
-    depths: &[OrderBookDepth10],
+    depths: &[OrderBookDepth],
     interval: Option<(u64, u64)>,
 ) -> CatalogTempDir {
     let catalog_dir = CatalogTempDir::new(label);
@@ -23694,7 +23733,7 @@ fn register_depth_catalog_with_depths(
         None => (None, None),
     };
     catalog.write_to_parquet(depths, start, end, None).unwrap();
-    data_engine.register_catalog(catalog, None);
+    data_engine.register_catalog(Box::new(catalog), None);
     catalog_dir
 }
 
@@ -23719,7 +23758,7 @@ fn test_request_book_deltas_catalog_only_serves_from_disk(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -23773,7 +23812,7 @@ fn test_request_book_deltas_catalog_plus_client_split(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -23857,7 +23896,7 @@ fn test_book_deltas_response_skips_cache_write_when_subscription_active(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
 
@@ -23927,7 +23966,7 @@ fn test_request_book_deltas_no_client_no_catalog_emits_empty(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -23967,7 +24006,7 @@ fn test_request_book_depth_catalog_only_serves_from_disk(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -24022,7 +24061,7 @@ fn test_request_book_depth_catalog_plus_client_split(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -24113,7 +24152,7 @@ fn test_request_book_depth_no_client_no_catalog_emits_empty(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache, None);
@@ -24153,15 +24192,15 @@ fn test_book_depth_response_publishes_pipeline_depths(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
     let pipeline_topic =
-        switchboard::MessagingSwitchboard::default().get_pipeline_book_depth10_topic(instrument_id);
+        switchboard::MessagingSwitchboard::default().get_pipeline_book_depth_topic(instrument_id);
     let (handler, saver) =
-        get_typed_message_saving_handler::<OrderBookDepth10>(Some(Ustr::from("depth-response")));
-    msgbus::subscribe_book_depth10(pipeline_topic.into(), handler, None);
+        get_typed_message_saving_handler::<OrderBookDepth>(Some(Ustr::from("depth-response")));
+    msgbus::subscribe_book_depth(pipeline_topic.into(), handler, None);
 
     data_engine.response(DataResponse::BookDepth(BookDepthResponse::new(
         UUID4::new(),
@@ -24199,7 +24238,7 @@ fn test_book_deltas_response_publishes_frames_by_f_last(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache, None);
 
@@ -24256,7 +24295,7 @@ fn test_book_deltas_response_applies_to_cache_when_no_subscription_but_book_exis
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
 
@@ -24326,7 +24365,7 @@ fn test_book_deltas_request_replays_day_start_snapshot(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
@@ -24403,7 +24442,7 @@ fn test_book_deltas_request_skips_replay_without_snapshot_flag(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
@@ -24465,7 +24504,7 @@ fn test_book_deltas_request_skips_replay_when_snapshot_not_on_day_boundary(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
@@ -24528,7 +24567,7 @@ fn test_book_deltas_request_skips_replay_when_start_at_day_boundary(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
@@ -24590,7 +24629,7 @@ fn test_book_deltas_request_replays_end_snapshot_when_exhausted(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
@@ -24651,7 +24690,7 @@ fn test_book_deltas_request_from_day_start_false_skips_floor(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
@@ -24712,7 +24751,7 @@ fn test_book_deltas_replay_writes_assembled_snapshot_to_cache(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock, cache.clone(), None);
@@ -24780,7 +24819,7 @@ fn test_book_deltas_replay_respects_cache_ownership(
 ) {
     let _ = stub_msgbus;
     let instrument_id = audusd_sim.id;
-    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_clock_to(&clock, 10_000_000_000);
     let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
@@ -24860,7 +24899,7 @@ fn test_book_deltas_replay_respects_cache_ownership(
 fn test_external_bars_release_after_final_owner(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -24940,7 +24979,7 @@ fn test_external_bars_release_after_final_owner(
 fn test_quote_routes_release_independently_with_shared_topic(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     venue: Venue,
 ) {
@@ -25034,7 +25073,7 @@ fn test_quote_routes_release_independently_with_shared_topic(
 fn test_subscribed_bars_includes_internal_aggregations(
     audusd_sim: CurrencyPair,
     data_engine: Rc<RefCell<DataEngine>>,
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -25070,4 +25109,504 @@ fn test_subscribed_bars_includes_internal_aggregations(
     // Internally aggregated subscriptions never reach a client, but must still
     // be reported (v1 parity)
     assert!(data_engine.subscribed_bars().contains(&bar_type));
+}
+
+#[fixture]
+fn managed_book_engine(
+    audusd_sim: CurrencyPair,
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+    venue: Venue,
+) -> Rc<RefCell<DataEngine>> {
+    let engine = create_snapshot_test_engine(clock.clone(), cache.clone());
+    let recorder = Rc::new(RefCell::new(Vec::new()));
+    register_mock_client(
+        clock,
+        cache.clone(),
+        client_id,
+        venue,
+        None,
+        &recorder,
+        &mut engine.borrow_mut(),
+    );
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+    engine
+}
+
+fn book_source_command(
+    id: InstrumentId,
+    client: ClientId,
+    depth_source: bool,
+    managed: bool,
+) -> SubscribeCommand {
+    if depth_source {
+        SubscribeCommand::BookDepth(SubscribeBookDepth::new(
+            id,
+            BookType::L2_MBP,
+            Some(client),
+            Some(id.venue),
+            UUID4::new(),
+            UnixNanos::from(101),
+            NonZeroUsize::new(25),
+            managed,
+            None,
+            None,
+        ))
+    } else {
+        SubscribeCommand::BookDeltas(SubscribeBookDeltas::new(
+            id,
+            BookType::L2_MBP,
+            Some(client),
+            Some(id.venue),
+            UUID4::new(),
+            UnixNanos::from(101),
+            NonZeroUsize::new(25),
+            managed,
+            None,
+            None,
+        ))
+    }
+}
+
+#[rstest]
+#[case::deltas_manage(false)]
+#[case::depth_manages(true)]
+fn test_managed_book_rejects_other_source_and_ignores_unmanaged_updates(
+    managed_book_engine: Rc<RefCell<DataEngine>>,
+    audusd_sim: CurrencyPair,
+    client_id: ClientId,
+    #[case] depth_source: bool,
+) {
+    let mut engine = managed_book_engine.borrow_mut();
+    let owner = book_source_command(audusd_sim.id, client_id, depth_source, true);
+    engine.execute_subscribe(owner).unwrap();
+    let conflicting = book_source_command(audusd_sim.id, client_id, !depth_source, true);
+    let error = engine.execute_subscribe(conflicting.clone()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Conflicting managed book source")
+    );
+    engine
+        .execute_unsubscribe(&conflicting.clone().into_unsubscribe(
+            UUID4::new(),
+            UnixNanos::from(103),
+            Some(conflicting.command_id()),
+        ))
+        .unwrap();
+
+    let unmanaged = book_source_command(audusd_sim.id, client_id, !depth_source, false);
+    engine.execute_subscribe(unmanaged).unwrap();
+    let (depth_handler, depths) = get_typed_message_saving_handler::<OrderBookDepth>(None);
+    let (delta_handler, deltas) = get_typed_message_saving_handler::<OrderBookDeltas>(None);
+    msgbus::subscribe_book_depth(
+        switchboard::get_book_depth_topic(audusd_sim.id).into(),
+        depth_handler,
+        None,
+    );
+    msgbus::subscribe_book_deltas(
+        switchboard::get_book_deltas_topic(audusd_sim.id).into(),
+        delta_handler,
+        None,
+    );
+    let mut full = stub_depth10();
+    full.instrument_id = audusd_sim.id;
+    full.sequence = 109;
+    full.ts_event = UnixNanos::from(113);
+    full.ts_init = UnixNanos::from(127);
+    let mut expected = OrderBook::new(audusd_sim.id, BookType::L2_MBP);
+    expected.apply_depth(&full).unwrap();
+    let delta = expected.to_deltas(full.ts_event, full.ts_init);
+    let mut truncated = full.clone();
+    truncated.bids.truncate(2);
+    truncated.asks.truncate(2);
+    truncated.bid_counts.truncate(2);
+    truncated.ask_counts.truncate(2);
+    if depth_source {
+        expected.apply_depth(&truncated).unwrap();
+        engine.process_data(Data::BookDepth(Box::new(truncated.clone())));
+        engine.process_data(Data::BookDeltas(Box::new(delta.clone())));
+    } else {
+        engine.process_data(Data::BookDeltas(Box::new(delta.clone())));
+        engine.process_data(Data::BookDepth(Box::new(truncated.clone())));
+    }
+
+    let cache = engine.cache();
+    let cache = cache.borrow();
+    let book = cache.order_book(&audusd_sim.id).unwrap();
+    assert_eq!(book.instrument_id, expected.instrument_id);
+    assert_eq!(book.book_type, expected.book_type);
+    assert_eq!(book.sequence, expected.sequence);
+    assert_eq!(book.ts_last, expected.ts_last);
+    assert_eq!(book.bids_as_map(None), expected.bids_as_map(None));
+    assert_eq!(book.asks_as_map(None), expected.asks_as_map(None));
+    assert_eq!(
+        serde_json::to_value(depths.get_messages()).unwrap(),
+        serde_json::to_value(vec![truncated]).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(deltas.get_messages()).unwrap(),
+        serde_json::to_value(vec![delta]).unwrap()
+    );
+}
+
+#[rstest]
+#[case::deltas_unmanaged_first(false, true)]
+#[case::deltas_unmanaged_last(false, false)]
+#[case::depth_unmanaged_first(true, true)]
+#[case::depth_unmanaged_last(true, false)]
+fn test_managed_book_owners_release_independently(
+    managed_book_engine: Rc<RefCell<DataEngine>>,
+    audusd_sim: CurrencyPair,
+    client_id: ClientId,
+    #[case] depth_source: bool,
+    #[case] unmanaged_first: bool,
+) {
+    let mut engine = managed_book_engine.borrow_mut();
+    let first = book_source_command(audusd_sim.id, client_id, depth_source, true);
+    let second = book_source_command(audusd_sim.id, client_id, depth_source, true);
+    let unmanaged = book_source_command(audusd_sim.id, client_id, depth_source, false);
+    for command in [&unmanaged, &first, &second] {
+        engine.execute_subscribe(command.clone()).unwrap();
+    }
+
+    let release = |engine: &mut DataEngine, command: &SubscribeCommand| {
+        engine
+            .execute_unsubscribe(&command.clone().into_unsubscribe(
+                UUID4::new(),
+                UnixNanos::from(103),
+                Some(command.command_id()),
+            ))
+            .unwrap();
+    };
+
+    let subscribers = || {
+        if depth_source {
+            msgbus::subscriber_count_depth(switchboard::get_book_depth_topic(audusd_sim.id))
+        } else {
+            msgbus::subscriber_count_deltas(switchboard::get_book_deltas_topic(audusd_sim.id))
+        }
+    };
+
+    if unmanaged_first {
+        release(&mut engine, &unmanaged);
+        assert_eq!(subscribers(), 1);
+    }
+
+    release(&mut engine, &first);
+    assert_eq!(subscribers(), 1);
+    // Releasing the same owner twice must not remove the remaining owner.
+    release(&mut engine, &first);
+    assert_eq!(subscribers(), 1);
+    release(&mut engine, &second);
+    assert_eq!(subscribers(), 0);
+    let replacement = book_source_command(audusd_sim.id, client_id, !depth_source, true);
+    engine.execute_subscribe(replacement).unwrap();
+    if !unmanaged_first {
+        release(&mut engine, &unmanaged);
+    }
+
+    assert_eq!(subscribers(), 0);
+    assert_eq!(
+        if depth_source {
+            msgbus::subscriber_count_deltas(switchboard::get_book_deltas_topic(audusd_sim.id))
+        } else {
+            msgbus::subscriber_count_depth(switchboard::get_book_depth_topic(audusd_sim.id))
+        },
+        1
+    );
+}
+
+#[rstest]
+#[case::book_type(0)]
+#[case::depth(1)]
+#[case::parameters(2)]
+#[case::client(3)]
+fn test_managed_book_rejects_incompatible_configuration(
+    managed_book_engine: Rc<RefCell<DataEngine>>,
+    audusd_sim: CurrencyPair,
+    client_id: ClientId,
+    #[case] conflict: u8,
+) {
+    let mut engine = managed_book_engine.borrow_mut();
+    let owner = book_source_command(audusd_sim.id, client_id, false, true);
+    engine.execute_subscribe(owner).unwrap();
+    let mut incoming = book_source_command(audusd_sim.id, client_id, false, true);
+
+    let SubscribeCommand::BookDeltas(cmd) = &mut incoming else {
+        unreachable!()
+    };
+
+    match conflict {
+        0 => cmd.book_type = BookType::L3_MBO,
+        1 => cmd.depth = NonZeroUsize::new(50),
+        2 => {
+            let mut params = Params::new();
+            params.insert("rpi".into(), serde_json::json!(true));
+            cmd.params = Some(params);
+        }
+        3 => cmd.client_id = Some(ClientId::new("OTHER")),
+        _ => unreachable!(),
+    }
+
+    let error = engine.execute_subscribe(incoming).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("same client, book type, depth, and parameters")
+    );
+    assert_eq!(
+        msgbus::subscriber_count_deltas(switchboard::get_book_deltas_topic(audusd_sim.id)),
+        1
+    );
+}
+
+#[rstest]
+#[case::depth_first(true)]
+#[case::interval_first(false)]
+fn test_interval_and_managed_depth_conflict(
+    managed_book_engine: Rc<RefCell<DataEngine>>,
+    audusd_sim: CurrencyPair,
+    client_id: ClientId,
+    #[case] depth_first: bool,
+) {
+    let mut engine = managed_book_engine.borrow_mut();
+    let depth = book_source_command(audusd_sim.id, client_id, true, true);
+    let interval = SubscribeCommand::BookSnapshots(SubscribeBookSnapshots::new(
+        audusd_sim.id,
+        BookType::L2_MBP,
+        Some(client_id),
+        Some(audusd_sim.id.venue),
+        UUID4::new(),
+        UnixNanos::from(101),
+        NonZeroUsize::new(25),
+        NonZeroUsize::new(100).unwrap(),
+        None,
+        None,
+    ));
+
+    let (first, second) = if depth_first {
+        (depth, interval)
+    } else {
+        (interval, depth)
+    };
+
+    engine.execute_subscribe(first.clone()).unwrap();
+    assert!(
+        engine
+            .execute_subscribe(second.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("Conflicting managed book source")
+    );
+    engine
+        .execute_unsubscribe(&second.clone().into_unsubscribe(
+            UUID4::new(),
+            UnixNanos::from(103),
+            Some(second.command_id()),
+        ))
+        .unwrap();
+    assert_eq!(
+        msgbus::subscriber_count_deltas(switchboard::get_book_deltas_topic(audusd_sim.id)),
+        usize::from(!depth_first)
+    );
+    assert_eq!(
+        msgbus::subscriber_count_depth(switchboard::get_book_depth_topic(audusd_sim.id)),
+        usize::from(depth_first)
+    );
+    engine
+        .execute_unsubscribe(&first.clone().into_unsubscribe(
+            UUID4::new(),
+            UnixNanos::from(107),
+            Some(first.command_id()),
+        ))
+        .unwrap();
+    engine.execute_subscribe(second).unwrap();
+}
+
+#[rstest]
+fn test_parent_book_owner_keeps_original_targets(
+    managed_book_engine: Rc<RefCell<DataEngine>>,
+    client_id: ClientId,
+) {
+    let mut engine = managed_book_engine.borrow_mut();
+    let cache = engine.cache().clone();
+    let first = make_es_future("ESZ1.XCME", "ESZ1");
+    let second = make_es_future("ESH2.XCME", "ESH2");
+    let first_id = first.id();
+    let second_id = second.id();
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::FuturesContract(first))
+        .unwrap();
+    let parent_id = InstrumentId::from("ES.FUT.XCME");
+    let mut original = book_source_command(parent_id, client_id, false, true);
+
+    let SubscribeCommand::BookDeltas(command) = &mut original else {
+        unreachable!();
+    };
+
+    command.params = Some(parent_params());
+    engine.execute_subscribe(original.clone()).unwrap();
+
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::FuturesContract(second))
+        .unwrap();
+    let mut expanded = original.clone();
+
+    let SubscribeCommand::BookDeltas(command) = &mut expanded else {
+        unreachable!();
+    };
+
+    command.command_id = UUID4::new();
+    engine.execute_subscribe(expanded.clone()).unwrap();
+    assert_eq!(
+        msgbus::subscriber_count_deltas(switchboard::get_book_deltas_topic(first_id)),
+        1
+    );
+    assert_eq!(
+        msgbus::subscriber_count_deltas(switchboard::get_book_deltas_topic(second_id)),
+        1
+    );
+
+    let expanded_id = expanded.command_id();
+    engine
+        .execute_unsubscribe(&expanded.into_unsubscribe(
+            UUID4::new(),
+            UnixNanos::from(103),
+            Some(expanded_id),
+        ))
+        .unwrap();
+    assert_eq!(
+        msgbus::subscriber_count_deltas(switchboard::get_book_deltas_topic(first_id)),
+        1
+    );
+    assert_eq!(
+        msgbus::subscriber_count_deltas(switchboard::get_book_deltas_topic(second_id)),
+        0
+    );
+
+    engine
+        .execute_subscribe(book_source_command(second_id, client_id, true, true))
+        .unwrap();
+    let original_id = original.command_id();
+    engine
+        .execute_unsubscribe(&original.into_unsubscribe(
+            UUID4::new(),
+            UnixNanos::from(107),
+            Some(original_id),
+        ))
+        .unwrap();
+    assert_eq!(
+        msgbus::subscriber_count_deltas(switchboard::get_book_deltas_topic(first_id)),
+        0
+    );
+    assert_eq!(
+        msgbus::subscriber_count_deltas(switchboard::get_book_deltas_topic(second_id)),
+        0
+    );
+    assert_eq!(
+        msgbus::subscriber_count_depth(switchboard::get_book_depth_topic(second_id)),
+        1
+    );
+}
+
+#[rstest]
+fn test_book_unsubscribe_without_correlation_releases_first_owner(
+    managed_book_engine: Rc<RefCell<DataEngine>>,
+    audusd_sim: CurrencyPair,
+    client_id: ClientId,
+) {
+    let mut engine = managed_book_engine.borrow_mut();
+    let unmanaged = book_source_command(audusd_sim.id, client_id, false, false);
+    let managed = book_source_command(audusd_sim.id, client_id, false, true);
+    engine.execute_subscribe(unmanaged.clone()).unwrap();
+    engine.execute_subscribe(managed.clone()).unwrap();
+
+    engine
+        .execute_unsubscribe(&unmanaged.into_unsubscribe(UUID4::new(), UnixNanos::from(103), None))
+        .unwrap();
+    let topic = switchboard::get_book_deltas_topic(audusd_sim.id);
+    assert_eq!(msgbus::subscriber_count_deltas(topic), 1);
+    let managed_id = managed.command_id();
+    engine
+        .execute_unsubscribe(&managed.into_unsubscribe(
+            UUID4::new(),
+            UnixNanos::from(107),
+            Some(managed_id),
+        ))
+        .unwrap();
+    assert_eq!(msgbus::subscriber_count_deltas(topic), 0);
+}
+
+#[rstest]
+#[case::book_type(0)]
+#[case::smaller_depth(1)]
+#[case::oversized_depth(2)]
+#[case::rpi(3)]
+fn test_unmanaged_depth_rejects_conflicting_feed_configuration(
+    managed_book_engine: Rc<RefCell<DataEngine>>,
+    audusd_sim: CurrencyPair,
+    client_id: ClientId,
+    #[case] conflict: u8,
+) {
+    let mut engine = managed_book_engine.borrow_mut();
+    let mut owner = book_source_command(audusd_sim.id, client_id, true, false);
+
+    let SubscribeCommand::BookDepth(command) = &mut owner else {
+        unreachable!()
+    };
+
+    command.depth = NonZeroUsize::new(5);
+    engine.execute_subscribe(owner.clone()).unwrap();
+
+    let mut incoming = owner.clone();
+
+    let SubscribeCommand::BookDepth(command) = &mut incoming else {
+        unreachable!()
+    };
+
+    command.command_id = UUID4::new();
+
+    match conflict {
+        0 => command.book_type = BookType::L3_MBO,
+        1 => command.depth = NonZeroUsize::new(1),
+        2 => command.depth = NonZeroUsize::new(6),
+        3 => {
+            let mut params = Params::new();
+            params.insert("rpi".into(), serde_json::json!(true));
+            command.params = Some(params);
+        }
+        _ => unreachable!(),
+    }
+
+    let error = engine.execute_subscribe(incoming.clone()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("same client, book type, depth, and parameters")
+    );
+    let incoming_id = incoming.command_id();
+    engine
+        .execute_unsubscribe(&incoming.into_unsubscribe(
+            UUID4::new(),
+            UnixNanos::from(103),
+            Some(incoming_id),
+        ))
+        .unwrap();
+    assert_eq!(engine.subscribed_book_depth(), vec![audusd_sim.id]);
+    let owner_id = owner.command_id();
+    engine
+        .execute_unsubscribe(&owner.into_unsubscribe(
+            UUID4::new(),
+            UnixNanos::from(107),
+            Some(owner_id),
+        ))
+        .unwrap();
+    assert!(engine.subscribed_book_depth().is_empty());
 }

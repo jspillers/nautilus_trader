@@ -21,7 +21,10 @@ use nautilus_common::{
     cache::CacheConfig, enums::Environment, logging::logger::LoggerConfig,
     msgbus::MessageBusConfig, python::config_error_to_pyvalue_err,
 };
-use nautilus_core::{UUID4, UnixNanos, python::to_pyvalue_err};
+use nautilus_core::{
+    UUID4, UnixNanos,
+    python::{to_pytype_err, to_pyvalue_err},
+};
 use nautilus_data::engine::config::DataEngineConfig;
 use nautilus_execution::{
     engine::config::ExecutionEngineConfig,
@@ -36,12 +39,15 @@ use nautilus_model::{
     data::BarSpecification,
     enums::{AccountType, BookType, OmsType, OtoTriggerMode},
     identifiers::{ClientId, InstrumentId, TraderId},
+    python::data::PyNautilusDataType,
     types::Currency,
 };
-use nautilus_persistence::config::DataCatalogConfig;
+use nautilus_persistence::{
+    config::{DataCatalogConfig, StreamingConfig},
+    python::config::PyCatalogBackend,
+};
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
-use nautilus_system::config::StreamingConfig;
 use nautilus_trading::ImportableControllerConfig;
 use pyo3::{Bound, IntoPyObjectExt, Py, PyAny, PyResult, Python, types::PyAnyMethods};
 use rust_decimal::Decimal;
@@ -53,7 +59,6 @@ use super::{
 };
 use crate::config::{
     BacktestDataConfig, BacktestEngineConfig, BacktestRunConfig, BacktestVenueConfig,
-    NautilusDataType,
 };
 
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -672,10 +677,14 @@ impl BacktestDataConfig {
         bar_spec = None,
         bar_types = None,
         optimize_file_loading = None,
+        catalog_backend = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
-        data_type: &str,
+        #[gen_stub(override_type(type_repr = "model.NautilusDataType"))] data_type: &Bound<
+            '_,
+            PyAny,
+        >,
         catalog_path: String,
         catalog_fs_protocol: Option<String>,
         catalog_fs_storage_options: Option<HashMap<String, String>>,
@@ -698,15 +707,22 @@ impl BacktestDataConfig {
         bar_spec: Option<BarSpecification>,
         bar_types: Option<Vec<String>>,
         optimize_file_loading: Option<bool>,
+        catalog_backend: Option<pyo3::PyRef<'_, PyCatalogBackend>>,
     ) -> pyo3::PyResult<Self> {
         let data_type = data_type
-            .parse::<NautilusDataType>()
-            .map_err(to_pyvalue_err)?;
+            .extract::<pyo3::PyRef<'_, PyNautilusDataType>>()
+            .map(|data_type| data_type.inner())
+            .map_err(|_| to_pytype_err("data_type must be NautilusDataType"))?;
         let start_time = timestamp_from_python(start_time)?;
         let end_time = timestamp_from_python(end_time)?;
         Self::builder()
             .data_type(data_type)
             .catalog_path(catalog_path)
+            .catalog_backend(
+                catalog_backend
+                    .map(|backend| backend.inner())
+                    .unwrap_or_default(),
+            )
             .maybe_catalog_fs_protocol(catalog_fs_protocol)
             .maybe_catalog_fs_storage_options(
                 catalog_fs_storage_options.map(|m| m.into_iter().collect()),
@@ -728,10 +744,17 @@ impl BacktestDataConfig {
             .map_err(config_error_to_pyvalue_err)
     }
 
+    /// Returns the configured catalog backend.
+    #[getter]
+    #[pyo3(name = "catalog_backend")]
+    fn py_catalog_backend(&self) -> PyCatalogBackend {
+        PyCatalogBackend::new(self.catalog_backend())
+    }
+
     #[getter]
     #[pyo3(name = "data_type")]
-    fn py_data_type(&self) -> String {
-        self.data_type().to_string()
+    fn py_data_type(&self) -> PyNautilusDataType {
+        PyNautilusDataType::new(self.data_type().clone())
     }
 
     #[getter]

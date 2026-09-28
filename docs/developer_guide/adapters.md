@@ -58,6 +58,7 @@ work that proves conformance.
 | [Data events and request freshness](#data-client)     | Data clients               |
 | [Backpressure](#backpressure)                         | Every adapter              |
 | [Task management](#task-management)                   | Every adapter              |
+| [Deterministic simulation](#deterministic-simulation) | Maintained adapters        |
 
 ### Execution and reconciliation
 
@@ -101,8 +102,12 @@ comparable across venues, so a local structure has to prove the same contract on
 Two execution clients implement the same trait without trading through a venue API, so the baseline
 does not apply to them: [sandbox](../../crates/adapters/sandbox/src/execution.rs) simulates fills
 locally, and [blockchain](../../crates/adapters/blockchain/src/execution/client.rs) executes
-on-chain behind the `defi` feature. Deterministic simulation eligibility also sits outside the
-baseline, as an optional capability proven per adapter rather than a requirement.
+on-chain behind the `defi` feature. Deterministic simulation is a maintained-adapter requirement
+rather than an optional capability: every maintained adapter must satisfy the
+[adapter DST contract](../concepts/dst.md#adapter-dst-contract) or carry a venue-scoped migration
+record tracking the gap. OKX is the reference implementation;
+[deterministic simulation](#deterministic-simulation) defines the seams, gates, and the bar for new
+adapters.
 
 | Target                     | Shared piece                                                                                           | Contract                                                                      |
 | -------------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------- |
@@ -118,6 +123,8 @@ baseline, as an optional capability proven per adapter rather than a requirement
 | Reconnect requests         | [`request_reconnect`](../../crates/network/src/websocket/client.rs)                                    | [Reconnection and shutdown](#reconnection-and-shutdown)                       |
 | Retry machinery            | [`RetryManager`](../../crates/network/src/retry.rs)                                                    | [Error handling and retry logic](#error-handling-and-retry-logic)             |
 | Inferred fill commission   | [`ExecutionClient`](../../crates/common/src/clients/execution.rs)                                      | [Commission failure handling](#commission-failure-handling)                   |
+| Time, tasks, and runtime   | [`nautilus_common::live::dst`](../../crates/common/src/live/dst.rs)                                    | [Deterministic simulation](#deterministic-simulation)                         |
+| Wall-clock reads           | [`duration_since_unix_epoch`](../../crates/core/src/time.rs)                                           | [Deterministic simulation](#deterministic-simulation)                         |
 
 Where a venue transmits a discrete value as an IEEE-754 field rather than a decimal string or JSON
 number, contain that at the parsing boundary as a documented exception instead of letting `f64`
@@ -126,6 +133,36 @@ spread inward from it.
 Retry classification is the exception to this table: it stays adapter-owned because venue status
 codes and rate-limit semantics differ. The shared machinery around it is not. See
 [error handling and retry logic](#error-handling-and-retry-logic) for both halves.
+
+### Deterministic simulation
+
+Every maintained adapter, an Official-tier adapter per
+[ADAPTERS.md](../../ADAPTERS.md#adapter-tiers), must satisfy the
+[adapter DST contract](../concepts/dst.md#adapter-dst-contract). An adapter that does not yet
+conform carries a venue-scoped migration record tracking the gap. Unclaimed capabilities stay
+outside the contract until a slice proves them.
+
+OKX is the reference implementation. It proves the contract through shared seams, static gates, and
+behavioral gates:
+
+- **Seams:** the `nautilus_common::live::dst` facade for time, tasks, runtime, and signals; the
+  `nautilus_core::time` wall-clock seam; the simulated HTTP and WebSocket transport in
+  `nautilus-network`; and the shared subscription, reconnect, and retry machinery in the baseline
+  table above.
+- **Static gates:** `check-dst-conventions` covers every DST-path production file (`ADAPTER_PATHS`
+  in `.pre-commit-hooks/check_dst_conventions.sh`), and the nightly `dst-smoke` gate runs the
+  simulation Clippy and test legs.
+- **Behavioral gates:** `crates/adapters/okx/tests/integration/dst.rs` pins exact subscribe bytes
+  and exact per-operation wire fields against controlled local peers; complete wire-to-domain
+  fresh-process comparison lives in the downstream harness.
+
+The [OKX integration guide's DST section](../integrations/okx.md#deterministic-simulation-testing)
+records the audited slice.
+
+A new adapter proves the contract from its first transport: gate DST-path files as they are added,
+drive every endpoint from configuration to a local peer, and pin wire bytes before expanding the
+slice. Do not introduce a shared abstraction until a second adapter proves the same boundary is
+needed.
 
 ## Structure of an adapter
 
@@ -394,6 +431,23 @@ live and test endpoints. Keep explicit URL overrides only where custom gateways,
 venue deployments require them. Test every supported environment and any precedence between an
 environment choice and an explicit override.
 
+Lay out config fields in this order:
+
+| Order | Field group                                | Placement rule                                                         |
+| ----- | ------------------------------------------ | ---------------------------------------------------------------------- |
+| 1     | Account identity, credentials, environment | Venue equivalents count: `network`, `deployment`, `region`.            |
+| 2     | URL overrides                              | One contiguous block: `base_url_http` first, then each `base_url_ws*`. |
+| 3     | `proxy_url`                                | Immediately after the URL block.                                       |
+| 4     | Everything else                            | Timeouts, retries, venue-specific behavior.                            |
+
+Resolve each `None` override to the environment default in a config helper method, and pass the
+resolved URL to the client constructor; constructors never read the `Option` fields directly.
+Keep the same relative order across the struct fields, `bon::Builder` accessors, pyo3 getter lists,
+and Python `__init__` signatures. Published Python signatures keep their positional order: new
+parameters are appended, and existing ones are not reordered, so a signature may lag the struct
+order. An intentional reorder of a published signature is a breaking change; note it under
+Breaking Changes in `RELEASES.md`.
+
 ### Credentials and secret handling
 
 When HTTP and WebSocket clients use the same key material, centralize credential handling in a type,
@@ -505,11 +559,19 @@ zeroization conventions.
 | Surface                      | Required handling                                                                                                | Zeroization boundary                                                   |
 | ---------------------------- | ---------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
 | HTTP secret body             | Use `HttpClient::request_with_secret_body`.                                                                      | The client retains the zeroizing owner; lower layers may copy it.      |
-| HTTP path or `HashMap` query | Use `HttpClient::request_with_url_redacted`.                                                                     | The URL is removed from logs and transport errors.                     |
-| HTTP typed query             | Use `HttpClient::request_with_params_url_redacted`.                                                              | The URL is removed from logs and transport errors.                     |
+| HTTP path or `HashMap` query | Use `HttpClient::request_with_url_redacted`.                                                                     | The URL is omitted from transport errors.                              |
+| HTTP typed query             | Use `HttpClient::request_with_params_url_redacted`.                                                              | The URL is omitted from transport errors.                              |
 | HTTP headers and proxy       | Create credential-bearing strings at the client boundary, avoid clones, and do not retain them in adapter state. | The shared client or transport may retain copies.                      |
 | WebSocket authentication     | Keep fields and serialized frames in `SecretString`; create the final `String` immediately before `send_text`.   | The shared client has no secret-owner-preserving send method.          |
 | Unsupported combination      | Extend the common client instead of implementing adapter-local URL or error scrubbing.                           | The common API must define the resulting ownership and redaction rule. |
+
+:::warning Disable redirects for authenticated requests
+
+Clients that send credentials or signed payloads must set `HttpRedirectPolicy::Reject`. Use an
+equivalent no-redirect policy with other HTTP transports so redirects cannot forward credentials
+or signed payloads to another destination.
+
+:::
 
 #### Verify credential handling
 
@@ -809,6 +871,130 @@ snapshot according to the venue contract. Map removal to `NotAvailableForTrading
 disappearance means the instrument is unavailable. Update the full private cache even when
 emissions are filtered to active subscriptions.
 
+### Order book recovery ownership
+
+[`nautilus_live::book`](../../crates/live/src/book/mod.rs) provides the recovery machinery shared by
+OKX, Polymarket, Lighter, and Binance. Keep venue-specific book synchronization and recovery in each
+adapter's `src/book/`, with WebSocket handlers dispatching commands and frames.
+
+#### Per-book sync
+
+`BookSync` holds one book's phase (waiting for its first snapshot, synced at a venue position, or
+recovering), its pending snapshot, and its recovery state. It performs no I/O, so the
+[L0 property test](spec_data_testing.md#validation-levels) drives it through arbitrary schedules of
+subscribes, snapshots, gaps, rejections, reconnects, and deadlines.
+
+A book out of sync needs an owner: a running recovery or an armed snapshot deadline.
+`BookSync::gap` requests recovery only when neither exists, and `BookSync::claim` admits one running
+recovery at a time, so repeated gap reports cannot start competing recoveries. Arm a deadline only
+where a monitor checks it, or the book keeps an owner that never acts. Stale-feed reports cover
+every book that no running recovery owns.
+
+OKX, Polymarket, and Binance keep a `BookSync` per book. Lighter keeps a `BookRecoveryState` per
+book inside its handler-owned tracker.
+
+#### Starting recovery
+
+Recovery for a `BookSync` book moves through four steps, and a book can stop between any two:
+
+1. **Mark**: `BookSync::gap` moves the book to `Recovering`, where it emits nothing.
+1. **Request**: the same call returns `BookSequenceOutcome::Recover` only when no running recovery
+   or armed snapshot deadline owns the book. A request grants no ownership, so later calls return
+   `Recover` again until an episode is claimed.
+1. **Claim**: `BookSync::claim` admits one episode, which then owns the book and retires any pending
+   snapshot wait.
+1. **Run**: the adapter spawns `BookRecovery::run` for the claimed episode in its task scope.
+
+Binance claims in the same step that detects the gap: every diff for an unsynced book tries
+`claim`, which refuses while an episode runs.
+
+When recovery cannot start, keep the book able to ask again:
+
+- Check what the replacement needs, such as a socket, channel, or token, before claiming. An early
+  return then leaves the book unowned.
+- Pass every incremental update for an unsynced book through `BookSync::gap`, including updates
+  that arrive while it is already recovering. Suppressing an update on phase alone strands a book
+  that nothing owns: its output stays dark until a snapshot happens to arrive.
+- Cancel a claimed episode when the task scope refuses its task, for example with a drop guard on
+  the episode's cancellation token that the task takes over. A running episode without a task owns
+  the book and refuses every later claim.
+- Start nothing after unsubscribe or shutdown. Removing the book cancels its episode, and a closed
+  task scope refuses the task, so the drop guard cancels a late claim.
+
+#### Recovery state and retry budgets
+
+Keep one `BookRecoveryState` per subscribed book under the adapter's existing state lock or owning
+task, either directly or inside the shared per-book `BookSync`. It admits one running recovery and
+cancels obsolete work. A book never ends in a failed state.
+
+`BookRecovery::run` owns replacement attempts, child cancellation tokens, snapshot waits, backoff,
+and retry limits. It makes up to eight attempts within 180 seconds, then continues at an interval
+that doubles from one minute to fifteen minutes until a snapshot is accepted or the episode is
+cancelled; an error the classifier rejects moves straight to that interval. Each attempt after the
+budget is bounded by `max(snapshot_timeout, 60 seconds)`, so a stalled write or a disabled snapshot
+deadline cannot stop the retries. The adapter supplies its replacement operation and error
+classifier.
+
+Keep a running invocation alive across reconnects so a reconnect can neither replenish the budget
+nor abandon a replacement write. A reconnect never interrupts an attempt or shortens a backoff
+inside the budget. It wakes an invocation that is waiting between attempts after its budget, so the
+next attempt uses the new connection at once. A reconnect that lands during an attempt, or before
+the budget runs out, instead ends the next wait between attempts after the budget.
+
+#### Snapshot acceptance
+
+A confirmed write alone never establishes a usable book. Coordinate replacement and acceptance in
+this order:
+
+1. Close `SnapshotGate` before replacement.
+1. Open the gate after the intended connection confirms the subscription write.
+1. Accept the snapshot under the same ownership boundary that starts recovery, then replace all
+   levels, including for an empty snapshot.
+
+`PendingSnapshot` cancels initial waits when the snapshot is accepted or the pending owner is removed.
+
+#### Venue rules and shared decisions
+
+The adapter owns sequencing, channel routing, wire commands, acknowledgement correlation, and
+snapshot parsing. The shared types describe the result of validation and monitoring:
+
+- `BookSequenceOutcome`: accept, suppress, or recover. Adapters retain their validation rules and
+  gap diagnostics.
+- `BookSyncSignal`: a stale feed or missing snapshot for one book.
+
+Lighter retains its subscription generations and control-ack/typed-snapshot correlation. OKX retains
+its documented [acknowledgement-correlation limits](../integrations/okx.md#snapshot-correlation-limitation).
+
+Adapters fall into two recovery families, which determine the oracle a stress harness can use:
+
+- Push (OKX, Polymarket, Lighter): a replacement resubscribes, and the venue stream delivers the
+  snapshot.
+- Pull (Binance): diff streams stay subscribed. A replacement fetches a REST snapshot, and the
+  adapter accepts it only when the buffered diffs continue from its `lastUpdateId` without a gap.
+
+#### Task lifetime and cancellation
+
+Run asynchronous work inside the client's task scope or handler-owned futures. The handler must
+continue draining commands and frames while writes wait, allowing unsubscribe, shutdown, and
+recovery deadlines to cancel obsolete operations.
+
+#### Naming and configuration
+
+Adapters implementing this machinery share names and tuning so operators move between venues
+without relearning behavior:
+
+- Keep book sync state in `src/book/sync.rs` behind `BookSyncTracker`.
+- Wait for snapshots with `book_snapshot_timeout_secs`, defaulting to the shared
+  `DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS` (10 seconds) in `nautilus_live::book`; the value stays
+  tunable per deployment.
+- Honor a zero timeout as disabled snapshot deadlines on every wait path, including adapter-owned
+  sends and snapshot waits outside the shared runner: with no deadline, those waits resolve only on
+  cancellation. The shared runner still bounds recovery by its 180-second initial budget and by
+  one-minute attempts after it.
+- Keep the live stress harness at `tests/stress/book_stress.rs` as the `<venue>-book-stress` test
+  target. The [order book sync conformance](spec_data_testing.md#order-book-sync-conformance)
+  specification defines the contract it checks and the faults it forces.
+
 ### Execution client
 
 Execution clients translate commands, preserve order identity, publish account state, and generate
@@ -862,6 +1048,33 @@ client declares a history bound, as described in
 clock. Returning `Ok(None)` logs a warning and leaves that client unreconciled, while an error
 fails startup.
 
+##### Mass-status timestamp contract
+
+`ExecutionMassStatus.ts_init` marks the start of snapshot collection. For every producer,
+including reconnect snapshots and custom `generate_mass_status` implementations:
+
+- **Capture before collection:** Read the adapter's local clock before the first request,
+  cache read, or concurrent collection task.
+- **Use a consistent clock:** Use the same local clock as execution fill and fill-void
+  initialization timestamps. Never substitute a venue timestamp or zero.
+- **Preserve the boundary:** Keep that value through snapshot construction and publication.
+  Neither completion time nor individual report timestamps replace it.
+
+Runtime reconciliation skips an order snapshot when a cached fill or fill void has `ts_init`
+at or after this boundary. Companion trades still process normally.
+
+Incorrect timestamps change reconciliation behavior:
+
+- A **completion timestamp** can make an older snapshot appear newer than an overlapping fill,
+  causing the engine to void that fill incorrectly.
+- A **zero timestamp** can suppress legitimate snapshot corrections indefinitely.
+
+**Test custom producers:** Delay a report response and assert that the mass-status timestamp
+is captured before collection starts and remains unchanged when collection finishes.
+
+See [Snapshot freshness and fill corrections](../concepts/execution/reconciliation.md#snapshot-freshness-and-fill-corrections)
+for the startup distinction and limits when venue state is already stale.
+
 ##### Bulk report filters
 
 The bulk methods take a filter command carrying `instrument_id`, `start`, and `end`, plus
@@ -903,6 +1116,26 @@ Distinguish absence from failure in that probe, because the engine acts on the d
 A failed lookup returned as `Ok(None)` can therefore reject or cancel an order that is live at the
 venue. The trait default returns `Ok(None)` after logging that the handler is not implemented, so
 implement this method before an open-order check runs in full-history mode.
+
+##### Shared reconciliation changes
+
+The execution engine and the live `ExecutionManager` apply every adapter's reports through the
+same code, so a change to shared execution or reconciliation logic changes behavior for every venue
+at once. Assess such a change against every adapter with an execution client, not only the venue
+that motivated it. For each adapter, check the report fields the change relies on, for example:
+
+- The time `OrderStatusReport.ts_accepted` carries: the venue's acceptance time, its last update
+  time, or a local timestamp. A last update or local time can place an order's acceptance after its
+  own fills.
+- The time `OrderStatusReport.ts_last` carries for a closed order: when it closed, or an earlier
+  time such as its creation, which can place a cancellation before the order's own fills.
+- Whether fill reports carry the same `venue_order_id` as the order report for the same order.
+- Whether one client order can carry more than one venue order ID in a single mass status, for
+  example after a price replacement.
+- Whether mass status includes closed orders or only open ones.
+
+Classify each adapter as helped, unaffected, or at risk, cite the code that decides it, and include
+the result in the pull request description.
 
 #### Commission failure handling
 
@@ -978,6 +1211,31 @@ Commission construction is an exception to partial bounded history. Follow
 [commission failure handling](#commission-failure-handling) and fail the report request instead of
 returning a set that omits the affected fill.
 
+:::danger[Position report parsing is market exposure]
+**Parse position reports exactly. The engine treats each explicit report as the position, then
+aligns to it within reconciliation tolerances or fails closed.** A wrong quantity, a wrong side,
+a dropped row, or an invented flat becomes exposure a strategy will trade.
+
+By default the engine generates the orders and fills required to reach the report you emit. It
+cannot recover a position fact you dropped or invented.
+
+Emit a report only for a fact the venue stated:
+
+- Open quantity and direction, as an open report
+- No position, as an explicit flat report, and only after coverage proves that position is flat
+
+Do not emit a report for:
+
+- An omitted instrument without authoritative coverage
+- A null quantity
+- An unparsed row
+- A venue that does not publish positions
+
+Dropping a reported zero or flat, or inventing a zero without authoritative coverage, is an
+adapter coding error. A complete venue snapshot can establish flat only when its documented
+coverage includes the position; a missing or failed response cannot.
+:::
+
 When positions come from a cached stream, absence proves flat only when a complete snapshot from
 the current connection epoch positively covers that instrument. Invalidate snapshot coverage on
 reconnect, and keep a row uncovered when it could not be parsed or mapped. Emit an explicit flat
@@ -1022,9 +1280,10 @@ neither fails nor warns because the venue returned records for the rest.
 Historical queries reach past the loaded instrument set routinely, because expiries retire
 instruments that earlier fills still reference. Failing a bounded-history query for one expired
 instrument would withhold every other record it returned, so record the incompleteness through
-`set_report_window` and let the engine apply its bounded-history rules. The engine acts on that
-incompleteness only for a mass status that declares `lookback_start`; an adapter that declares no
-bound follows the compatibility fill-adjustment path instead.
+`set_report_window`. Incompleteness does not veto an explicit position report. A bounded fill for an
+instrument with no explicit position report does not change a position. Emit an explicit flat report
+only when coverage proves the venue has no position. Do not omit the row and expect the engine to
+infer flat.
 
 `reconciliation_instrument_ids` filters reports after the execution engine receives them, so it
 cannot prevent a resolution failure inside an adapter. Keep the adapter's scope in its instrument
