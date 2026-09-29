@@ -33,7 +33,7 @@ use nautilus_model::{
     },
     instruments::{InstrumentAny, SyntheticInstrument},
     orderbook::OrderBook,
-    orders::OrderAny,
+    orders::{Order, OrderAny},
     position::Position,
     types::{Currency, Money},
 };
@@ -559,6 +559,19 @@ pub trait CacheDatabaseAdapter {
     ///
     /// Returns an error if updating an order fails.
     fn update_order(&self, order_event: &OrderEventAny) -> anyhow::Result<()>;
+
+    /// Updates an order in the cache with its last applied event.
+    ///
+    /// `order` is the state after applying its last event. Adapters that maintain derived order
+    /// indexes may use this state instead of replaying the persisted event history. The default
+    /// implementation persists `order.last_event()` through [`Self::update_order`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if updating the order fails.
+    fn update_order_state(&self, order: &OrderAny) -> anyhow::Result<()> {
+        self.update_order(order.last_event())
+    }
 
     /// Updates a position in the cache.
     ///
