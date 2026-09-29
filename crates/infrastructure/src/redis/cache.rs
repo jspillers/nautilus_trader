@@ -121,6 +121,26 @@ const INDEX_POSITIONS: &str = "index:positions";
 const INDEX_POSITIONS_OPEN: &str = "index:positions_open";
 const INDEX_POSITIONS_CLOSED: &str = "index:positions_closed";
 
+/// Appends an order event and updates its index sets only when the order event list exists.
+///
+/// `KEYS[1]` is the order event list and `KEYS[2..]` are order index sets. `ARGV[1]` is the
+/// serialized event and `ARGV[2]` is the client order ID. `ARGV[i + 1]` is `1` to add the client
+/// order ID to `KEYS[i]` or `0` to remove it. Returns 1 when appended, or 0 when the list is missing.
+const APPEND_ORDER_EVENT_SCRIPT: &str = "
+if redis.call('EXISTS', KEYS[1]) == 0 then
+    return 0
+end
+redis.call('RPUSH', KEYS[1], ARGV[1])
+for i = 2, #KEYS do
+    if ARGV[i + 1] == '1' then
+        redis.call('SADD', KEYS[i], ARGV[2])
+    else
+        redis.call('SREM', KEYS[i], ARGV[2])
+    end
+end
+return 1
+";
+
 /// Configuration for a Redis-backed cache database.
 ///
 /// Redis 6.2 or higher is required for correct operation.
@@ -255,10 +275,68 @@ pub enum DatabaseOperation {
     Insert,
     Update,
     UpdateOrder,
+    /// Appends an order event with index membership taken from the post-event order.
+    AppendOrderEvent(OrderIndexUpdate),
     ReplaceList,
     Delete,
     Flush(SyncSender<()>),
     Close,
+}
+
+/// Order index membership derived from an order state.
+///
+/// Carries the order facts that determine the order index sets, so the writer can update the
+/// indexes in the same atomic pipeline as the event append without replaying the stored history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrderIndexUpdate {
+    client_order_id: ClientOrderId,
+    has_venue_order_id: bool,
+    is_inflight: bool,
+    lifecycle: OrderLifecycle,
+    is_emulated: bool,
+}
+
+/// Whether an order belongs in the open or closed order index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrderLifecycle {
+    Open,
+    Closed,
+    Neither,
+}
+
+impl OrderIndexUpdate {
+    fn from_order(order: &OrderAny) -> Self {
+        let is_closed = order.is_closed();
+        let lifecycle = if order.is_open() {
+            OrderLifecycle::Open
+        } else if is_closed {
+            OrderLifecycle::Closed
+        } else {
+            OrderLifecycle::Neither
+        };
+        Self {
+            client_order_id: order.client_order_id(),
+            has_venue_order_id: order.venue_order_id().is_some(),
+            is_inflight: order.is_inflight(),
+            lifecycle,
+            is_emulated: order.emulation_trigger().is_some() && !is_closed,
+        }
+    }
+
+    /// Returns the index set changes in application order as `(index, is_member)` pairs.
+    fn set_changes(self) -> impl Iterator<Item = (&'static str, bool)> {
+        let lifecycle: &[(&'static str, bool)] = match self.lifecycle {
+            OrderLifecycle::Open => &[(INDEX_ORDERS_CLOSED, false), (INDEX_ORDERS_OPEN, true)],
+            OrderLifecycle::Closed => &[(INDEX_ORDERS_OPEN, false), (INDEX_ORDERS_CLOSED, true)],
+            OrderLifecycle::Neither => &[],
+        };
+
+        std::iter::once((INDEX_ORDERS, true))
+            .chain(self.has_venue_order_id.then_some((INDEX_ORDER_IDS, true)))
+            .chain(std::iter::once((INDEX_ORDERS_INFLIGHT, self.is_inflight)))
+            .chain(lifecycle.iter().copied())
+            .chain(std::iter::once((INDEX_ORDERS_EMULATED, self.is_emulated)))
+    }
 }
 
 /// Represents a database command to be performed which may be executed in a task.
@@ -785,6 +863,7 @@ async fn drain_buffer(
     let mut pipe = redis::pipe();
     pipe.atomic();
     let mut has_pending_ops = false;
+    let mut order_appends = Vec::new();
 
     for msg in buffer.drain(..) {
         let Some(key) = msg.key else {
@@ -827,7 +906,8 @@ async fn drain_buffer(
                 }
             }
             DatabaseOperation::UpdateOrder => {
-                flush_pending_pipeline(conn, &mut pipe, &mut has_pending_ops).await;
+                flush_pending_pipeline(conn, &mut pipe, &mut has_pending_ops, &mut order_appends)
+                    .await;
 
                 if let Some(payload) = msg.payload {
                     log::debug!("Processing UPDATE_ORDER for key: {key}");
@@ -839,6 +919,17 @@ async fn drain_buffer(
                 } else {
                     log::error!("Null `payload` for `update_order`");
                 }
+            }
+            DatabaseOperation::AppendOrderEvent(update) => {
+                let payload = msg.payload.as_deref();
+                has_pending_ops |= queue_order_event(
+                    &mut pipe,
+                    trader_key,
+                    key,
+                    payload,
+                    update,
+                    &mut order_appends,
+                );
             }
             DatabaseOperation::ReplaceList => {
                 if let Some(payload) = msg.payload {
@@ -871,25 +962,108 @@ async fn drain_buffer(
         }
     }
 
-    flush_pending_pipeline(conn, &mut pipe, &mut has_pending_ops).await;
+    flush_pending_pipeline(conn, &mut pipe, &mut has_pending_ops, &mut order_appends).await;
 }
 
+/// Executes the pending atomic pipeline.
+///
+/// `order_appends` holds the reply index and key of each order event append in the pipeline, so a
+/// skipped append for a missing order event list is logged after the transaction completes.
 async fn flush_pending_pipeline(
     conn: &mut ConnectionManager,
     pipe: &mut Pipeline,
     has_pending_ops: &mut bool,
+    order_appends: &mut Vec<(usize, String)>,
 ) {
     if !*has_pending_ops {
         return;
     }
 
-    if let Err(e) = pipe.query_async::<()>(conn).await {
-        log::error!("{e}");
+    if order_appends.is_empty() {
+        if let Err(e) = pipe.query_async::<()>(conn).await {
+            log::error!("{e}");
+        }
+    } else {
+        match pipe.query_async::<Vec<redis::Value>>(conn).await {
+            Ok(replies) => log_order_append_replies(&replies, order_appends),
+            Err(e) => log::error!("{e}"),
+        }
+        order_appends.clear();
     }
 
     *pipe = redis::pipe();
     pipe.atomic();
     *has_pending_ops = false;
+}
+
+fn log_order_append_replies(replies: &[redis::Value], order_appends: &[(usize, String)]) {
+    for (reply_index, key) in order_appends {
+        match replies.get(*reply_index) {
+            Some(redis::Value::Int(1)) => {}
+            Some(redis::Value::Int(0)) => {
+                log::warn!("Cannot update order in Redis, no existing state at {key}");
+            }
+            reply => log::error!("Unexpected reply appending order event at {key}: {reply:?}"),
+        }
+    }
+}
+
+/// Queues an order event append, recording its reply index in `order_appends`.
+///
+/// Returns whether the append was queued.
+fn queue_order_event(
+    pipe: &mut Pipeline,
+    trader_key: &str,
+    key: String,
+    payload: Option<&[Bytes]>,
+    update: OrderIndexUpdate,
+    order_appends: &mut Vec<(usize, String)>,
+) -> bool {
+    let Some(payload) = payload else {
+        log::error!("Null `payload` for `append_order_event`");
+        return false;
+    };
+
+    log::debug!("Processing APPEND_ORDER_EVENT for key: {key}");
+    let reply_index = pipe.len();
+    if let Err(e) = append_order_event(pipe, trader_key, &key, payload, update) {
+        log::error!("{e}");
+        return false;
+    }
+
+    order_appends.push((reply_index, key));
+    true
+}
+
+/// Queues an order event append and its index updates as one conditional script in `pipe`.
+///
+/// The script appends and updates indexes only when the order event list exists, matching the
+/// skip of [`update_order_event_log`] for an order with no existing state.
+fn append_order_event(
+    pipe: &mut Pipeline,
+    trader_key: &str,
+    key: &str,
+    value: &[Bytes],
+    update: OrderIndexUpdate,
+) -> anyhow::Result<()> {
+    check_slice_not_empty(value, stringify!(value))?;
+
+    let order_id = update.client_order_id.to_string();
+    let changes: Vec<(&str, bool)> = update.set_changes().collect();
+
+    pipe.cmd("EVAL")
+        .arg(APPEND_ORDER_EVENT_SCRIPT)
+        .arg(1 + changes.len())
+        .arg(key);
+    for (index, _) in &changes {
+        pipe.arg(full_redis_key(trader_key, index));
+    }
+    pipe.arg(value[0].as_ref()).arg(order_id.as_bytes());
+    for (_, is_member) in &changes {
+        pipe.arg(if *is_member { "1" } else { "0" });
+    }
+
+    Ok(())
 }
 
 async fn update_order_event_log(
@@ -1120,73 +1294,16 @@ fn full_redis_key(trader_key: &str, key: &str) -> String {
 }
 
 fn update_order_indexes(pipe: &mut Pipeline, trader_key: &str, order: &OrderAny) {
-    let client_order_id = order.client_order_id();
-    let order_id_bytes = client_order_id.to_string();
+    let update = OrderIndexUpdate::from_order(order);
+    let order_id_bytes = update.client_order_id.to_string();
 
-    insert_set(
-        pipe,
-        &full_redis_key(trader_key, INDEX_ORDERS),
-        order_id_bytes.as_bytes(),
-    );
-
-    if order.venue_order_id().is_some() {
-        insert_set(
-            pipe,
-            &full_redis_key(trader_key, INDEX_ORDER_IDS),
-            order_id_bytes.as_bytes(),
-        );
-    }
-
-    if order.is_inflight() {
-        insert_set(
-            pipe,
-            &full_redis_key(trader_key, INDEX_ORDERS_INFLIGHT),
-            order_id_bytes.as_bytes(),
-        );
-    } else {
-        remove_from_set(
-            pipe,
-            &full_redis_key(trader_key, INDEX_ORDERS_INFLIGHT),
-            order_id_bytes.as_bytes(),
-        );
-    }
-
-    if order.is_open() {
-        remove_from_set(
-            pipe,
-            &full_redis_key(trader_key, INDEX_ORDERS_CLOSED),
-            order_id_bytes.as_bytes(),
-        );
-        insert_set(
-            pipe,
-            &full_redis_key(trader_key, INDEX_ORDERS_OPEN),
-            order_id_bytes.as_bytes(),
-        );
-    } else if order.is_closed() {
-        remove_from_set(
-            pipe,
-            &full_redis_key(trader_key, INDEX_ORDERS_OPEN),
-            order_id_bytes.as_bytes(),
-        );
-        insert_set(
-            pipe,
-            &full_redis_key(trader_key, INDEX_ORDERS_CLOSED),
-            order_id_bytes.as_bytes(),
-        );
-    }
-
-    if order.emulation_trigger().is_some() && !order.is_closed() {
-        insert_set(
-            pipe,
-            &full_redis_key(trader_key, INDEX_ORDERS_EMULATED),
-            order_id_bytes.as_bytes(),
-        );
-    } else {
-        remove_from_set(
-            pipe,
-            &full_redis_key(trader_key, INDEX_ORDERS_EMULATED),
-            order_id_bytes.as_bytes(),
-        );
+    for (index, is_member) in update.set_changes() {
+        let key = full_redis_key(trader_key, index);
+        if is_member {
+            insert_set(pipe, &key, order_id_bytes.as_bytes());
+        } else {
+            remove_from_set(pipe, &key, order_id_bytes.as_bytes());
+        }
     }
 }
 
@@ -1876,6 +1993,19 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             .map_err(|e| anyhow::anyhow!("{FAILED_TX_CHANNEL}: {e}"))
     }
 
+    fn update_order_state(&self, order: &OrderAny) -> anyhow::Result<()> {
+        let order_event = order.last_event();
+        let client_order_id = order_event.client_order_id();
+        let key = format!("{ORDERS}{REDIS_DELIMITER}{client_order_id}");
+        let payload = self.serialize_order_event(order_event)?;
+        let update = OrderIndexUpdate::from_order(order);
+        self.send_command(
+            DatabaseOperation::AppendOrderEvent(update),
+            key,
+            Some(vec![payload]),
+        )
+    }
+
     fn update_position(&self, position: &Position) -> anyhow::Result<()> {
         let position_id = position.id;
         if position.requires_replay_state() {
@@ -1940,9 +2070,305 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_model::{
+        enums::{OrderSide, OrderType, TriggerType},
+        events::order::spec::{
+            OrderEmulatedSpec, OrderPendingCancelSpec, OrderRejectedSpec, OrderReleasedSpec,
+        },
+        identifiers::TradeId,
+        instruments::stubs::crypto_perpetual_ethusdt,
+        orders::{builder::OrderTestBuilder, stubs::TestOrderEventStubs},
+        types::{Price, Quantity},
+    };
     use rstest::rstest;
 
     use super::*;
+
+    const TRADER_KEY: &str = "trader-TESTER-001";
+
+    // The order index updates as written before `OrderIndexUpdate` existed, kept as the oracle
+    // for the index changes that both order event write paths must apply.
+    fn reference_update_order_indexes(pipe: &mut Pipeline, trader_key: &str, order: &OrderAny) {
+        let order_id_bytes = order.client_order_id().to_string();
+        let key = |index| full_redis_key(trader_key, index);
+
+        insert_set(pipe, &key(INDEX_ORDERS), order_id_bytes.as_bytes());
+
+        if order.venue_order_id().is_some() {
+            insert_set(pipe, &key(INDEX_ORDER_IDS), order_id_bytes.as_bytes());
+        }
+
+        if order.is_inflight() {
+            insert_set(pipe, &key(INDEX_ORDERS_INFLIGHT), order_id_bytes.as_bytes());
+        } else {
+            remove_from_set(pipe, &key(INDEX_ORDERS_INFLIGHT), order_id_bytes.as_bytes());
+        }
+
+        if order.is_open() {
+            remove_from_set(pipe, &key(INDEX_ORDERS_CLOSED), order_id_bytes.as_bytes());
+            insert_set(pipe, &key(INDEX_ORDERS_OPEN), order_id_bytes.as_bytes());
+        } else if order.is_closed() {
+            remove_from_set(pipe, &key(INDEX_ORDERS_OPEN), order_id_bytes.as_bytes());
+            insert_set(pipe, &key(INDEX_ORDERS_CLOSED), order_id_bytes.as_bytes());
+        }
+
+        if order.emulation_trigger().is_some() && !order.is_closed() {
+            insert_set(pipe, &key(INDEX_ORDERS_EMULATED), order_id_bytes.as_bytes());
+        } else {
+            remove_from_set(pipe, &key(INDEX_ORDERS_EMULATED), order_id_bytes.as_bytes());
+        }
+    }
+
+    fn command_args(cmd: &redis::Cmd) -> Vec<Vec<u8>> {
+        cmd.args_iter()
+            .map(|arg| match arg {
+                redis::Arg::Simple(bytes) => bytes.to_vec(),
+                _ => panic!("unexpected non-simple argument"),
+            })
+            .collect()
+    }
+
+    fn apply(order: &mut OrderAny, event: OrderEventAny) -> OrderAny {
+        order.apply(event).unwrap();
+        order.clone()
+    }
+
+    // Orders covering each index-relevant state reached through native order events.
+    fn orders_in_each_index_state() -> Vec<OrderAny> {
+        let mut states = limit_order_lifecycle_states();
+        states.extend(rejected_and_emulated_order_states());
+        states
+    }
+
+    fn limit_order_lifecycle_states() -> Vec<OrderAny> {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let account_id = AccountId::new("BINANCE-001");
+        let mut states = Vec::new();
+
+        let mut limit = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("2.0"))
+            .price(Price::from("1000.00"))
+            .client_order_id(ClientOrderId::new("O-LIMIT"))
+            .build();
+        states.push(limit.clone());
+        let submitted = TestOrderEventStubs::submitted(&limit, account_id);
+        states.push(apply(&mut limit, submitted));
+        let accepted = TestOrderEventStubs::accepted(&limit, account_id, VenueOrderId::new("V-1"));
+        states.push(apply(&mut limit, accepted));
+        let pending_cancel = OrderEventAny::PendingCancel(
+            OrderPendingCancelSpec::builder()
+                .trader_id(limit.trader_id())
+                .strategy_id(limit.strategy_id())
+                .instrument_id(limit.instrument_id())
+                .client_order_id(limit.client_order_id())
+                .account_id(account_id)
+                .venue_order_id(VenueOrderId::new("V-1"))
+                .build(),
+        );
+        states.push(apply(&mut limit, pending_cancel));
+        let partial_fill = TestOrderEventStubs::filled(
+            &limit,
+            &instrument,
+            Some(TradeId::new("T-1")),
+            None,
+            None,
+            Some(Quantity::from("1.0")),
+            None,
+            None,
+            None,
+            Some(account_id),
+        );
+        states.push(apply(&mut limit, partial_fill));
+        let final_fill = TestOrderEventStubs::filled(
+            &limit,
+            &instrument,
+            Some(TradeId::new("T-2")),
+            None,
+            None,
+            Some(Quantity::from("1.0")),
+            None,
+            None,
+            None,
+            Some(account_id),
+        );
+        states.push(apply(&mut limit, final_fill));
+
+        states
+    }
+
+    fn rejected_and_emulated_order_states() -> Vec<OrderAny> {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let account_id = AccountId::new("BINANCE-001");
+        let mut states = Vec::new();
+
+        let mut rejected = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("1.0"))
+            .client_order_id(ClientOrderId::new("O-REJECTED"))
+            .build();
+        let submitted = TestOrderEventStubs::submitted(&rejected, account_id);
+        apply(&mut rejected, submitted);
+        let rejection = OrderEventAny::Rejected(
+            OrderRejectedSpec::builder()
+                .trader_id(rejected.trader_id())
+                .strategy_id(rejected.strategy_id())
+                .instrument_id(rejected.instrument_id())
+                .client_order_id(rejected.client_order_id())
+                .account_id(account_id)
+                .build(),
+        );
+        states.push(apply(&mut rejected, rejection));
+
+        let mut emulated = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .price(Price::from("1000.00"))
+            .emulation_trigger(TriggerType::BidAsk)
+            .client_order_id(ClientOrderId::new("O-EMULATED"))
+            .build();
+        states.push(emulated.clone());
+        let emulation = OrderEventAny::Emulated(
+            OrderEmulatedSpec::builder()
+                .trader_id(emulated.trader_id())
+                .strategy_id(emulated.strategy_id())
+                .instrument_id(emulated.instrument_id())
+                .client_order_id(emulated.client_order_id())
+                .build(),
+        );
+        states.push(apply(&mut emulated, emulation));
+        let mut released = emulated.clone();
+        let canceled = TestOrderEventStubs::canceled(&emulated, account_id, None);
+        states.push(apply(&mut emulated, canceled));
+        let release = OrderEventAny::Released(
+            OrderReleasedSpec::builder()
+                .trader_id(released.trader_id())
+                .strategy_id(released.strategy_id())
+                .instrument_id(released.instrument_id())
+                .client_order_id(released.client_order_id())
+                .released_price(Price::from("1000.00"))
+                .build(),
+        );
+        states.push(apply(&mut released, release));
+
+        states
+    }
+
+    #[rstest]
+    fn test_update_order_indexes_matches_reference_for_each_order_state() {
+        let orders = orders_in_each_index_state();
+        assert!(
+            orders
+                .iter()
+                .any(|order| !order.is_open() && !order.is_closed())
+        );
+        assert!(orders.iter().any(Order::is_inflight));
+        assert!(orders.iter().any(Order::is_open));
+        assert!(orders.iter().any(Order::is_closed));
+        assert!(orders.iter().any(|order| order.venue_order_id().is_some()));
+        assert!(
+            orders
+                .iter()
+                .any(|order| order.emulation_trigger().is_some() && !order.is_closed())
+        );
+
+        for order in orders {
+            let mut expected = redis::pipe();
+            reference_update_order_indexes(&mut expected, TRADER_KEY, &order);
+            let mut actual = redis::pipe();
+            update_order_indexes(&mut actual, TRADER_KEY, &order);
+
+            assert_eq!(
+                actual.get_packed_pipeline(),
+                expected.get_packed_pipeline(),
+                "index commands differ for {} in {:?}",
+                order.client_order_id(),
+                order.status()
+            );
+        }
+    }
+
+    #[rstest]
+    fn test_append_order_event_script_applies_reference_index_changes() {
+        for order in orders_in_each_index_state() {
+            let key = full_redis_key(
+                TRADER_KEY,
+                &format!("{ORDERS}{REDIS_DELIMITER}{}", order.client_order_id()),
+            );
+            let payload = Bytes::from_static(b"event");
+            let mut pipe = redis::pipe();
+            append_order_event(
+                &mut pipe,
+                TRADER_KEY,
+                &key,
+                std::slice::from_ref(&payload),
+                OrderIndexUpdate::from_order(&order),
+            )
+            .unwrap();
+            let mut reference = redis::pipe();
+            reference_update_order_indexes(&mut reference, TRADER_KEY, &order);
+
+            let commands: Vec<_> = pipe.cmd_iter().collect();
+            assert_eq!(commands.len(), 1);
+            let args = command_args(commands[0]);
+            let key_count: usize = std::str::from_utf8(&args[2]).unwrap().parse().unwrap();
+            let index_count = key_count - 1;
+            assert_eq!(args[0], b"EVAL");
+            assert_eq!(args[1], APPEND_ORDER_EVENT_SCRIPT.as_bytes());
+            assert_eq!(args[3], key.as_bytes());
+            assert_eq!(args.len(), 3 + key_count + 2 + index_count);
+            assert_eq!(args[3 + key_count], &payload[..]);
+            assert_eq!(
+                args[4 + key_count],
+                order.client_order_id().to_string().as_bytes()
+            );
+
+            // Each scripted index change must equal the reference SADD or SREM, in order.
+            let scripted: Vec<Vec<Vec<u8>>> = (0..index_count)
+                .map(|i| {
+                    let command: &[u8] = if args[5 + key_count + i] == b"1" {
+                        b"SADD"
+                    } else {
+                        assert_eq!(args[5 + key_count + i], b"0");
+                        b"SREM"
+                    };
+                    vec![
+                        command.to_vec(),
+                        args[4 + i].clone(),
+                        order.client_order_id().to_string().into_bytes(),
+                    ]
+                })
+                .collect();
+            let reference: Vec<Vec<Vec<u8>>> = reference.cmd_iter().map(command_args).collect();
+            assert_eq!(
+                scripted,
+                reference,
+                "scripted index changes differ for {} in {:?}",
+                order.client_order_id(),
+                order.status()
+            );
+        }
+    }
+
+    #[rstest]
+    fn test_append_order_event_rejects_empty_payload() {
+        let order = orders_in_each_index_state().remove(0);
+        let mut pipe = redis::pipe();
+
+        let result = append_order_event(
+            &mut pipe,
+            TRADER_KEY,
+            "trader-TESTER-001:orders:O-LIMIT",
+            &[],
+            OrderIndexUpdate::from_order(&order),
+        );
+
+        assert!(result.is_err());
+        assert!(pipe.is_empty());
+    }
 
     #[rstest]
     fn test_get_trader_key_with_prefix_and_instance_id() {
