@@ -53,6 +53,10 @@ pub struct OrderMatchingEngineConfig {
     pub oto_full_trigger: bool,
     #[builder(default)]
     pub defer_option_settlement: bool,
+    /// Whether expiration/contract-close events may close positions and credit settlement cash.
+    /// When false, expired instruments remain closed with retained positions and balances.
+    #[builder(default = true)]
+    pub settle_expired_positions: bool,
     pub price_protection_points: Option<u32>,
 }
 
@@ -85,6 +89,7 @@ mod tests {
         assert!(!config.queue_position);
         assert!(!config.oto_full_trigger);
         assert!(!config.defer_option_settlement);
+        assert!(config.settle_expired_positions);
         assert_eq!(config.price_protection_points, None);
     }
 }

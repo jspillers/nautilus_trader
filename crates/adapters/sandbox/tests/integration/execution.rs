@@ -127,6 +127,7 @@ fn create_config(
         fill_model: None,
         latency_model: None,
         frozen_account: false,
+        settle_expired_positions: true,
         bar_execution: false,
         trade_execution: false,
         reject_stop_orders: true,
@@ -665,6 +666,15 @@ fn setup_pending_resolution_harness(
     account_id: AccountId,
     client_order_suffix: &str,
 ) -> PendingResolutionHarness {
+    setup_pending_resolution_harness_with_policy(trader_id, account_id, client_order_suffix, true)
+}
+
+fn setup_pending_resolution_harness_with_policy(
+    trader_id: TraderId,
+    account_id: AccountId,
+    client_order_suffix: &str,
+    settle_expired_positions: bool,
+) -> PendingResolutionHarness {
     let mut binary = binary_option();
     binary.activation_ns = UnixNanos::from(1);
     binary.expiration_ns = UnixNanos::from(100);
@@ -675,6 +685,7 @@ fn setup_pending_resolution_harness(
     let clock: Rc<RefCell<dyn Clock>> = test_clock.clone();
 
     let mut config = create_config(trader_id, account_id, venue);
+    config.settle_expired_positions = settle_expired_positions;
     config.base_currency = Some(Currency::USDC());
     config.starting_balances = vec![Money::new(100_000.0, Currency::USDC())];
     let core = ExecutionClientCore::new(
@@ -2192,6 +2203,74 @@ fn test_client_stop_when_not_started(mut execution_client: SandboxExecutionClien
 }
 
 #[rstest]
+#[tokio::test]
+async fn test_paper_binary_option_hold_inventory_ignores_close_payout(
+    trader_id: TraderId,
+    account_id: AccountId,
+) {
+    let mut harness =
+        setup_pending_resolution_harness_with_policy(trader_id, account_id, "BO-HOLD", false);
+    setup_account_state_handler(harness.context.cache.clone());
+    harness.context.client.connect().await.unwrap();
+    assert_pending_resolution_transition(&mut harness, "REST-BO-HOLD", "PROBE-BO-HOLD");
+    let before_positions = harness
+        .context
+        .cache
+        .borrow()
+        .positions_open(None, None, None, None, None)
+        .into_iter()
+        .map(|p| (*p).clone())
+        .collect::<Vec<_>>();
+    let before_cash = harness
+        .context
+        .cache
+        .borrow()
+        .account(&account_id)
+        .unwrap()
+        .last_event();
+    let close = InstrumentClose::new(
+        harness.instrument.id(),
+        Price::from("1.000"),
+        InstrumentCloseType::ContractExpired,
+        UnixNanos::from(300),
+        UnixNanos::from(300),
+    );
+    let data_engine = Rc::new(RefCell::new(DataEngine::new(
+        harness.clock.clone(),
+        harness.context.cache.clone(),
+        None,
+    )));
+    DataEngine::register_msgbus_handlers(&data_engine);
+    for _ in 0..2 {
+        msgbus::send_data(
+            MessagingSwitchboard::data_engine_process_data(),
+            Data::InstrumentClose(close),
+        );
+    }
+    assert!(
+        std::iter::from_fn(|| harness.rx.try_recv().ok())
+            .all(|event| { !matches!(event, ExecutionEvent::Order(OrderEventAny::Filled(_))) })
+    );
+    let cache = harness.context.cache.borrow();
+    let positions = cache
+        .positions_open(None, None, None, None, None)
+        .into_iter()
+        .map(|p| (*p).clone())
+        .collect::<Vec<_>>();
+    assert_eq!(positions, before_positions);
+    assert_eq!(
+        cache.account(&account_id).unwrap().last_event(),
+        before_cash
+    );
+    assert!(
+        cache
+            .orders(None, None, None, None, None)
+            .iter()
+            .all(|order| !order.client_order_id().as_str().starts_with("EXPIRATION-"))
+    );
+}
+
+#[rstest]
 fn test_paper_binary_option_pending_resolution_then_close_settlement(
     trader_id: TraderId,
     account_id: AccountId,
@@ -3108,6 +3187,7 @@ fn test_instrument_close_sync_cleanup_handles_synchronous_position_closed_reentr
             fill_model: None,
             latency_model: None,
             frozen_account: false,
+            settle_expired_positions: true,
             bar_execution: false,
             trade_execution: false,
             reject_stop_orders: true,
@@ -4320,6 +4400,7 @@ fn test_submit_order_through_exec_engine_no_reentrant_panic(
         fill_model: None,
         latency_model,
         frozen_account: false,
+        settle_expired_positions: true,
         bar_execution: false,
         trade_execution: false,
         reject_stop_orders: true,
