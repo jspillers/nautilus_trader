@@ -96,6 +96,10 @@ pub struct SandboxExecutionClientConfig {
     /// If True, account balances won't change (frozen).
     #[builder(default)]
     pub frozen_account: bool,
+    /// Whether expiration and contract-close events may settle positions.
+    /// Disable to retain outcome inventory and unavailable settlement proceeds.
+    #[builder(default = true)]
+    pub settle_expired_positions: bool,
     /// If bars should be processed by the matching engine (and move the market).
     #[builder(default = true)]
     pub bar_execution: bool,
@@ -166,6 +170,7 @@ impl SandboxExecutionClientConfig {
             .use_random_ids(self.use_random_ids)
             .use_reduce_only(self.use_reduce_only)
             .use_market_order_acks(self.use_market_order_acks)
+            .settle_expired_positions(self.settle_expired_positions)
             .queue_position(self.queue_position)
             .oto_full_trigger(self.oto_full_trigger)
             .maybe_price_protection_points(price_protection)
