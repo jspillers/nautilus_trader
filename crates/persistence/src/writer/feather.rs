@@ -668,7 +668,16 @@ impl FeatherWriter {
             let batch = T::encode_batch(&metadata, &group)?;
             let metadata_rows = group
                 .iter()
-                .map(T::metadata)
+                .map(|item| {
+                    // A sentinel accepted by the chunk schema (for example a CLEAR
+                    // delta) must keep that schema during staged restoration too.
+                    // Non-sentinel rows with different precision retain their own metadata.
+                    if item.matches_chunk_metadata(&metadata) {
+                        metadata.clone()
+                    } else {
+                        T::metadata(item)
+                    }
+                })
                 .map(|metadata| arrow_metadata_row(&metadata, batch.schema().fields()))
                 .collect::<anyhow::Result<Vec<_>>>()?;
             let batch = record_batch_with_identifier_column(batch, identifier.as_deref())?;
@@ -2273,6 +2282,58 @@ mod tests {
         writer.write_data(Data::BookDelta(delta)).unwrap();
 
         writer.flush().unwrap();
+    }
+
+    #[rstest]
+    fn batched_clear_keeps_chunk_precision_when_staged_rows_are_restored() {
+        use nautilus_model::{
+            data::BookOrder,
+            enums::{BookAction, OrderSide, RecordFlag},
+        };
+        let temp = TempDir::new().unwrap();
+        let mut writer = FeatherWriter::new(
+            temp.path().to_path_buf(),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::NoRotation,
+            None,
+            None,
+        );
+        let id = InstrumentId::from("TEST.SIM");
+        let ts = UnixNanos::from(1);
+        let rows = vec![
+            OrderBookDelta::clear(id, 1, ts, ts),
+            OrderBookDelta::new(
+                id,
+                BookAction::Add,
+                BookOrder::new(
+                    OrderSide::Buy,
+                    Price::from("0.1234"),
+                    Quantity::from("1.999999"),
+                    0,
+                ),
+                RecordFlag::F_LAST as u8,
+                1,
+                ts,
+                ts,
+            ),
+        ];
+        writer.write_batch(rows.clone()).unwrap();
+        writer.close().unwrap();
+        let files = feather_files(temp.path(), FEATHER_EXTENSION);
+        assert_eq!(files.len(), 1);
+        let batches = read_feather_batches(&files[0]);
+        assert_eq!(
+            batches.len(),
+            1,
+            "sentinel and values must share their accepted chunk schema"
+        );
+        let metadata = batches[0].schema().metadata().clone();
+        assert_eq!(metadata["price_precision"], "4");
+        assert_eq!(metadata["size_precision"], "6");
+        assert_eq!(
+            OrderBookDelta::decode_data_batch(&metadata, batches[0].clone()).unwrap(),
+            rows.into_iter().map(Data::BookDelta).collect::<Vec<_>>()
+        );
     }
 
     #[rstest]
