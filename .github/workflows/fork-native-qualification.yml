@@ -1,0 +1,74 @@
+name: Fork native qualification
+
+on:
+  pull_request:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-native-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-controls:
+    # This workflow belongs to the maintained Remora fork, not an upstream contribution.
+    if: github.repository == 'jspillers/nautilus_trader'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out the exact PR merge candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install native compiler and isolated test Redis
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang pkg-config redis-server
+          sudo systemctl stop redis-server
+          mkdir -p "$RUNNER_TEMP/redis"
+          redis-server --bind 127.0.0.1 --port 6379 --save '' --appendonly no \
+            --dir "$RUNNER_TEMP/redis" --daemonize yes \
+            --pidfile "$RUNNER_TEMP/redis/pid"
+          redis-cli -h 127.0.0.1 -p 6379 ping
+      - name: Install the pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: "1.99.0"
+          components: clippy
+          cache: false
+          rustflags: ""
+      - name: Cache locked compiler dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: fork-native-ci-pr
+          cache-bin: "false"
+          cache-on-failure: "false"
+      - name: Test native Redis bus and bounded publisher
+        run: >-
+          cargo test --locked --profile ci-pr -p nautilus-infrastructure
+          --features redis --lib redis:: -- --test-threads=1
+      - name: Test native Redis cache integration
+        run: >-
+          cargo test --locked --profile ci-pr -p nautilus-infrastructure
+          --features redis --test integration test_cache_redis -- --test-threads=1
+      - name: Test native Sandbox order and account lifecycle
+        run: >-
+          cargo test --locked --profile ci-pr -p nautilus-sandbox
+          --test integration -- --test-threads=1
+      - name: Test native Feather write and replay staging
+        run: >-
+          cargo test --locked --profile ci-pr -p nautilus-persistence
+          --lib writer::feather::tests -- --test-threads=1
+      - name: Lint the affected native crates
+        run: >-
+          cargo clippy --locked --profile ci-pr -p nautilus-infrastructure
+          -p nautilus-sandbox -p nautilus-persistence --all-targets -- -D warnings
+      - name: Shut down test-only Redis
+        if: always()
+        run: redis-cli -h 127.0.0.1 -p 6379 shutdown nosave
