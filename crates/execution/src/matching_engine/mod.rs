@@ -2654,6 +2654,11 @@ impl OrderMatchingEngine {
             return;
         }
 
+        if !self.config.settle_expired_positions {
+            self.enter_pending_resolution(excluded);
+            return;
+        }
+
         if self.instrument_close.is_none()
             && timestamp_triggered
             && self.requires_pending_resolution()
