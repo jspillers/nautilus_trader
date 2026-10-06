@@ -37,7 +37,10 @@ use nautilus_common::{
         self, MessageBus, MessagingSwitchboard, TypedHandler,
         stubs::get_typed_into_message_saving_handler, typed_handler::TypedIntoHandler,
     },
-    runner::{SyncTradingCommandSender, drain_trading_cmd_queue, replace_exec_cmd_sender},
+    runner::{
+        SyncTradingCommandSender, TimeEventMessage, TimeEventSender, drain_trading_cmd_queue,
+        replace_exec_cmd_sender,
+    },
 };
 use nautilus_core::{DurationNanos, UUID4, UnixNanos};
 use nautilus_data::engine::DataEngine;
@@ -47,7 +50,9 @@ use nautilus_execution::{
     client::core::ExecutionClientCore,
     engine::ExecutionEngine,
     models::{
-        fee::{FeeModelAny, MakerTakerFeeModel, ProbabilityPriceFeeModel},
+        fee::{
+            FeeModel, FeeModelAny, FeeModelHandle, MakerTakerFeeModel, ProbabilityPriceFeeModel,
+        },
         fill::{DefaultFillModel, FillModel, FillModelAny, FillModelHandle},
         latency::{LatencyModelAny, StaticLatencyModel},
     },
@@ -1503,6 +1508,24 @@ fn assert_fee_model_config_drives_sandbox_commission(
     trader_id: TraderId,
     account_id: AccountId,
 ) {
+    assert_explicit_fee_model_drives_sandbox_commission(
+        Some(fee_model),
+        None,
+        price,
+        expected,
+        trader_id,
+        account_id,
+    );
+}
+
+fn assert_explicit_fee_model_drives_sandbox_commission(
+    configured_fee: Option<FeeModelAny>,
+    runtime_fee: Option<FeeModelHandle>,
+    price: &str,
+    expected: &str,
+    trader_id: TraderId,
+    account_id: AccountId,
+) {
     setup_order_event_handler();
 
     let instrument = InstrumentAny::BinaryOption(binary_option());
@@ -1513,7 +1536,7 @@ fn assert_fee_model_config_drives_sandbox_commission(
     let mut config = create_config(trader_id, account_id, venue);
     config.base_currency = Some(Currency::USDC());
     config.starting_balances = vec![Money::new(100_000.0, Currency::USDC())];
-    config.fee_model = Some(fee_model);
+    config.fee_model = configured_fee;
 
     let core = ExecutionClientCore::new(
         trader_id,
@@ -1525,7 +1548,13 @@ fn assert_fee_model_config_drives_sandbox_commission(
         config.base_currency,
         cache.clone(),
     );
-    let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone()).unwrap();
+    let mut client = match runtime_fee {
+        Some(model) => {
+            SandboxExecutionClient::new_with_fee_model(core, config, clock, cache.clone(), model)
+        }
+        None => SandboxExecutionClient::new(core, config, clock, cache.clone()),
+    }
+    .unwrap();
 
     cache
         .borrow_mut()
@@ -1533,7 +1562,7 @@ fn assert_fee_model_config_drives_sandbox_commission(
         .unwrap();
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-    set_exec_event_sender(tx);
+    nautilus_common::live::runner::replace_exec_event_sender(tx);
     client.start().unwrap();
 
     let quote = QuoteTick::new(
@@ -7487,5 +7516,195 @@ fn test_new_rejects_missing_fee_model(trader_id: TraderId, account_id: AccountId
     assert!(
         err.to_string().contains("explicit fee_model"),
         "unexpected error: {err}"
+    );
+}
+
+#[derive(Debug)]
+struct CountingRuntimeFee {
+    calls: Rc<Cell<u32>>,
+    native: ProbabilityPriceFeeModel,
+}
+impl FeeModel for CountingRuntimeFee {
+    fn get_commission(
+        &self,
+        order: &OrderAny,
+        quantity: Quantity,
+        price: Price,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        self.calls.set(self.calls.get() + 1);
+        self.native
+            .get_commission(order, quantity, price, instrument)
+    }
+}
+
+#[rstest]
+fn test_runtime_fee_handle_reaches_lazily_created_matching_engine(
+    trader_id: TraderId,
+    account_id: AccountId,
+) {
+    let calls = Rc::new(Cell::new(0));
+    let model = FeeModelHandle::new(CountingRuntimeFee {
+        calls: calls.clone(),
+        native: ProbabilityPriceFeeModel::new(Decimal::ZERO, Decimal::new(7, 2)),
+    });
+    for expected_calls in [1, 2] {
+        assert_explicit_fee_model_drives_sandbox_commission(
+            None,
+            Some(model.clone()),
+            "0.500",
+            "0.01750",
+            trader_id,
+            account_id,
+        );
+        assert_eq!(calls.get(), expected_calls);
+    }
+    let other_calls = Rc::new(Cell::new(0));
+    let other_model = FeeModelHandle::new(CountingRuntimeFee {
+        calls: other_calls.clone(),
+        native: ProbabilityPriceFeeModel::new(Decimal::ZERO, Decimal::new(3, 2)),
+    });
+    assert_explicit_fee_model_drives_sandbox_commission(
+        None,
+        Some(other_model),
+        "0.500",
+        "0.00750",
+        trader_id,
+        AccountId::from("SANDBOX-002"),
+    );
+    assert_eq!(calls.get(), 2);
+    assert_eq!(other_calls.get(), 1);
+}
+
+#[rstest]
+fn test_runtime_fee_handle_rejects_ambiguous_config(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let config = create_config(trader_id, account_id, venue);
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::new("SANDBOX"),
+        venue,
+        config.oms_type,
+        account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let model = FeeModelHandle::new(MakerTakerFeeModel::zero());
+    let error =
+        SandboxExecutionClient::new_with_fee_model(core, config, clock, cache, model).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("conflicts with config.fee_model")
+    );
+}
+
+#[derive(Debug)]
+struct FactoryTimeEventSender(std::sync::mpsc::Sender<TimeEventMessage>);
+impl TimeEventSender for FactoryTimeEventSender {
+    fn send(&self, message: TimeEventMessage) {
+        self.0
+            .send(message)
+            .expect("factory timer message should send");
+    }
+}
+
+#[tokio::test]
+async fn test_runtime_fee_factory_preserves_native_dispatch_and_commission() {
+    use nautilus_common::factories::SimulatedExecutionClientFactory;
+    use nautilus_sandbox::factory::SandboxExecutionClientFactory;
+    let (timer_tx, _timer_rx) = std::sync::mpsc::channel();
+    nautilus_common::runner::replace_time_event_sender(Arc::new(FactoryTimeEventSender(timer_tx)));
+    let trader_id = TraderId::from("SANDBOX-FACTORY");
+    let account_id = AccountId::from("SANDBOX-FACTORY");
+    setup_order_event_handler();
+    let now = nautilus_core::time::get_atomic_clock_realtime().get_time_ns();
+    let mut binary = binary_option();
+    binary.activation_ns = UnixNanos::from(*now - 1_000_000_000);
+    binary.expiration_ns = UnixNanos::from(*now + 3_600_000_000_000);
+    let instrument = InstrumentAny::BinaryOption(binary);
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    let mut config = create_config(trader_id, account_id, instrument.id().venue);
+    config.fee_model = None;
+    config.base_currency = Some(Currency::USDC());
+    config.starting_balances = vec![Money::new(100_000.0, Currency::USDC())];
+    let calls = Rc::new(Cell::new(0));
+    let factory =
+        SandboxExecutionClientFactory::with_fee_model(FeeModelHandle::new(CountingRuntimeFee {
+            calls: calls.clone(),
+            native: ProbabilityPriceFeeModel::new(Decimal::ZERO, Decimal::new(7, 2)),
+        }));
+    let mut client = factory
+        .create(trader_id, "SANDBOX-FACTORY", &config, cache.clone())
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    nautilus_common::live::runner::replace_exec_event_sender(tx);
+    client.start().unwrap();
+    let quote = QuoteTick::new(
+        instrument.id(),
+        Price::from("0.500"),
+        Price::from("0.500"),
+        Quantity::new(100.0, 2),
+        Quantity::new(100.0, 2),
+        now,
+        now,
+    );
+    msgbus::publish_quote(
+        format!("data.quotes.{}.{}", instrument.id().venue, instrument.id()).into(),
+        &quote,
+    );
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.00"))
+        .client_order_id("FACTORY-FEE".into())
+        .ts_init(now)
+        .submit(true)
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    client
+        .submit_order(SubmitOrder::from_order(
+            &order,
+            trader_id,
+            Some(client.client_id()),
+            None,
+            UUID4::new(),
+            now,
+        ))
+        .unwrap();
+    let commissions: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            ExecutionEvent::Order(OrderEventAny::Filled(fill))
+                if fill.client_order_id == order.client_order_id() =>
+            {
+                fill.commission
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(commissions, vec![Money::from("0.01750 USDC")]);
+    assert_eq!(calls.get(), 1);
+    client.stop().unwrap();
+    config.fee_model = Some(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()));
+    assert!(
+        factory
+            .create(trader_id, "SANDBOX-FACTORY", &config, cache)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("conflicts with config.fee_model")
     );
 }

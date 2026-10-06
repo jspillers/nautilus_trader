@@ -25,7 +25,7 @@ impl SandboxExecutionClientFactory {
     /// Factory for creating sandbox execution clients.
     #[new]
     fn py_new() -> Self {
-        Self
+        Self::new()
     }
 
     #[pyo3(name = "name")]
