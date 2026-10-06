@@ -24,7 +24,7 @@ use nautilus_common::{
     factories::{ClientConfig, SimulatedExecutionClientFactory},
     live::clock::LiveClock,
 };
-use nautilus_execution::client::core::ExecutionClientCore;
+use nautilus_execution::{client::core::ExecutionClientCore, models::fee::FeeModelHandle};
 use nautilus_model::identifiers::{ClientId, TraderId};
 
 use crate::{config::SandboxExecutionClientConfig, execution::SandboxExecutionClient};
@@ -49,13 +49,27 @@ impl ClientConfig for SandboxExecutionClientConfig {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.sandbox")
 )]
-pub struct SandboxExecutionClientFactory;
+pub struct SandboxExecutionClientFactory {
+    fee_model: Option<FeeModelHandle>,
+}
 
 impl SandboxExecutionClientFactory {
     /// Creates a new [`SandboxExecutionClientFactory`] instance.
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self { fee_model: None }
+    }
+
+    /// Creates a factory with an explicitly owned runtime fee model.
+    ///
+    /// The model is shared by this account's matching engines, including engines
+    /// created for later instrument definitions. Use a separate model per account
+    /// when its state accumulates per-order fees or rebates.
+    #[must_use]
+    pub fn with_fee_model(fee_model: FeeModelHandle) -> Self {
+        Self {
+            fee_model: Some(fee_model),
+        }
     }
 }
 
@@ -91,7 +105,16 @@ impl SimulatedExecutionClientFactory for SandboxExecutionClientFactory {
             cache.clone(),
         );
 
-        let client = SandboxExecutionClient::new(core, sandbox_config, clock, cache)?;
+        let client = match &self.fee_model {
+            Some(fee_model) => SandboxExecutionClient::new_with_fee_model(
+                core,
+                sandbox_config,
+                clock,
+                cache,
+                fee_model.clone(),
+            )?,
+            None => SandboxExecutionClient::new(core, sandbox_config, clock, cache)?,
+        };
         Ok(Box::new(client))
     }
 
