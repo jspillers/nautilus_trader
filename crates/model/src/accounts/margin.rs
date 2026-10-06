@@ -35,7 +35,9 @@ use std::{
 
 use ahash::AHashMap;
 use indexmap::IndexMap;
-use nautilus_core::correctness::{CorrectnessResultExt, FAILED, check_positive_decimal};
+use nautilus_core::correctness::{
+    CorrectnessResult, CorrectnessResultExt, FAILED, check_positive_decimal,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +54,7 @@ use crate::{
     position::Position,
     types::{
         AccountBalance, Currency, MarginBalance, Money, Price, Quantity,
+        fixed::check_float_precision,
         money::{MONEY_RAW_MAX, MONEY_RAW_MIN, MoneyRaw},
     },
 };
@@ -125,20 +128,46 @@ impl MarginAccount {
     ///
     /// # Panics
     ///
-    /// Panics if `leverage` is not positive.
+    /// Panics if `leverage` is not positive. See [`Self::try_set_default_leverage`].
     pub fn set_default_leverage(&mut self, leverage: Decimal) {
-        check_positive_decimal(leverage, "leverage").expect_display(FAILED);
+        self.try_set_default_leverage(leverage)
+            .expect_display(FAILED);
+    }
+
+    /// Sets the default leverage for the account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `leverage` is not positive, leaving the account unchanged.
+    pub fn try_set_default_leverage(&mut self, leverage: Decimal) -> CorrectnessResult<()> {
+        check_positive_decimal(leverage, "leverage")?;
         self.default_leverage = leverage;
+        Ok(())
     }
 
     /// Sets the leverage for a specific instrument.
     ///
     /// # Panics
     ///
-    /// Panics if `leverage` is not positive.
+    /// Panics if `leverage` is not positive. See [`Self::try_set_leverage`].
     pub fn set_leverage(&mut self, instrument_id: InstrumentId, leverage: Decimal) {
-        check_positive_decimal(leverage, "leverage").expect_display(FAILED);
+        self.try_set_leverage(instrument_id, leverage)
+            .expect_display(FAILED);
+    }
+
+    /// Sets the leverage for a specific instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `leverage` is not positive, leaving the account unchanged.
+    pub fn try_set_leverage(
+        &mut self,
+        instrument_id: InstrumentId,
+        leverage: Decimal,
+    ) -> CorrectnessResult<()> {
+        check_positive_decimal(leverage, "leverage")?;
         self.leverages.insert(instrument_id, leverage);
+        Ok(())
     }
 
     #[must_use]
@@ -617,6 +646,7 @@ impl Account for MarginAccount {
             // to avoid double-limiting that occurs in position.calculate_pnl()
             let mut pnl_quantity = fill.last_qty.min(pos.quantity);
             pnl_quantity.precision = fill.last_qty.precision;
+            check_float_precision(fill.last_px.precision)?;
             let pnl =
                 pos.try_calculate_pnl(pos.avg_px_open, fill.last_px.as_f64(), pnl_quantity)?;
             pnls.push(pnl);
@@ -657,6 +687,7 @@ impl Hash for MarginAccount {
 
 #[cfg(test)]
 mod tests {
+    use ahash::AHashMap;
     use indexmap::IndexMap;
     use nautilus_core::UnixNanos;
     use rstest::rstest;
@@ -809,6 +840,36 @@ mod tests {
         assert_eq!(
             margin_account.get_leverage(&instrument_id_aud_usd_sim),
             Decimal::from(10)
+        );
+    }
+
+    #[rstest]
+    #[case(dec!(0))]
+    #[case(dec!(-2.5))]
+    fn test_try_leverage_setters_reject_non_positive_without_mutation(
+        mut margin_account: MarginAccount,
+        instrument_id_aud_usd_sim: InstrumentId,
+        #[case] leverage: Decimal,
+    ) {
+        margin_account
+            .try_set_leverage(instrument_id_aud_usd_sim, dec!(10))
+            .unwrap();
+        margin_account.try_set_default_leverage(dec!(5)).unwrap();
+
+        let default_error = margin_account
+            .try_set_default_leverage(leverage)
+            .unwrap_err();
+        let instrument_error = margin_account
+            .try_set_leverage(instrument_id_aud_usd_sim, leverage)
+            .unwrap_err();
+
+        let expected = format!("invalid Decimal for 'leverage' not positive, was {leverage}");
+        assert_eq!(default_error.to_string(), expected);
+        assert_eq!(instrument_error.to_string(), expected);
+        assert_eq!(margin_account.default_leverage, dec!(5));
+        assert_eq!(
+            margin_account.leverages,
+            AHashMap::from([(instrument_id_aud_usd_sim, dec!(10))])
         );
     }
 
@@ -1443,6 +1504,48 @@ mod tests {
 
         // Should return empty PnL list
         assert_eq!(pnls.len(), 0);
+    }
+
+    #[cfg(feature = "defi")]
+    #[rstest]
+    #[case::precision_16("50001.0000000000000000", None)]
+    #[case::precision_17("50001.00000000000000000", Some(17))]
+    #[case::precision_18("50001.000000000000000000", Some(18))]
+    fn test_calculate_pnls_checks_reducing_fill_price_float_precision(
+        margin_account: MarginAccount,
+        #[case] last_px: &str,
+        #[case] expected_error_precision: Option<u8>,
+    ) {
+        let btcusdt = currency_pair_btcusdt();
+        let instrument = InstrumentAny::CurrencyPair(btcusdt.clone());
+        let fill_open = OrderFilledSpec::builder()
+            .instrument_id(btcusdt.id)
+            .trade_id(TradeId::from("T-1"))
+            .last_qty(Quantity::from("1.000000"))
+            .last_px(Price::from("50000.00"))
+            .currency(btcusdt.quote_currency)
+            .position_id(PositionId::from("P-1"))
+            .build();
+        let position = Position::new(&instrument, fill_open);
+        let fill_close = OrderFilledSpec::builder()
+            .instrument_id(btcusdt.id)
+            .trade_id(TradeId::from("T-2"))
+            .order_side(OrderSide::Sell)
+            .last_qty(Quantity::from("1.000000"))
+            .last_px(Price::from(last_px))
+            .currency(btcusdt.quote_currency)
+            .position_id(PositionId::from("P-1"))
+            .build();
+
+        let result = margin_account.calculate_pnls(&instrument, &fill_close, Some(position));
+
+        match expected_error_precision {
+            None => assert_eq!(result.unwrap(), vec![Money::from("1 USDT")]),
+            Some(precision) => assert_eq!(
+                result.unwrap_err().to_string(),
+                format!("Fixed-point precision {precision} exceeds maximum float precision 16")
+            ),
+        }
     }
 
     #[rstest]

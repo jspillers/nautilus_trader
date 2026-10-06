@@ -21,27 +21,36 @@ use std::{
 };
 
 use arrow::{
-    array::{FixedSizeBinaryArray, UInt64Array},
+    array::{FixedSizeBinaryArray, StringArray, UInt64Array},
     datatypes::{DataType, Field, Schema, TimeUnit},
     record_batch::RecordBatch,
 };
 use nautilus_model::{
-    data::{Bar, Data, NautilusDataType, NautilusRecordType, OrderBookDepth, QuoteTick, TradeTick},
+    data::{
+        Bar, Data, NautilusDataType, NautilusRecordType, OrderBookDepth, QuoteTick, TradeTick,
+        stubs::quote_ethusdt_binance,
+    },
     events::AccountState,
-    instruments::NautilusInstrumentType,
+    instruments::{InstrumentAny, NautilusInstrumentType, stubs::crypto_perpetual_ethusdt},
 };
 use nautilus_persistence::{
-    backend::{
-        parquet::{
-            catalog::ParquetDataCatalog,
-            migration::{ParquetMigrationConfig, migrate_parquet_catalog},
-        },
-        session::DataBackendSession,
+    backend::parquet::{
+        catalog::ParquetDataCatalog,
+        migration::{ParquetMigrationConfig, migrate_parquet_catalog},
     },
-    catalog::types::CatalogDataType,
+    catalog::{
+        traits::CatalogReader,
+        types::{CatalogDataType, CatalogQuery},
+    },
     test_data::RustTestCustomData,
 };
-use nautilus_serialization::{arrow::DecodeTypedFromRecordBatch, ensure_custom_data_registered};
+use nautilus_serialization::{
+    arrow::{
+        ArrowSchemaProvider, DecodeTypedFromRecordBatch, EncodeToRecordBatch,
+        record_batch_with_u64_timestamps,
+    },
+    ensure_custom_data_registered,
+};
 use object_store::local::LocalFileSystem;
 use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
 use rstest::rstest;
@@ -78,11 +87,13 @@ fn runtime_queries_reject_legacy_catalogs(
 
     let result = match query {
         "typed" => catalog
-            .query_typed_data::<QuoteTick>(None, None, None, predicate, None, true)
-            .map(|_| ()),
-        "pages" => catalog
             .query::<QuoteTick>(None, None, None, predicate, None, true)
             .map(|_| ()),
+        "pages" => {
+            let query = CatalogQuery::new(NautilusDataType::QuoteTick)
+                .with_where_clause(predicate.map(String::from));
+            CatalogReader::query_batch_session(&mut catalog, &query, None).map(|_| ())
+        }
         "records" => catalog
             .query_record_batches(
                 &NautilusRecordType::AccountState.into(),
@@ -123,31 +134,134 @@ fn runtime_queries_reject_legacy_catalogs(
 }
 
 #[rstest]
-#[case(false)]
-#[case(true)]
-fn backend_session_rejects_legacy_before_filtering(#[case] raw: bool) {
-    let source = fixture_path();
-    let relative = catalog_files(&source)
-        .into_iter()
-        .find(|(path, _)| path.to_string_lossy().contains("data/quotes/"))
-        .unwrap()
-        .0;
-    let file = source.join(relative);
-    let mut session = DataBackendSession::new(10);
-    let query = Some("SELECT * FROM legacy_quotes WHERE false");
+fn runtime_queries_and_migration_accept_non_instrument_class_metadata() {
+    let temporary = TempDir::new().unwrap();
+    let source = temporary.path().join("source");
+    let target = temporary.path().join("destination");
+    let file = source.join("data/quotes/ETHUSDT-PERP.BINANCE/quote.parquet");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
 
-    let result = if raw {
-        session
-            .collect_query_batches("legacy_quotes", file.to_str().unwrap(), query)
-            .map(|_| ())
+    let quote = quote_ethusdt_binance();
+    let mut metadata = QuoteTick::chunk_metadata(&[quote]);
+    metadata.insert("class".to_string(), "QuoteTick".to_string());
+    let batch = QuoteTick::encode_batch(&metadata, &[quote]).unwrap();
+    let mut writer =
+        ArrowWriter::try_new(fs::File::create(&file).unwrap(), batch.schema(), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let original = catalog_files(&source);
+    let mut catalog = ParquetDataCatalog::new(&source, None, None, None, None);
+
+    let quotes = catalog
+        .query::<QuoteTick>(None, None, None, None, None, true)
+        .unwrap();
+    let report = migrate_parquet_catalog(config(&source, &target, false)).unwrap();
+    let mut destination = ParquetDataCatalog::new(&target, None, None, None, None);
+    let migrated = destination
+        .query::<QuoteTick>(None, None, None, None, None, true)
+        .unwrap();
+
+    assert_eq!(report.migrated_files, 1);
+    assert_eq!(report.migrated_rows, 1);
+    assert_eq!(report.skipped_files, 0);
+    assert_eq!(
+        serde_json::to_value(&quotes).unwrap(),
+        serde_json::to_value([quote]).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&migrated).unwrap(),
+        serde_json::to_value([quote]).unwrap()
+    );
+    assert_eq!(catalog_files(&source), original);
+}
+
+#[rstest]
+fn migration_converts_class_instruments(
+    #[values(false, true)] utc_timestamps: bool,
+    #[values(false, true)] fee_columns: bool,
+) {
+    let temporary = TempDir::new().unwrap();
+    let source = temporary.path().join("source");
+    let target = temporary.path().join("destination");
+    let file = source.join("data/crypto_perpetual/ETHUSDT-PERP.BINANCE/instrument.parquet");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+
+    let mut instrument = crypto_perpetual_ethusdt();
+    instrument.ts_event = 1_700_000_000_000_000_123.into();
+    instrument.ts_init = 1_700_000_000_000_000_126.into();
+    let instruments = vec![InstrumentAny::CryptoPerpetual(instrument)];
+    let metadata = InstrumentAny::chunk_metadata(&instruments);
+    let batch = InstrumentAny::encode_batch(&metadata, &instruments).unwrap();
+
+    let batch = if utc_timestamps {
+        batch
     } else {
-        session.add_file::<QuoteTick>("legacy_quotes", file.to_str().unwrap(), query, None)
+        record_batch_with_u64_timestamps(&batch).unwrap()
     };
 
+    let mut metadata = batch.schema().metadata().clone();
+    let type_name = metadata.remove("type_name").unwrap();
+    metadata.insert("class".to_string(), type_name);
+    let mut fields = batch.schema().fields().to_vec();
+    let mut columns = batch.columns().to_vec();
+
+    if fee_columns {
+        let offset = batch.schema().index_of("margin_maint").unwrap() + 1;
+
+        for (index, (name, value)) in [("maker_fee", "0.0002"), ("taker_fee", "0.0004")]
+            .into_iter()
+            .enumerate()
+        {
+            fields.insert(
+                offset + index,
+                Arc::new(Field::new(name, DataType::Utf8, false)),
+            );
+            columns.insert(offset + index, Arc::new(StringArray::from(vec![value])));
+        }
+    }
+
+    let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+    let mut writer = ArrowWriter::try_new(fs::File::create(&file).unwrap(), schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let original = catalog_files(&source);
+
+    let dry_run = migrate_parquet_catalog(config(&source, &target, true)).unwrap();
+    assert_eq!(dry_run.migrated_files, 0);
+    assert!(!target.exists());
+
+    let report = migrate_parquet_catalog(config(&source, &target, false)).unwrap();
+    let destination = ParquetDataCatalog::new(&target, None, None, None, None);
+    let migrated = destination.query_instruments(None).unwrap();
+    let destination_files = catalog_files(&target);
+    let schema = ParquetRecordBatchReaderBuilder::try_new(
+        fs::File::open(target.join(&destination_files[0].0)).unwrap(),
+    )
+    .unwrap()
+    .schema()
+    .clone();
+    let mut source_catalog = ParquetDataCatalog::new(&source, None, None, None, None);
+    let runtime_error = source_catalog.query_instruments(None).unwrap_err();
+    let filtered_error = source_catalog
+        .query_instruments_filtered_with_where(None, None, None, Some("false"))
+        .unwrap_err();
+
+    assert_eq!(report.migrated_files, 1);
+    assert_eq!(report.migrated_rows, 1);
+    assert_eq!(report.skipped_files, 0);
     assert_eq!(
-        result.unwrap_err().to_string(),
-        "External error: Legacy catalog schema is not supported by runtime queries; run `nautilus catalog migrate-parquet` to migrate to a separate destination before reading"
+        schema.as_ref(),
+        &InstrumentAny::get_schema(Some(InstrumentAny::chunk_metadata(&instruments)))
     );
+    assert_eq!(
+        serde_json::to_value(&migrated).unwrap(),
+        serde_json::to_value(&instruments).unwrap()
+    );
+    assert_eq!(catalog_files(&source), original);
+    let expected_error = "Legacy catalog schema is not supported by runtime queries; run `nautilus catalog migrate-parquet` to migrate to a separate destination before reading";
+    assert_eq!(runtime_error.to_string(), expected_error);
+    assert_eq!(filtered_error.to_string(), expected_error);
 }
 
 #[rstest]
@@ -169,7 +283,7 @@ fn develop_catalog_migrates_to_final_arrow_without_changing_source() {
     macro_rules! check_rows {
         ($ty:ty, $key:literal, $many:expr) => {{
             let actual = catalog
-                .query_typed_data::<$ty>(None, None, None, None, None, true)
+                .query::<$ty>(None, None, None, None, None, true)
                 .unwrap();
             let expected_rows = if $many {
                 expected[$key].clone()
@@ -195,7 +309,7 @@ fn develop_catalog_migrates_to_final_arrow_without_changing_source() {
     }
 
     let depths = catalog
-        .query_typed_data::<OrderBookDepth>(None, None, None, None, None, true)
+        .query::<OrderBookDepth>(None, None, None, None, None, true)
         .unwrap();
     assert_eq!(depths, vec![expected_depth]);
     let instruments = catalog.query_instruments(None).unwrap();
@@ -330,7 +444,7 @@ fn migrated_catalog_consolidates_with_fresh_writes() {
     macro_rules! write_later_copy {
         ($ty:ty) => {{
             let migrated = catalog
-                .query_typed_data::<$ty>(None, None, None, None, None, true)
+                .query::<$ty>(None, None, None, None, None, true)
                 .unwrap();
             let fresh = migrated
                 .iter()
@@ -357,7 +471,7 @@ fn migrated_catalog_consolidates_with_fresh_writes() {
     macro_rules! query {
         ($ty:ty) => {
             catalog
-                .query_typed_data::<$ty>(None, None, None, None, None, true)
+                .query::<$ty>(None, None, None, None, None, true)
                 .unwrap()
         };
     }
@@ -682,7 +796,7 @@ fn remote_migration_preserves_encoded_object_paths(#[case] prefix: &str) {
 
     let report = target.migrate_from_legacy_parquet_catalog(&source).unwrap();
     let actual = target
-        .query_typed_data::<QuoteTick>(None, None, None, None, None, true)
+        .query::<QuoteTick>(None, None, None, None, None, true)
         .unwrap();
     let expected: Value =
         serde_json::from_slice(&fs::read(fixture_path().join("expected.json")).unwrap()).unwrap();

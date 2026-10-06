@@ -61,6 +61,13 @@ def _read_arrow_bytes(data: bytes) -> pa.Table:
     return pa.ipc.open_stream(pa.py_buffer(data)).read_all()
 
 
+def _legacy_table(staged: pa.Table) -> pa.Table:
+    # Legacy files carry the schema metadata a staged file keeps per row
+    [metadata_json] = set(staged.column("nautilus_metadata_json").to_pylist())
+    table = staged.drop_columns(["identifier", "nautilus_metadata_id", "nautilus_metadata_json"])
+    return table.replace_schema_metadata(json.loads(metadata_json)["schema_metadata"])
+
+
 def _record_batch_bytes(batch: pa.RecordBatch) -> bytes:
     sink = pa.BufferOutputStream()
     with pa.ipc.new_stream(sink, batch.schema) as writer:
@@ -106,6 +113,59 @@ def test_catalog_missing_directory_error(tmp_path: Path, file_uri: bool) -> None
     assert catalog.list_data_types() == []
 
 
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        (0, "UNCOMPRESSED"),
+        (1, "SNAPPY"),
+        (2, "GZIP"),
+        (4, "BROTLI"),
+        (5, "LZ4"),
+        (6, "ZSTD"),
+    ],
+)
+def test_catalog_writes_with_compression_code(tmp_path: Path, code: int, expected: str) -> None:
+    """
+    Verify each supported compression code reaches the written Parquet file.
+    """
+    catalog = ParquetDataCatalog(str(tmp_path), compression=code)
+
+    catalog.write_quote_ticks([TestDataProviderPyo3.quote_tick()])
+
+    [file_path] = tmp_path.rglob("*.parquet")
+    row_group = pq.ParquetFile(file_path).metadata.row_group(0)
+    compressions = {row_group.column(index).compression for index in range(row_group.num_columns)}
+    assert compressions == {expected}
+
+
+@pytest.mark.parametrize("code", [3, 7, 255])
+def test_catalog_rejects_unsupported_compression_code(tmp_path: Path, code: int) -> None:
+    """
+    Reject the LZO code and unknown codes when the catalog is constructed.
+    """
+    with pytest.raises(ValueError, match="Invalid compression code") as exc_info:
+        ParquetDataCatalog(str(tmp_path), compression=code)
+
+    assert str(exc_info.value) == (
+        f"Invalid compression code {code}, expected one of 0 (UNCOMPRESSED), 1 (SNAPPY), "
+        "2 (GZIP), 4 (BROTLI), 5 (LZ4_RAW), or 6 (ZSTD)"
+    )
+
+
+@pytest.mark.parametrize("field", ["batch_size", "max_row_group_size"])
+def test_catalog_rejects_zero_count(tmp_path: Path, field: str) -> None:
+    """
+    Reject a zero row count when the catalog is constructed.
+    """
+    with pytest.raises(ValueError, match=f"invalid {field}") as exc_info:
+        ParquetDataCatalog(str(tmp_path), **{field: 0})
+
+    assert str(exc_info.value) == (
+        f"invalid {field}: must be a positive number of rows; omit the field for the backend "
+        "default"
+    )
+
+
 def test_migration_planner_resolves_funding_and_close_files(tmp_path: Path) -> None:
     """
     Verify migration planner resolves funding and close files.
@@ -145,7 +205,7 @@ def test_migration_planner_resolves_funding_and_close_files(tmp_path: Path) -> N
         [feather_path] = staging.rglob("*.feather")
         directory = source_path / "data" / type_name
         directory.mkdir(parents=True)
-        table = _read_arrow_bytes(feather_path.read_bytes())
+        table = _legacy_table(_read_arrow_bytes(feather_path.read_bytes()))
         pq.write_table(table, directory / "python.parquet")
 
     target = ParquetDataCatalog(str(target_path))

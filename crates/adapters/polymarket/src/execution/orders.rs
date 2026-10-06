@@ -28,8 +28,6 @@ use nautilus_model::{
     types::{Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
-#[cfg(test)]
-use rust_decimal_macros::dec;
 
 use super::{
     PolymarketExecutionClient,
@@ -138,7 +136,7 @@ impl PolymarketExecutionClient {
 
             emitter.emit_order_submitted(&order);
 
-            let submission = match submitter.prepare_limit_order_submission(&request).await {
+            let submission = match submitter.prepare_limit_order_submission(&request) {
                 Ok(submission) => submission,
                 Err(e) => {
                     reject_submit_order(&order, &format!("{e}"), &emitter, clock, &pending_cancels);
@@ -156,6 +154,8 @@ impl PolymarketExecutionClient {
                 &emitter,
                 clock,
             );
+
+            pending_submits.insert(expected_venue_order_id, order.client_order_id());
 
             match submitter.post_limit_order_submission(submission).await {
                 Ok(response) => {
@@ -420,7 +420,7 @@ impl PolymarketExecutionClient {
                             is_quote_qty,
                             side,
                             amount,
-                            unknown.expected_base_qty.unwrap_or_default(),
+                            unknown.expected_base_qty,
                             true,
                             size_precision,
                             &emitter,
@@ -428,9 +428,8 @@ impl PolymarketExecutionClient {
                         );
 
                         let fill_tracker_quantity = if is_quote_qty && side == OrderSide::Buy {
-                            unknown
-                                .expected_base_qty
-                                .and_then(|qty| Quantity::from_decimal_dp(qty, size_precision).ok())
+                            Quantity::from_decimal_dp(unknown.expected_base_qty, size_precision)
+                                .ok()
                         } else {
                             None
                         };
@@ -678,7 +677,7 @@ impl PolymarketExecutionClient {
 
             let requests: Vec<LimitOrderSubmitRequest> =
                 batch_orders.iter().map(|bo| bo.request.clone()).collect();
-            let prepare_results = submitter.prepare_limit_order_submissions(&requests).await;
+            let prepare_results = submitter.prepare_limit_order_submissions(&requests);
 
             let mut prepared_orders = Vec::with_capacity(batch_orders.len());
             let mut submissions = Vec::with_capacity(batch_orders.len());
@@ -694,6 +693,10 @@ impl PolymarketExecutionClient {
                             submission.expected_base_qty,
                             &emitter,
                             clock,
+                        );
+                        pending_submits.insert(
+                            submission.expected_venue_order_id,
+                            batch_order.order.client_order_id(),
                         );
                         prepared_orders.push(batch_order);
                         submissions.push(submission);
@@ -974,6 +977,7 @@ impl PolymarketExecutionClient {
             self.fill_tracker.restore_order(
                 venue_order_id,
                 venue_leg_qty,
+                order.quantity().saturating_sub(venue_leg_qty),
                 cached_venue_leg_filled,
                 order.order_side(),
             );
@@ -1101,6 +1105,7 @@ impl PolymarketExecutionClient {
                 api_key: api_key.expose_secret(),
                 pusd: get_pusd_currency(),
                 clock,
+                settlement: settlement.clone(),
             };
             let mut status_retry_count = 0;
             let mut status_retry_delay_ms =
@@ -1282,6 +1287,7 @@ impl PolymarketExecutionClient {
                 fill_tracker.restore_order(
                     venue_order_id,
                     venue_leg_qty,
+                    order.quantity().saturating_sub(venue_leg_qty),
                     confirmed_venue_leg_filled,
                     order.order_side(),
                 );
@@ -1356,7 +1362,7 @@ impl PolymarketExecutionClient {
                 size_precision,
             };
 
-            let submission = match submitter.prepare_limit_order_submission(&request).await {
+            let submission = match submitter.prepare_limit_order_submission(&request) {
                 Ok(submission) => submission,
                 Err(e) => {
                     reject_modify(
@@ -1492,7 +1498,7 @@ fn reject_modify_and_finish(
     close_canceled_order: bool,
     emitter: &nautilus_live::ExecutionEventEmitter,
     clock: &'static AtomicTime,
-    fill_tracker: &super::order_fill_tracker::OrderFillTrackerMap,
+    fill_tracker: &super::fill_tracker::OrderFillTrackerMap,
     ws_dispatch_state: &std::sync::Arc<
         parking_lot::Mutex<crate::websocket::dispatch::WsDispatchState>,
     >,
@@ -1565,7 +1571,7 @@ pub(super) fn calculate_commission(
 
 #[cfg(test)]
 mod tests {
-    use nautilus_model::instruments::stubs::binary_option;
+    use nautilus_model::{instruments::stubs::binary_option, types::Currency};
     use rstest::rstest;
 
     use super::*;
@@ -1582,7 +1588,7 @@ mod tests {
         )
         .expect("a zero commission is representable");
 
-        assert_eq!(commission.as_decimal(), dec!(0));
+        assert_eq!(commission, Money::zero(Currency::USDC()));
     }
 
     #[rstest]
@@ -1597,6 +1603,36 @@ mod tests {
         )
         .expect("a zero commission is representable");
 
-        assert_eq!(commission.as_decimal(), dec!(0));
+        assert_eq!(commission, Money::zero(Currency::USDC()));
+    }
+
+    #[rstest]
+    #[case::taker_linear(LiquiditySide::Taker, "1", "1.4 pUSD")]
+    #[case::taker_quadratic(LiquiditySide::Taker, "2", "0.224 pUSD")]
+    #[case::maker_with_fee_schedule(LiquiditySide::Maker, "2", "0 pUSD")]
+    fn test_calculate_commission_uses_fee_schedule_and_quote_currency(
+        #[case] liquidity_side: LiquiditySide,
+        #[case] exponent: &str,
+        #[case] expected: &str,
+    ) {
+        let mut binary = binary_option();
+        binary.currency = Currency::pUSD();
+        let mut info = nautilus_core::Params::new();
+        info.insert(
+            "fee_schedule".into(),
+            serde_json::json!({"rate": "0.07", "exponent": exponent}),
+        );
+        binary.info = Some(info);
+        let instrument = InstrumentAny::BinaryOption(binary);
+
+        let commission = calculate_commission(
+            &instrument,
+            Quantity::from("125.000000"),
+            Price::from("0.2000"),
+            liquidity_side,
+        )
+        .unwrap();
+
+        assert_eq!(commission, Money::from(expected));
     }
 }

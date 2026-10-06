@@ -132,6 +132,8 @@ pub(super) struct TestServerState {
     pub(super) last_headers: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     pub(super) last_path: Arc<tokio::sync::Mutex<String>>,
     pub(super) last_query: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    pub(super) trade_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
+    pub(super) balance_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     pub(super) gamma_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     pub(super) version_response: Arc<tokio::sync::Mutex<Value>>,
     pub(super) version_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
@@ -178,6 +180,7 @@ pub(super) struct TestServerState {
     pub(super) market_cancel_delete_count: Arc<tokio::sync::Mutex<usize>>,
     pub(super) market_cancel_request_gate: Arc<RequestGate>,
     pub(super) order_request_gate: Arc<RequestGate>,
+    pub(super) order_response_gate: Arc<RequestGate>,
     pub(super) batch_order_request_gate: Arc<RequestGate>,
     pub(super) open_order_ids: Arc<tokio::sync::Mutex<HashSet<String>>>,
     pub(super) orders_response_override: Arc<tokio::sync::Mutex<Option<Value>>>,
@@ -205,6 +208,8 @@ impl Default for TestServerState {
             last_headers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             last_path: Arc::new(tokio::sync::Mutex::new(String::new())),
             last_query: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            trade_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            balance_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             gamma_response: Arc::new(tokio::sync::Mutex::new(None)),
             version_response: Arc::new(tokio::sync::Mutex::new(load_json(
                 "http_version_response.json",
@@ -255,6 +260,7 @@ impl Default for TestServerState {
             market_cancel_delete_count: Arc::new(tokio::sync::Mutex::new(0)),
             market_cancel_request_gate: Arc::new(RequestGate::default()),
             order_request_gate: Arc::new(RequestGate::default()),
+            order_response_gate: Arc::new(RequestGate::default()),
             batch_order_request_gate: Arc::new(RequestGate::default()),
             open_order_ids: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             orders_response_override: Arc::new(tokio::sync::Mutex::new(None)),
@@ -383,6 +389,7 @@ async fn handle_get_trades(
     let after = query
         .get("after")
         .and_then(|value| value.parse::<u64>().ok());
+    state.trade_queries.lock().await.push(query.clone());
     *state.last_query.lock().await = query;
     if let Some(override_value) = state.trades_response_override.lock().await.as_ref() {
         let mut page = override_value.clone();
@@ -409,7 +416,9 @@ async fn handle_get_balance(
     State(state): State<TestServerState>,
     uri: Uri,
     headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    state.balance_queries.lock().await.push(query);
     *state.last_path.lock().await = uri.path().to_string();
     state
         .startup_request_paths
@@ -494,6 +503,7 @@ async fn handle_post_order(
     }
 
     record_open_order_ids(&state, std::slice::from_ref(&body)).await;
+    state.order_response_gate.wait().await;
     let mut response = (status, Json(body)).into_response();
     response
         .headers_mut()

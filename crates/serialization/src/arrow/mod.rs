@@ -95,7 +95,7 @@ pub use self::legacy::{
     normalize_legacy_fixed_columns, normalized_legacy_data_type, normalized_timestamp_type,
 };
 
-// Define metadata key constants constants
+// Define metadata key constants
 pub const KEY_BAR_TYPE: &str = "bar_type";
 pub const KEY_IDENTIFIER: &str = "identifier";
 pub const KEY_INSTRUMENT_ID: &str = "instrument_id";
@@ -273,8 +273,8 @@ pub fn record_batch_with_u64_timestamps(batch: &RecordBatch) -> Result<RecordBat
 
     for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
         if field.data_type() != &timestamp_data_type() {
-            fields.push(field.clone());
-            columns.push(column.clone());
+            fields.push(Arc::clone(field));
+            columns.push(Arc::clone(column));
             continue;
         }
         let values = column
@@ -1009,7 +1009,7 @@ pub fn schema_without_identifier_column(schema: &Schema) -> Schema {
         .fields()
         .iter()
         .enumerate()
-        .filter_map(|(index, field)| (index != identifier_index).then_some(field.clone()))
+        .filter_map(|(index, field)| (index != identifier_index).then_some(Arc::clone(field)))
         .collect::<Vec<_>>();
 
     Schema::new_with_metadata(fields, schema.metadata().clone())

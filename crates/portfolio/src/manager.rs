@@ -707,58 +707,58 @@ impl AccountsManager {
 
             let margin_init = match instrument {
                 InstrumentAny::Betting(i) => account
-                    .calculate_initial_margin(i, order.quantity(), price?, None)
+                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
                     .ok()?,
                 InstrumentAny::BinaryOption(i) => account
-                    .calculate_initial_margin(i, order.quantity(), price?, None)
+                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
                     .ok()?,
                 InstrumentAny::Cfd(i) => account
-                    .calculate_initial_margin(i, order.quantity(), price?, None)
+                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
                     .ok()?,
                 InstrumentAny::Commodity(i) => account
-                    .calculate_initial_margin(i, order.quantity(), price?, None)
+                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
                     .ok()?,
                 InstrumentAny::CryptoFuture(i) => account
-                    .calculate_initial_margin(i, order.quantity(), price?, None)
+                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
                     .ok()?,
                 InstrumentAny::CryptoFuturesSpread(i) => account
-                    .calculate_initial_margin(i, order.quantity(), price?, None)
+                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
                     .ok()?,
                 InstrumentAny::CryptoOption(i) => account
-                    .calculate_initial_margin(i, order.quantity(), price?, None)
+                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
                     .ok()?,
                 InstrumentAny::CryptoOptionSpread(i) => account
-                    .calculate_initial_margin(i, order.quantity(), price?, None)
+                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
                     .ok()?,
                 InstrumentAny::CryptoPerpetual(i) => account
-                    .calculate_initial_margin(i, order.quantity(), price?, None)
+                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
                     .ok()?,
                 InstrumentAny::CurrencyPair(i) => account
-                    .calculate_initial_margin(i, order.quantity(), price?, None)
+                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
                     .ok()?,
                 InstrumentAny::Equity(i) => account
-                    .calculate_initial_margin(i, order.quantity(), price?, None)
+                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
                     .ok()?,
                 InstrumentAny::FuturesContract(i) => account
-                    .calculate_initial_margin(i, order.quantity(), price?, None)
+                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
                     .ok()?,
                 InstrumentAny::FuturesSpread(i) => account
-                    .calculate_initial_margin(i, order.quantity(), price?, None)
+                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
                     .ok()?,
                 InstrumentAny::IndexInstrument(i) => account
-                    .calculate_initial_margin(i, order.quantity(), price?, None)
+                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
                     .ok()?,
                 InstrumentAny::OptionContract(i) => account
-                    .calculate_initial_margin(i, order.quantity(), price?, None)
+                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
                     .ok()?,
                 InstrumentAny::OptionSpread(i) => account
-                    .calculate_initial_margin(i, order.quantity(), price?, None)
+                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
                     .ok()?,
                 InstrumentAny::PerpetualContract(i) => account
-                    .calculate_initial_margin(i, order.quantity(), price?, None)
+                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
                     .ok()?,
                 InstrumentAny::TokenizedAsset(i) => account
-                    .calculate_initial_margin(i, order.quantity(), price?, None)
+                    .calculate_initial_margin(i, order.leaves_qty(), price?, None)
                     .ok()?,
             };
 
@@ -866,7 +866,7 @@ impl AccountsManager {
             let mut locked = match account.calculate_balance_locked(
                 instrument,
                 order.order_side(),
-                order.quantity(),
+                order.leaves_qty(),
                 price?,
                 None,
             ) {
@@ -2027,6 +2027,79 @@ mod tests {
         } else {
             panic!("Expected BettingAccount");
         }
+    }
+
+    #[rstest]
+    fn test_update_orders_betting_after_partial_fill() {
+        let gbp = Currency::GBP();
+        let account_id = AccountId::new("BETTING-001");
+        let account_state = AccountState::new(
+            account_id,
+            AccountType::Betting,
+            vec![AccountBalance::new(
+                Money::new(1_000.0, gbp),
+                Money::zero(gbp),
+                Money::new(1_000.0, gbp),
+            )],
+            Vec::new(),
+            true,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            Some(gbp),
+        );
+        let account = BettingAccount::new(account_state, true);
+
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        let manager = AccountsManager::new(clock, cache);
+        let instrument = betting();
+
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("12"))
+            .price(Price::from("3.00"))
+            .build();
+        order
+            .apply(OrderEventAny::Submitted(order_submitted_for_account(
+                &order, account_id,
+            )))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Accepted(order_accepted_for_account(
+                &order,
+                VenueOrderId::new("L1"),
+                account_id,
+            )))
+            .unwrap();
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(order.client_order_id())
+            .venue_order_id(VenueOrderId::new("L1"))
+            .account_id(account_id)
+            .order_side(OrderSide::Sell)
+            .order_type(OrderType::Limit)
+            .last_qty(Quantity::from("5"))
+            .last_px(Price::from("3.00"))
+            .position_id(PositionId::new("P-001"))
+            .build();
+        order.apply(OrderEventAny::Filled(fill)).unwrap();
+
+        let (account, _) = manager
+            .update_orders(
+                &AccountAny::Betting(account),
+                &InstrumentAny::Betting(instrument),
+                &[&order],
+                UnixNanos::default(),
+            )
+            .unwrap();
+
+        assert_eq!(order.leaves_qty(), Quantity::from("7"));
+        assert_eq!(
+            account.balance_locked(Some(gbp)),
+            Some(Money::new(7.0, gbp))
+        );
     }
 
     #[rstest]
@@ -3691,6 +3764,78 @@ mod tests {
     }
 
     #[rstest]
+    fn test_update_margin_init_after_partial_fill() {
+        let usd = Currency::USD();
+        let mut account = build_margin_account_usd(1_000_000.0);
+        let instrument = audusd_sim();
+        account.set_leverage(instrument.id(), Decimal::ONE);
+        let instrument_any = InstrumentAny::CurrencyPair(instrument.clone());
+
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        let manager = AccountsManager::new(clock, cache);
+
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("100"))
+            .price(Price::from("1.00000"))
+            .build();
+        order
+            .apply(OrderEventAny::Submitted(order_submitted_for(&order)))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Accepted(order_accepted_for(
+                &order,
+                VenueOrderId::new("1"),
+            )))
+            .unwrap();
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(order.client_order_id())
+            .venue_order_id(VenueOrderId::new("1"))
+            .order_side(OrderSide::Buy)
+            .order_type(OrderType::Limit)
+            .last_qty(Quantity::from("40"))
+            .last_px(Price::from("1.00000"))
+            .position_id(PositionId::new("P-001"))
+            .build();
+        order.apply(OrderEventAny::Filled(fill.clone())).unwrap();
+        let position = Position::new(&instrument_any, fill);
+
+        manager
+            .update_margin_init(
+                &mut account,
+                &instrument_any,
+                &[&order],
+                UnixNanos::default(),
+            )
+            .unwrap();
+        manager
+            .update_positions_in_place(
+                &mut account,
+                &instrument_any,
+                vec![&position],
+                UnixNanos::default(),
+            )
+            .unwrap();
+
+        assert_eq!(order.leaves_qty(), Quantity::from("60"));
+        assert_eq!(
+            account.maintenance_margin(instrument.id()),
+            Money::new(1.20, usd)
+        );
+        assert_eq!(
+            account.initial_margin(instrument.id()),
+            Money::new(1.80, usd)
+        );
+        assert_eq!(
+            account.balance_locked(Some(usd)),
+            Some(Money::new(3.00, usd))
+        );
+    }
+
+    #[rstest]
     fn test_cash_account_rejects_negative_balance_when_borrowing_disabled() {
         let usd = Currency::USD();
         let account_state = AccountState::new(
@@ -3754,7 +3899,7 @@ mod tests {
             .add_account(AccountAny::Cash(account.clone()))
             .unwrap();
 
-        let manager = AccountsManager::new(clock, cache.clone());
+        let manager = AccountsManager::new(clock, Rc::clone(&cache));
         let instrument = audusd_sim();
 
         let mut order = OrderTestBuilder::new(OrderType::Market)
@@ -4009,7 +4154,7 @@ mod tests {
             .add_account(AccountAny::Cash(account.clone()))
             .unwrap();
 
-        let manager = AccountsManager::new(clock, cache.clone());
+        let manager = AccountsManager::new(clock, Rc::clone(&cache));
         let instrument = audusd_sim();
 
         let mut order = OrderTestBuilder::new(OrderType::Market)
@@ -4095,7 +4240,7 @@ mod tests {
         let account = CashAccount::new(account_state, true, false);
         let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
-        let manager = AccountsManager::new(clock, cache.clone());
+        let manager = AccountsManager::new(clock, Rc::clone(&cache));
         let mut instrument = currency_pair_btcusdt();
         instrument.size_increment = Quantity::from("0.005000");
         let instrument = InstrumentAny::CurrencyPair(instrument);
@@ -4175,7 +4320,7 @@ mod tests {
 
         let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
-        let manager = AccountsManager::new(clock, cache.clone());
+        let manager = AccountsManager::new(clock, Rc::clone(&cache));
         let instrument = audusd_sim();
         let instrument_any = InstrumentAny::CurrencyPair(instrument.clone());
 
@@ -4240,7 +4385,7 @@ mod tests {
         let account = CashAccount::new(account_state, true, false);
         let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
-        let manager = AccountsManager::new(clock, cache.clone());
+        let manager = AccountsManager::new(clock, Rc::clone(&cache));
         let instrument = audusd_sim();
         let fill = OrderFilledSpec::builder()
             .instrument_id(instrument.id())
@@ -4478,7 +4623,7 @@ mod tests {
         let account = multi_currency_cash_account_with_usd_locked(1_000.0, 200.0);
         let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
-        let manager = AccountsManager::new(clock, cache.clone());
+        let manager = AccountsManager::new(clock, Rc::clone(&cache));
         let instrument = audusd_sim();
         cache
             .borrow_mut()
@@ -4514,7 +4659,7 @@ mod tests {
         let account = multi_currency_cash_account_with_usd_locked(1_000.0, 200.0);
         let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
-        let manager = AccountsManager::new(clock, cache.clone());
+        let manager = AccountsManager::new(clock, Rc::clone(&cache));
         let instrument = audusd_sim();
         cache
             .borrow_mut()
@@ -4550,7 +4695,7 @@ mod tests {
         let account = multi_currency_cash_account_with_usd_locked(1_000.0, 50.0);
         let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
-        let manager = AccountsManager::new(clock, cache.clone());
+        let manager = AccountsManager::new(clock, Rc::clone(&cache));
         let instrument = audusd_sim();
         cache
             .borrow_mut()
@@ -4586,7 +4731,7 @@ mod tests {
         let account = multi_currency_cash_account_with_usd_locked_and_borrowing(100.0, 50.0, true);
         let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
-        let manager = AccountsManager::new(clock, cache.clone());
+        let manager = AccountsManager::new(clock, Rc::clone(&cache));
         let instrument = audusd_sim();
         cache
             .borrow_mut()
@@ -4622,7 +4767,7 @@ mod tests {
         let account = multi_currency_betting_account_with_gbp_locked(1_000.0, 200.0);
         let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
-        let manager = AccountsManager::new(clock, cache.clone());
+        let manager = AccountsManager::new(clock, Rc::clone(&cache));
         let instrument = betting();
         cache
             .borrow_mut()
@@ -4675,7 +4820,7 @@ mod tests {
             .borrow_mut()
             .add_account(AccountAny::Cash(account.clone()))
             .unwrap();
-        let manager = AccountsManager::new(clock, cache.clone());
+        let manager = AccountsManager::new(clock, Rc::clone(&cache));
         let instrument = audusd_sim();
         let fill = buy_audusd_fill("10000", "0.80000", 20.0);
         let position = Position::new(
@@ -4719,7 +4864,7 @@ mod tests {
             .borrow_mut()
             .add_account(AccountAny::Cash(account.clone()))
             .unwrap();
-        let manager = AccountsManager::new(clock, cache.clone());
+        let manager = AccountsManager::new(clock, Rc::clone(&cache));
         let instrument = audusd_sim();
         let fill = buy_audusd_fill("10000", "0.80000", 20.0);
         let position = Position::new(
@@ -4775,7 +4920,7 @@ mod tests {
             .borrow_mut()
             .add_account(AccountAny::Cash(account.clone()))
             .unwrap();
-        let manager = AccountsManager::new(clock, cache.clone());
+        let manager = AccountsManager::new(clock, Rc::clone(&cache));
         let instrument = audusd_sim();
         // Buy AUD/USD on an AUD-only account: produces negative USD pnl on a missing currency,
         // which the documented Python-parity branch rejects even with `allow_borrowing=true`.

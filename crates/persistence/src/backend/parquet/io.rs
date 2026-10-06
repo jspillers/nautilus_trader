@@ -14,9 +14,8 @@
 // -------------------------------------------------------------------------------------------------
 
 #![expect(
-    clippy::missing_errors_doc,
     clippy::missing_panics_doc,
-    reason = "Parquet I/O functions forward Arrow/object-store errors and use validated schema paths"
+    reason = "Parquet I/O functions use validated schema paths"
 )]
 
 use std::{collections::HashMap, sync::Arc};
@@ -33,7 +32,7 @@ use parquet::{
         ArrowSchemaConverter, ArrowWriter, ParquetRecordBatchStreamBuilder,
         arrow_reader::ParquetRecordBatchReaderBuilder,
     },
-    basic::{Compression, ZstdLevel},
+    basic::{Compression, Encoding, ZstdLevel},
     file::{
         metadata::{KeyValue, SortingColumn},
         properties::WriterProperties,
@@ -51,60 +50,6 @@ pub(crate) struct ObjectStoreLocation {
     pub object_store: Arc<dyn ObjectStore>,
     pub base_path: String,
     pub original_uri: String,
-    store_root_url: Option<Url>,
-}
-
-impl ObjectStoreLocation {
-    pub(crate) fn store_root_url(&self) -> Option<&Url> {
-        self.store_root_url.as_ref()
-    }
-}
-
-/// Writes a `RecordBatch` to a Parquet file using object store, with optional compression.
-///
-/// # Errors
-///
-/// Returns an error if writing to Parquet fails or any I/O operation fails.
-pub async fn write_batch_to_parquet(
-    batch: RecordBatch,
-    path: &str,
-    storage_options: Option<AHashMap<String, String>>,
-    compression: Option<Compression>,
-    max_row_group_size: Option<usize>,
-) -> anyhow::Result<()> {
-    write_batches_to_parquet(
-        &[batch],
-        path,
-        storage_options,
-        compression,
-        max_row_group_size,
-    )
-    .await
-}
-
-/// Writes multiple `RecordBatch` items to a Parquet file using object store, with optional compression, row group sizing, and storage options.
-///
-/// # Errors
-///
-/// Returns an error if `batches` is empty, writing to Parquet fails, or any I/O operation fails.
-pub async fn write_batches_to_parquet(
-    batches: &[RecordBatch],
-    path: &str,
-    storage_options: Option<AHashMap<String, String>>,
-    compression: Option<Compression>,
-    max_row_group_size: Option<usize>,
-) -> anyhow::Result<()> {
-    let (object_store, base_path, _) = create_object_store_from_path(path, storage_options)?;
-
-    write_batches_to_object_store(
-        batches,
-        object_store,
-        &object_path_under_base(&base_path, path),
-        compression,
-        max_row_group_size,
-        None,
-    )
-    .await
 }
 
 /// Reads only the Arrow schema (including key/value metadata) of a Parquet object.
@@ -229,6 +174,15 @@ async fn write_batches_to_object_store_with_mode(
             props_builder.set_column_bloom_filter_enabled(ColumnPath::from(KEY_IDENTIFIER), true);
     }
 
+    // Delta encoding stores near-unique timestamps more compactly than a dictionary
+    for name in ["ts_event", "ts_init"] {
+        if schema.index_of(name).is_ok() {
+            props_builder = props_builder
+                .set_column_dictionary_enabled(ColumnPath::from(name), false)
+                .set_column_encoding(ColumnPath::from(name), Encoding::DELTA_BINARY_PACKED);
+        }
+    }
+
     let writer_props = props_builder.build();
 
     let mut writer = ArrowWriter::try_new(&mut buffer, schema, Some(writer_props))?;
@@ -339,44 +293,6 @@ fn deduplicate_record_batches(batches: &[RecordBatch]) -> anyhow::Result<Vec<Rec
     }
 
     Ok(result)
-}
-
-/// Combines multiple Parquet files using object store with storage options
-///
-/// # Errors
-///
-/// Returns an error if file reading or writing fails.
-pub async fn combine_parquet_files(
-    file_paths: Vec<&str>,
-    new_file_path: &str,
-    storage_options: Option<AHashMap<String, String>>,
-    compression: Option<Compression>,
-    max_row_group_size: Option<usize>,
-    deduplicate: Option<bool>,
-) -> anyhow::Result<()> {
-    if file_paths.len() <= 1 {
-        return Ok(());
-    }
-
-    // Create object store from the first file path (assuming all files are in the same store)
-    let (object_store, base_path, _) =
-        create_object_store_from_path(file_paths[0], storage_options)?;
-
-    // Convert string paths to ObjectPath
-    let object_paths: Vec<ObjectPath> = file_paths
-        .iter()
-        .map(|path| object_path_under_base(&base_path, path))
-        .collect();
-
-    combine_parquet_files_from_object_store(
-        object_store,
-        object_paths,
-        &object_path_under_base(&base_path, new_file_path),
-        compression,
-        max_row_group_size,
-        deduplicate,
-    )
-    .await
 }
 
 /// Combines multiple Parquet files from object store
@@ -602,22 +518,6 @@ fn field_metadata_keys(schema: &Schema) -> impl Iterator<Item = (String, String)
     })
 }
 
-/// Extracts the minimum and maximum i64 values for the specified `column_name` from a Parquet file's metadata using object store with storage options.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be read, metadata parsing fails, or the column is missing or has no statistics.
-pub async fn min_max_from_parquet_metadata(
-    file_path: &str,
-    storage_options: Option<AHashMap<String, String>>,
-    column_name: &str,
-) -> anyhow::Result<(u64, u64)> {
-    let (object_store, base_path, _) = create_object_store_from_path(file_path, storage_options)?;
-    let object_path = object_path_under_base(&base_path, file_path);
-
-    min_max_from_parquet_metadata_object_store(object_store, &object_path, column_name).await
-}
-
 /// Extracts the minimum and maximum i64 values for the specified `column_name` from a Parquet file's metadata in object store.
 ///
 /// # Errors
@@ -697,12 +597,20 @@ pub async fn min_max_from_parquet_metadata_object_store(
 /// # Parameters
 ///
 /// - `path`: The URI string for the storage location.
-/// - `storage_options`: Optional `HashMap` containing storage-specific configuration options:
+/// - `storage_options`: Optional `HashMap` of `object_store` configuration keys for the scheme,
+///   under their prefixed or short names (`aws_region` or `region`):
 ///   - For S3: `endpoint_url`, region, `access_key_id`, `secret_access_key`, `session_token`, etc.
-///   - For GCS: `service_account_path`, `service_account_key`, `project_id`, etc.
+///     The legacy `key` and `secret` names are also accepted.
+///   - For GCS: `service_account_path`, `service_account_key`, `application_credentials`, etc.
 ///   - For Azure: `account_name`, `account_key`, `sas_token`, etc.
+///   - For HTTP: client options such as `timeout`.
 ///
 /// Returns a tuple of (`ObjectStore`, `base_path`, `normalized_uri`)
+///
+/// # Errors
+///
+/// Returns an error if the URI is invalid, a storage option key is unknown for the scheme, or the
+/// object store cannot be built.
 pub fn create_object_store_from_path(
     path: &str,
     storage_options: Option<AHashMap<String, String>>,
@@ -757,25 +665,11 @@ pub(crate) fn create_object_store_location_from_path(
         _ => create_local_store(&uri, false), // Fallback: assume local path
     }?;
 
-    let store_root_url = Url::parse(&original_uri)
-        .ok()
-        .filter(|url| is_remote_uri_scheme(url.scheme()))
-        .map(|_| remote_store_root_url(&original_uri))
-        .transpose()?;
     Ok(ObjectStoreLocation {
         object_store,
         base_path,
         original_uri,
-        store_root_url,
     })
-}
-
-fn object_path_under_base(base_path: &str, path: &str) -> ObjectPath {
-    if base_path.is_empty() {
-        ObjectPath::from(path)
-    } else {
-        ObjectPath::from(format!("{base_path}/{path}"))
-    }
 }
 
 pub(crate) fn is_remote_uri_scheme(scheme: &str) -> bool {
@@ -805,7 +699,7 @@ pub(crate) fn remote_full_uri(uri: &str, object_path: &str) -> anyhow::Result<St
     }
 }
 
-/// Appends an encoded object-store path to the local storage URI.
+/// Appends an encoded object-store path to a local or remote storage URI.
 /// Preserve the encoded names used by the native object-store backend.
 pub(crate) fn append_path_to_file_uri(base_uri: &str, path: &str) -> String {
     if let Ok(mut url) = Url::parse(base_uri) {
@@ -873,32 +767,13 @@ fn create_s3_store(
     // Apply storage options if provided
     if let Some(options) = storage_options {
         for (key, value) in options {
-            match key.as_str() {
-                // Accept legacy storage-option aliases alongside native names.
-                "endpoint_url" | "endpoint" => {
-                    builder = builder.with_endpoint(&value);
-                }
-                "region" => {
-                    builder = builder.with_region(&value);
-                }
-                "access_key_id" | "key" => {
-                    builder = builder.with_access_key_id(&value);
-                }
-                "secret_access_key" | "secret" => {
-                    builder = builder.with_secret_access_key(&value);
-                }
-                "session_token" | "token" => {
-                    builder = builder.with_token(&value);
-                }
-                "allow_http" => {
-                    let allow_http = value.to_lowercase() == "true";
-                    builder = builder.with_allow_http(allow_http);
-                }
-                _ => {
-                    // Ignore unknown options for forward compatibility
-                    log::warn!("Unknown S3 storage option: {key}");
-                }
-            }
+            // The `object_store` parser lacks the legacy fsspec `key` and `secret` names
+            let config_key = match key.as_str() {
+                "key" => object_store::aws::AmazonS3ConfigKey::AccessKeyId,
+                "secret" => object_store::aws::AmazonS3ConfigKey::SecretAccessKey,
+                _ => key.parse()?,
+            };
+            builder = builder.with_config(config_key, value);
         }
     }
 
@@ -920,34 +795,8 @@ fn create_gcs_store(
     // Apply storage options if provided
     if let Some(options) = storage_options {
         for (key, value) in options {
-            match key.as_str() {
-                "service_account_path" | "credential_path" => {
-                    builder = builder.with_service_account_path(&value);
-                }
-                "service_account_key" => {
-                    builder = builder.with_service_account_key(&value);
-                }
-                "project_id" => {
-                    // Note: GoogleCloudStorageBuilder doesn't have with_project_id method
-                    // This would need to be handled via environment variables or service account
-                    log::warn!(
-                        "project_id should be set via service account or environment variables"
-                    );
-                }
-                "application_credentials" => {
-                    // Set GOOGLE_APPLICATION_CREDENTIALS env var required by Google auth libraries.
-                    // SAFETY: std::env::set_var is marked unsafe because it mutates global state and
-                    // can break signal-safe code. We only call it during configuration before any
-                    // multi-threaded work starts, so it is considered safe in this context.
-                    unsafe {
-                        std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", &value);
-                    }
-                }
-                _ => {
-                    // Ignore unknown options for forward compatibility
-                    log::warn!("Unknown GCS storage option: {key}");
-                }
-            }
+            builder =
+                builder.with_config(key.parse::<object_store::gcp::GoogleConfigKey>()?, value);
         }
     }
 
@@ -969,7 +818,7 @@ fn create_azure_store(
 
     // Apply storage options if provided
     if let Some(options) = storage_options {
-        builder = apply_azure_storage_options(builder, options, "Azure");
+        builder = apply_azure_storage_options(builder, options)?;
     }
 
     let azure_store = builder.build()?;
@@ -1004,61 +853,24 @@ fn create_abfs_store(
 
     // Apply storage options if provided (same as Azure store)
     if let Some(options) = storage_options {
-        builder = apply_azure_storage_options(builder, options, "ABFS");
+        builder = apply_azure_storage_options(builder, options)?;
     }
 
     let azure_store = builder.build()?;
     Ok((Arc::new(azure_store), path, uri.to_string()))
 }
 
-/// Applies shared Azure storage options to the builder; `store_label` names the URI
-/// scheme ("Azure" or "ABFS") in unknown-option warnings.
+/// Applies shared Azure storage options to the builder for the `az` and `abfs` schemes.
 #[cfg(feature = "cloud")]
 fn apply_azure_storage_options(
     mut builder: object_store::azure::MicrosoftAzureBuilder,
     options: AHashMap<String, String>,
-    store_label: &str,
-) -> object_store::azure::MicrosoftAzureBuilder {
+) -> anyhow::Result<object_store::azure::MicrosoftAzureBuilder> {
     for (key, value) in options {
-        match key.as_str() {
-            "account_name" => {
-                builder = builder.with_account(&value);
-            }
-            "account_key" => {
-                builder = builder.with_access_key(&value);
-            }
-            "sas_token" => {
-                // Parse SAS token as query string parameters
-                let query_pairs: Vec<(String, String)> = value
-                    .split('&')
-                    .filter_map(|pair| {
-                        let mut parts = pair.split('=');
-                        match (parts.next(), parts.next()) {
-                            (Some(key), Some(val)) => Some((key.to_string(), val.to_string())),
-                            _ => None,
-                        }
-                    })
-                    .collect();
-
-                builder = builder.with_sas_authorization(query_pairs);
-            }
-            "client_id" => {
-                builder = builder.with_client_id(&value);
-            }
-            "client_secret" => {
-                builder = builder.with_client_secret(&value);
-            }
-            "tenant_id" => {
-                builder = builder.with_tenant_id(&value);
-            }
-            _ => {
-                // Ignore unknown options for forward compatibility
-                log::warn!("Unknown {store_label} storage option: {key}");
-            }
-        }
+        builder = builder.with_config(key.parse::<object_store::azure::AzureConfigKey>()?, value);
     }
 
-    builder
+    Ok(builder)
 }
 
 /// Helper function to create HTTP object store with options.
@@ -1073,15 +885,12 @@ fn create_http_store(
         .trim_end_matches('/')
         .to_string();
 
-    let builder = object_store::http::HttpBuilder::new().with_url(base_url);
+    let mut builder = object_store::http::HttpBuilder::new().with_url(base_url);
 
     // Apply storage options if provided
     if let Some(options) = storage_options {
-        for (key, _value) in options {
-            // HTTP builder has limited configuration options
-            // Most HTTP-specific options would be handled via client options
-            // Ignore unknown options for forward compatibility
-            log::warn!("Unknown HTTP storage option: {key}");
+        for (key, value) in options {
+            builder = builder.with_config(key.parse::<object_store::ClientConfigKey>()?, value);
         }
     }
 
@@ -1089,11 +898,25 @@ fn create_http_store(
     Ok((Arc::new(http_store), path, uri.to_string()))
 }
 
-/// Helper function to parse URL and extract path component.
+/// Parses a remote storage URI into its URL and object-store base path.
+///
+/// Catalog listings return keys under the encoded base path while lookups use the path as
+/// written, so a base path that URL parsing or object-store path encoding changes is rejected.
 #[cfg(feature = "cloud")]
 fn parse_url_and_path(uri: &str) -> anyhow::Result<(Url, String)> {
     let url = Url::parse(uri)?;
     let path = url.path().trim_start_matches('/').to_string();
+    let raw_path = uri
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('/'))
+        .map_or("", |(_, raw)| raw.trim_start_matches('/'));
+
+    anyhow::ensure!(
+        raw_path == path && ObjectPath::from(path.as_str()).as_ref() == path.trim_end_matches('/'),
+        "Storage URI '{uri}' has a base path that URL parsing or object-store path encoding \
+         changes; use a base path without spaces, non-ASCII, or reserved characters",
+    );
+
     Ok((url, path))
 }
 
@@ -1107,15 +930,17 @@ fn extract_host(url: &Url, error_msg: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cloud")]
+    use std::io::{BufRead, Write};
     use std::{collections::HashMap, sync::Arc};
 
     #[cfg(feature = "cloud")]
     use ahash::AHashMap;
     use arrow::{
-        array::{ArrayRef, StringArray, UInt64Array},
+        array::{Array, ArrayRef, StringArray, TimestampNanosecondArray, UInt64Array},
         datatypes::{DataType, Field, Schema},
     };
-    use nautilus_serialization::arrow::json_string_field;
+    use nautilus_serialization::arrow::{json_string_field, timestamp_data_type};
     use parquet::file::{properties::ReaderProperties, serialized_reader::ReadOptionsBuilder};
     use rstest::rstest;
 
@@ -1562,6 +1387,89 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn default_writer_delta_encodes_timestamps_without_dictionary() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("timestamps.parquet");
+
+        let object_store = Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(directory.path()).unwrap(),
+        );
+        let object_path = ObjectPath::from("timestamps.parquet");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("identifier", DataType::Utf8, false),
+            Field::new("ts_event", timestamp_data_type(), false),
+            Field::new("ts_init", timestamp_data_type(), false),
+        ]));
+        let identifiers = StringArray::from(vec!["AUD/USD.SIM", "AUD/USD.SIM", "AUD/USD.SIM"]);
+        let ts_event = TimestampNanosecondArray::from(vec![
+            1_700_000_000_123_456_001_i64,
+            1_700_000_000_123_456_789,
+            1_700_000_001_000_000_000,
+        ])
+        .with_timezone("UTC");
+        let ts_init = TimestampNanosecondArray::from(vec![
+            1_700_000_000_123_457_000_i64,
+            1_700_000_000_123_458_000,
+            1_700_000_001_000_001_000,
+        ])
+        .with_timezone("UTC");
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(identifiers.clone()) as ArrayRef,
+                Arc::new(ts_event.clone()) as ArrayRef,
+                Arc::new(ts_init.clone()) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        write_batches_to_object_store(&[batch], object_store, &object_path, None, None, None)
+            .await
+            .unwrap();
+
+        let reader = SerializedFileReader::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let columns = reader.metadata().row_group(0).columns();
+        let timestamp_encodings = columns[1..]
+            .iter()
+            .map(|column| {
+                (
+                    column.column_path().string(),
+                    column.dictionary_page_offset(),
+                    column.encodings().collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let read = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path).unwrap())
+            .unwrap()
+            .build()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(columns[0].dictionary_page_offset().is_some());
+        assert_eq!(
+            timestamp_encodings,
+            vec![
+                (
+                    "ts_event".to_string(),
+                    None,
+                    vec![Encoding::RLE, Encoding::DELTA_BINARY_PACKED],
+                ),
+                (
+                    "ts_init".to_string(),
+                    None,
+                    vec![Encoding::RLE, Encoding::DELTA_BINARY_PACKED],
+                ),
+            ],
+        );
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].column(0).as_ref(), &identifiers as &dyn Array);
+        assert_eq!(read[0].column(1).as_ref(), &ts_event as &dyn Array);
+        assert_eq!(read[0].column(2).as_ref(), &ts_init as &dyn Array);
+    }
+
     #[rstest]
     fn test_create_object_store_from_path_local() {
         // Create a temporary directory for testing
@@ -1635,24 +1543,223 @@ mod tests {
     #[rstest]
     #[cfg(feature = "cloud")]
     fn test_create_object_store_from_path_gcs() {
-        // Test GCS without service account (will use default credentials or fail gracefully)
-        let mut options = AHashMap::new();
-        options.insert("project_id".to_string(), "test-project".to_string());
+        let credentials_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test_data/gcs_authorized_user_credentials.json");
+        let options = AHashMap::from([
+            ("skip_signature".to_string(), "true".to_string()),
+            (
+                "application_credentials".to_string(),
+                credentials_path.to_str().unwrap().to_string(),
+            ),
+        ]);
 
-        let result = create_object_store_from_path("gs://test-bucket/path", Some(options));
-        // GCS might fail due to missing credentials, but we're testing the path parsing
-        // The function should at least parse the URI correctly before failing on auth
-        match result {
-            Ok((_, base_path, uri)) => {
-                assert_eq!(base_path, "path");
-                assert_eq!(uri, "gs://test-bucket/path");
-            }
-            Err(e) => {
-                // Expected to fail due to missing credentials, but should contain bucket info
-                let error_msg = format!("{e:?}");
-                assert!(error_msg.contains("test-bucket") || error_msg.contains("credential"));
-            }
-        }
+        let (_, base_path, uri) =
+            create_object_store_from_path("gs://test-bucket/path", Some(options)).unwrap();
+
+        assert_eq!(base_path, "path");
+        assert_eq!(uri, "gs://test-bucket/path");
+    }
+
+    #[rstest]
+    #[cfg(feature = "cloud")]
+    fn test_create_object_store_gcs_reads_application_credentials_option() {
+        let directory = tempfile::tempdir().unwrap();
+        let credentials_path = directory.path().join("missing-credentials.json");
+        let credentials_path = credentials_path.to_str().unwrap();
+        let options = AHashMap::from([(
+            "application_credentials".to_string(),
+            credentials_path.to_string(),
+        )]);
+
+        let error = create_object_store_from_path("gs://test-bucket/path", Some(options))
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(
+            error.contains(&format!(
+                "Unable to open service account file from {credentials_path}"
+            )),
+            "{error}"
+        );
+    }
+
+    #[rstest]
+    #[cfg(feature = "cloud")]
+    #[case::s3("s3://test-bucket/path", "no_such_option", "S3")]
+    #[case::gcs_project_id("gs://test-bucket/path", "project_id", "GCS")]
+    #[case::azure("az://container/path", "no_such_option", "MicrosoftAzure")]
+    #[case::abfs(
+        "abfs://container@account.dfs.core.windows.net/path",
+        "no_such_option",
+        "MicrosoftAzure"
+    )]
+    #[case::http("https://example.com/path", "no_such_option", "HTTP")]
+    fn test_create_object_store_rejects_unknown_storage_option(
+        #[case] uri: &str,
+        #[case] key: &str,
+        #[case] store: &str,
+    ) {
+        let options = AHashMap::from([(key.to_string(), "value".to_string())]);
+
+        let error = create_object_store_from_path(uri, Some(options))
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert_eq!(
+            error,
+            format!("Configuration key: '{key}' is not valid for store '{store}'.")
+        );
+    }
+
+    #[rstest]
+    #[cfg(feature = "cloud")]
+    #[case::non_ascii("s3://test-bucket/préfix")]
+    #[case::space("s3://test-bucket/my prefix")]
+    #[case::tilde("s3://test-bucket/~prefix")]
+    #[case::fragment("s3://test-bucket/pre#fix")]
+    #[case::percent_encoded("s3://test-bucket/pr%C3%A9fix")]
+    #[case::empty_segment("s3://test-bucket/base//path")]
+    #[case::gcs("gs://test-bucket/préfix")]
+    #[case::azure("az://container/préfix")]
+    #[case::abfs("abfs://container@account.dfs.core.windows.net/préfix")]
+    #[case::http("https://example.com/préfix")]
+    fn test_create_object_store_rejects_base_path_that_paths_change(#[case] uri: &str) {
+        let error = create_object_store_from_path(uri, None)
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert_eq!(
+            error,
+            format!(
+                "Storage URI '{uri}' has a base path that URL parsing or object-store path \
+                 encoding changes; use a base path without spaces, non-ASCII, or reserved \
+                 characters"
+            )
+        );
+    }
+
+    #[rstest]
+    #[cfg(feature = "cloud")]
+    #[case::bucket_root("s3://test-bucket", "")]
+    #[case::trailing_slash("s3://test-bucket/nautilus-data/", "nautilus-data/")]
+    #[case::unreserved(
+        "s3://test-bucket/team_a/v2.catalog/year=2026",
+        "team_a/v2.catalog/year=2026"
+    )]
+    fn test_create_object_store_accepts_ascii_base_path(
+        #[case] uri: &str,
+        #[case] expected_base_path: &str,
+    ) {
+        let (_, base_path, original_uri) = create_object_store_from_path(uri, None).unwrap();
+
+        assert_eq!(base_path, expected_base_path);
+        assert_eq!(original_uri, uri);
+    }
+
+    #[rstest]
+    #[case::native("aws_access_key_id", "aws_secret_access_key")]
+    #[case::short("access_key_id", "secret_access_key")]
+    #[case::legacy("key", "secret")]
+    #[tokio::test]
+    #[cfg(feature = "cloud")]
+    async fn test_create_object_store_s3_applies_credential_option_names(
+        #[case] key_id_option: &str,
+        #[case] secret_option: &str,
+    ) {
+        let (endpoint, server) = capture_request_head();
+        let options = AHashMap::from([
+            ("aws_endpoint".to_string(), endpoint),
+            ("aws_allow_http".to_string(), "true".to_string()),
+            (key_id_option.to_string(), "TESTKEYID".to_string()),
+            (secret_option.to_string(), "test-secret".to_string()),
+        ]);
+        let (store, base_path, _) =
+            create_object_store_from_path("s3://test-bucket/path", Some(options)).unwrap();
+
+        let result = store
+            .head(&ObjectPath::from(format!("{base_path}/probe")))
+            .await;
+
+        assert!(
+            matches!(result, Err(object_store::Error::NotFound { .. })),
+            "{result:?}"
+        );
+        let head = server.join().unwrap();
+        assert_eq!(
+            head.lines().next(),
+            Some("HEAD /test-bucket/path/probe HTTP/1.1")
+        );
+        assert!(
+            head.contains("authorization: AWS4-HMAC-SHA256 Credential=TESTKEYID/"),
+            "{head}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "cloud")]
+    async fn test_create_object_store_http_applies_client_option() {
+        let (endpoint, server) = capture_request_head();
+        let options = AHashMap::from([
+            ("allow_http".to_string(), "true".to_string()),
+            (
+                "user_agent".to_string(),
+                "nautilus-catalog-test".to_string(),
+            ),
+        ]);
+        let (store, base_path, _) =
+            create_object_store_from_path(&format!("{endpoint}/path"), Some(options)).unwrap();
+
+        let result = store
+            .head(&ObjectPath::from(format!("{base_path}/probe")))
+            .await;
+
+        assert!(
+            matches!(result, Err(object_store::Error::NotFound { .. })),
+            "{result:?}"
+        );
+        let head = server.join().unwrap();
+        assert_eq!(head.lines().next(), Some("HEAD /path/probe HTTP/1.1"));
+        assert!(
+            head.contains("user-agent: nautilus-catalog-test\r\n"),
+            "{head}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "cloud")]
+    async fn test_create_object_store_azure_sends_sas_token_signature_encoded_once() {
+        let (endpoint, server) = capture_request_head();
+        let options = AHashMap::from([
+            ("account_name".to_string(), "account".to_string()),
+            ("azure_storage_endpoint".to_string(), endpoint),
+            ("azure_allow_http".to_string(), "true".to_string()),
+            (
+                "sas_token".to_string(),
+                "sv=2022-11-02&se=2030-01-01T00:00:00Z&sig=abc%2Bdef%3D".to_string(),
+            ),
+        ]);
+        let (store, base_path, _) =
+            create_object_store_from_path("az://container/path", Some(options)).unwrap();
+
+        let result = store
+            .head(&ObjectPath::from(format!("{base_path}/probe")))
+            .await;
+
+        assert!(
+            matches!(result, Err(object_store::Error::NotFound { .. })),
+            "{result:?}"
+        );
+        let head = server.join().unwrap();
+        assert_eq!(
+            head.lines().next(),
+            Some(
+                "HEAD /container/path/probe?sv=2022-11-02&se=2030-01-01T00%3A00%3A00Z\
+                 &sig=abc%2Bdef%3D HTTP/1.1"
+            )
+        );
     }
 
     #[rstest]
@@ -1702,5 +1809,31 @@ mod tests {
                 .trim_end_matches('/'),
             "s3://test-bucket"
         );
+    }
+
+    #[cfg(feature = "cloud")]
+    fn capture_request_head() -> (String, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim_end().is_empty() {
+                    break;
+                }
+                head.push_str(&line);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .unwrap();
+            head
+        });
+        (endpoint, handle)
     }
 }
