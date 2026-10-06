@@ -353,6 +353,10 @@ pub struct SimulatedVenueConfig {
     /// If option settlement waits for expiry processing after same-timestamp market data.
     #[builder(default = true)]
     pub defer_option_settlement: bool,
+    /// If expired positions settle automatically. Disable to retain inventory without
+    /// inferred payouts while preserving native expiry cancellation and admission rejection.
+    #[builder(default = true)]
+    pub settle_expired_positions: bool,
     /// The market order price protection distance in ticks, or zero to disable protection.
     #[builder(default = 0)]
     pub price_protection_points: u32,
@@ -1565,6 +1569,7 @@ mod tests {
     fn test_minimal_sim_config_is_valid() {
         let config = minimal_sim_builder!().build().unwrap();
         assert!(config.defer_option_settlement);
+        assert!(config.settle_expired_positions);
     }
 
     #[rstest]

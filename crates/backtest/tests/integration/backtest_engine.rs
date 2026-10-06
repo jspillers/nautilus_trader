@@ -70,7 +70,7 @@ use nautilus_model::{
     },
     instruments::{
         CryptoPerpetual, Equity, IndexInstrument, Instrument, InstrumentAny, OptionContract,
-        stubs::{betting, crypto_perpetual_ethusdt, default_fx_ccy},
+        stubs::{betting, binary_option, crypto_perpetual_ethusdt, default_fx_ccy},
     },
     orders::{Order, OrderAny},
     position::Position,
@@ -2515,6 +2515,7 @@ fn test_run_books_cash_fill_allowed_by_balance_or_borrowing(
 #[rstest]
 fn test_instrument_close_precedes_expiration_timer_at_same_timestamp(
     #[values(false, true)] quote_at_expiration: bool,
+    #[values(false, true)] settle_expired_positions: bool,
 ) {
     let venue = Venue::from("OPRA");
     let expiration_ns = UnixNanos::from(2_000_000_000u64);
@@ -2531,6 +2532,7 @@ fn test_instrument_close_precedes_expiration_timer_at_same_timestamp(
         .book_type(BookType::L1_MBP)
         .starting_balances(vec![Money::from("1_000_000 USD")])
         .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+        .settle_expired_positions(settle_expired_positions)
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -2580,6 +2582,25 @@ fn test_instrument_close_precedes_expiration_timer_at_same_timestamp(
             false,
         )
         .unwrap();
+
+    if !settle_expired_positions {
+        let cache = engine.kernel().cache.borrow();
+        let open = cache.positions_open(None, Some(&option_id), None, None, None);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].quantity, Quantity::from(1));
+        assert!(
+            cache
+                .positions_closed(None, Some(&option_id), None, None, None)
+                .is_empty()
+        );
+        assert!(
+            cache
+                .orders(None, Some(&option_id), None, None, None)
+                .iter()
+                .all(|order| !order.client_order_id().as_str().starts_with("EXPIRATION-"))
+        );
+        return;
+    }
 
     assert_eq!(
         expiration_fill_price(&engine, venue, option_id),
@@ -5335,7 +5356,9 @@ fn test_iteration_advances_with_data(crypto_perpetual_ethusdt: CryptoPerpetual) 
 }
 
 #[rstest]
-fn test_option_expiry_timer_closes_position_without_data_at_expiration() {
+fn test_option_expiry_timer_closes_position_without_data_at_expiration(
+    #[values(false, true)] settle_expired_positions: bool,
+) {
     let venue = Venue::from("OPRA");
     let expiration_ns = UnixNanos::from(2_000_000_000u64);
     let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
@@ -5348,6 +5371,7 @@ fn test_option_expiry_timer_closes_position_without_data_at_expiration() {
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
                 .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+                .settle_expired_positions(settle_expired_positions)
                 .build()
                 .unwrap(),
         )
@@ -5392,6 +5416,23 @@ fn test_option_expiry_timer_closes_position_without_data_at_expiration() {
     let cache_rc = engine.kernel().cache();
     let cache = cache_rc.borrow();
     let open = cache.positions_open(None, Some(&option_id), None, None, None);
+    if !settle_expired_positions {
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].quantity, Quantity::from(1));
+        assert!(
+            cache
+                .positions_closed(None, Some(&option_id), None, None, None)
+                .is_empty()
+        );
+        assert!(
+            cache
+                .orders(None, Some(&option_id), None, None, None)
+                .iter()
+                .all(|order| !order.client_order_id().as_str().starts_with("EXPIRATION-"))
+        );
+        return;
+    }
+
     assert!(
         open.is_empty(),
         "expected option expiration timer to close the position, found {}",
@@ -5400,6 +5441,108 @@ fn test_option_expiry_timer_closes_position_without_data_at_expiration() {
 
     let closed = cache.positions_closed(None, Some(&option_id), None, None, None);
     assert_eq!(closed.len(), 1);
+}
+
+#[rstest]
+#[case::settlement(true, "1005.90", 0, 1)]
+#[case::inventory_retention(false, "995.90", 1, 0)]
+fn test_binary_inventory_retention_ignores_duplicate_close_payouts(
+    #[case] settle_expired_positions: bool,
+    #[case] cash: &str,
+    #[case] open_count: usize,
+    #[case] closed_count: usize,
+) {
+    let expiration = UnixNanos::from(2_000_000_000u64);
+    let mut binary = binary_option();
+    binary.activation_ns = UnixNanos::from(1);
+    binary.expiration_ns = expiration;
+    let currency = binary.quote_currency();
+    let instrument = InstrumentAny::BinaryOption(binary);
+    let instrument_id = instrument.id();
+    let venue = instrument_id.venue;
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    engine
+        .add_venue(
+            SimulatedVenueConfig::builder()
+                .venue(venue)
+                .oms_type(OmsType::Netting)
+                .account_type(AccountType::Cash)
+                .base_currency(currency)
+                .book_type(BookType::L1_MBP)
+                .starting_balances(vec![Money::from_decimal(dec!(1000), currency).unwrap()])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+                .settle_expired_positions(settle_expired_positions)
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+    engine.add_instrument(&instrument).unwrap();
+    engine
+        .add_strategy(OpenOptionOnQuote::new(
+            instrument_id,
+            Quantity::from("10.00"),
+        ))
+        .unwrap();
+    let close = |ns| {
+        Data::InstrumentClose(InstrumentClose::new(
+            instrument_id,
+            Price::from("1.000"),
+            InstrumentCloseType::ContractExpired,
+            UnixNanos::from(ns),
+            UnixNanos::from(ns),
+        ))
+    };
+    engine
+        .add_data(
+            vec![
+                quote_with_size(
+                    instrument_id,
+                    "0.400",
+                    "0.410",
+                    "100.00",
+                    expiration.as_u64() - 2000,
+                ),
+                close(expiration.as_u64()),
+                close(expiration.as_u64() + 1000),
+            ],
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+    engine
+        .run(
+            Some(UnixNanos::from(expiration.as_u64() - 3000)),
+            Some(UnixNanos::from(expiration.as_u64() + 1000)),
+            None,
+            false,
+        )
+        .unwrap();
+    let cache = engine.kernel().cache.borrow();
+    let open = cache.positions_open(None, Some(&instrument_id), None, None, None);
+    assert_eq!(open.len(), open_count);
+    assert_eq!(
+        cache
+            .positions_closed(None, Some(&instrument_id), None, None, None)
+            .len(),
+        closed_count
+    );
+
+    if !settle_expired_positions {
+        assert_eq!(open[0].quantity, Quantity::from("10.00"));
+        assert!(
+            cache
+                .orders(None, Some(&instrument_id), None, None, None)
+                .iter()
+                .all(|order| !order.client_order_id().as_str().starts_with("EXPIRATION-"))
+        );
+    }
+    drop(open);
+    drop(cache);
+    assert_eq!(
+        account_total(&engine, venue.as_str(), currency),
+        Some(Money::from_decimal(cash.parse().unwrap(), currency).unwrap())
+    );
 }
 
 #[rstest]
