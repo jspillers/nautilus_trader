@@ -118,6 +118,17 @@ pub struct RedisMessageBusConfig {
     pub max_delay: u64,
     /// The multiplication factor for retry delay calculation.
     pub factor: u64,
+    /// Maximum concurrently polled publication batches, one preserves sequential publishing.
+    pub publish_max_inflight_batches: usize,
+    /// Maximum messages per publication batch.
+    pub publish_batch_max_messages: usize,
+    /// Optional bound across queued, buffered and unconfirmed messages.
+    pub publish_max_outstanding_messages: Option<usize>,
+    /// Maximum outstanding payload and topic bytes when message limits are enabled.
+    pub publish_max_outstanding_bytes: usize,
+    /// Exact, explicitly lossy data topics whose unsent values may be superseded.
+    /// Never configure order, account, reconciliation or control facts here.
+    pub publish_coalesce_topics: Vec<String>,
 }
 
 impl Debug for RedisMessageBusConfig {
@@ -135,6 +146,23 @@ impl Debug for RedisMessageBusConfig {
             .field("exponent_base", &self.exponent_base)
             .field("max_delay", &self.max_delay)
             .field("factor", &self.factor)
+            .field(
+                "publish_max_inflight_batches",
+                &self.publish_max_inflight_batches,
+            )
+            .field(
+                "publish_batch_max_messages",
+                &self.publish_batch_max_messages,
+            )
+            .field(
+                "publish_max_outstanding_messages",
+                &self.publish_max_outstanding_messages,
+            )
+            .field(
+                "publish_max_outstanding_bytes",
+                &self.publish_max_outstanding_bytes,
+            )
+            .field("publish_coalesce_topics", &self.publish_coalesce_topics)
             .finish()
     }
 }
@@ -153,6 +181,11 @@ impl Default for RedisMessageBusConfig {
             exponent_base: 2,
             max_delay: 1000,
             factor: 2,
+            publish_max_inflight_batches: 1,
+            publish_batch_max_messages: 256,
+            publish_max_outstanding_messages: None,
+            publish_max_outstanding_bytes: 4 * 1024 * 1024,
+            publish_coalesce_topics: Vec::new(),
         }
     }
 }
@@ -250,6 +283,7 @@ pub struct RedisMessageBusBacking {
     /// The instance ID for this message bus backing.
     pub instance_id: UUID4,
     pub_tx: tokio::sync::mpsc::UnboundedSender<BusMessage>,
+    publish_budget: Option<Arc<super::publisher::PublishBudget>>,
     pub_handle: Option<tokio::task::JoinHandle<()>>,
     stream_rx: Option<tokio::sync::mpsc::Receiver<BusMessage>>,
     stream_handle: Option<tokio::task::JoinHandle<()>>,
@@ -289,11 +323,27 @@ impl RedisMessageBusBacking {
         let heartbeat_interval_secs = config.heartbeat_interval_secs;
         let publish = backing.clone();
 
+        super::publisher::validate(&backing)?;
+        if backing.publish_max_outstanding_messages.is_some() {
+            anyhow::ensure!(
+                config.autotrim_mins.is_none_or(|minutes| minutes == 0),
+                "Bounded publication does not support age trimming; use native MAXLEN"
+            );
+        }
+        let publish_budget = backing.publish_max_outstanding_messages.map(|maximum| {
+            Arc::new(super::publisher::PublishBudget::new(
+                maximum,
+                backing.publish_max_outstanding_bytes,
+            ))
+        });
+        let task_budget = publish_budget.clone();
         let (pub_tx, pub_rx) = tokio::sync::mpsc::unbounded_channel::<BusMessage>();
 
         // Create publish task (start the runtime here for now)
         let pub_handle = Some(get_runtime().spawn(async move {
-            if let Err(e) = publish_messages(pub_rx, trader_id, instance_id, config, publish).await
+            if let Err(e) =
+                publish_messages_inner(pub_rx, trader_id, instance_id, config, publish, task_budget)
+                    .await
             {
                 log_task_error(MSGBUS_PUBLISH, &e);
             }
@@ -328,9 +378,16 @@ impl RedisMessageBusBacking {
         let heartbeat_handle = if let Some(heartbeat_interval_secs) = heartbeat_interval_secs {
             let signal = heartbeat_signal.clone();
             let pub_tx_clone = pub_tx.clone();
+            let heartbeat_budget = publish_budget.clone();
 
             Some(get_runtime().spawn(async move {
-                run_heartbeat(heartbeat_interval_secs, signal, pub_tx_clone).await;
+                run_heartbeat(
+                    heartbeat_interval_secs,
+                    signal,
+                    pub_tx_clone,
+                    heartbeat_budget,
+                )
+                .await;
             }))
         } else {
             None
@@ -340,6 +397,7 @@ impl RedisMessageBusBacking {
             trader_id,
             instance_id,
             pub_tx,
+            publish_budget,
             pub_handle,
             stream_rx,
             stream_handle,
@@ -354,12 +412,26 @@ impl MessageBusBacking for RedisMessageBusBacking {
     /// Returns whether the message bus backing publishing channel is closed.
     fn is_closed(&self) -> bool {
         self.pub_tx.is_closed()
+            || self
+                .publish_budget
+                .as_ref()
+                .is_some_and(|budget| budget.is_failed())
     }
 
     /// Queues a serialized bus message for external publication.
     fn publish(&self, message: BusMessage) {
-        if let Err(e) = self.pub_tx.send(message) {
-            log::error!("Failed to send message: {e}");
+        if let Some(budget) = &self.publish_budget {
+            if let Err(e) = budget.reserve(&message) {
+                log::error!("Failed to queue native publication: {e}");
+                return;
+            }
+            let bytes = message.payload.len() + message.topic.as_str().len();
+            if self.pub_tx.send(message).is_err() {
+                budget.release(1, bytes);
+                log::error!("Native publisher channel closed");
+            }
+        } else if self.pub_tx.send(message).is_err() {
+            log::error!("Native publisher channel closed");
         }
     }
 
@@ -434,16 +506,50 @@ impl RedisMessageBusBacking {
 /// - Establishing the Redis connection fails.
 /// - Any Redis command fails during publishing.
 pub async fn publish_messages(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<BusMessage>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<BusMessage>,
     trader_id: TraderId,
     instance_id: UUID4,
     config: MessageBusConfig,
     backing: RedisMessageBusConfig,
 ) -> anyhow::Result<()> {
+    // An externally supplied unbounded channel has no synchronous reservation seam.
+    // Keep this compatibility helper on the original sequential path; bounded
+    // publication is owned by RedisMessageBusBacking.
+    anyhow::ensure!(
+        backing.publish_max_inflight_batches == 1
+            && backing.publish_max_outstanding_messages.is_none()
+            && backing.publish_coalesce_topics.is_empty(),
+        "Bounded publication requires RedisMessageBusBacking ownership"
+    );
+    publish_messages_inner(rx, trader_id, instance_id, config, backing, None).await
+}
+
+async fn publish_messages_inner(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<BusMessage>,
+    trader_id: TraderId,
+    instance_id: UUID4,
+    config: MessageBusConfig,
+    backing: RedisMessageBusConfig,
+    budget: Option<Arc<super::publisher::PublishBudget>>,
+) -> anyhow::Result<()> {
     log_task_started(MSGBUS_PUBLISH);
 
     let mut con = create_redis_connection(MSGBUS_PUBLISH, &backing).await?;
     let stream_key = get_stream_key(trader_id, instance_id, &config);
+
+    if backing.publish_max_inflight_batches > 1 || budget.is_some() {
+        super::publisher::run(rx, stream_key, config, backing, budget, move |pipe| {
+            let mut connection = con.clone();
+            async move {
+                pipe.query_async::<()>(&mut connection)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Native Redis publication failed: {:?}", e.kind()))
+            }
+        })
+        .await?;
+        log_task_stopped(MSGBUS_PUBLISH);
+        return Ok(());
+    }
 
     // Auto-trimming
     let autotrim_duration = config
@@ -903,6 +1009,7 @@ async fn run_heartbeat(
     heartbeat_interval_secs: u16,
     signal: Arc<AtomicBool>,
     pub_tx: tokio::sync::mpsc::UnboundedSender<BusMessage>,
+    budget: Option<Arc<super::publisher::PublishBudget>>,
 ) {
     log_task_started("heartbeat");
     log::debug!("Heartbeat at {heartbeat_interval_secs} second intervals");
@@ -925,9 +1032,17 @@ async fn run_heartbeat(
         tokio::select! {
             _ = heartbeat_timer.tick() => {
                 let heartbeat = create_heartbeat_msg();
-                if let Err(e) = pub_tx.send(heartbeat) {
-                    // We expect an error if the channel is closed during shutdown
-                    log::debug!("Error sending heartbeat: {e}");
+                let bytes = heartbeat.payload.len() + heartbeat.topic.as_str().len();
+                if let Some(budget) = &budget
+                    && budget.reserve(&heartbeat).is_err()
+                {
+                    break;
+                }
+                if pub_tx.send(heartbeat).is_err() {
+                    if let Some(budget) = &budget {
+                        budget.release(1, bytes);
+                    }
+                    log::debug!("Heartbeat publisher channel closed");
                 }
             },
             _ = check_timer.tick() => {}
@@ -1468,6 +1583,7 @@ mod tests {
             trader_id: TraderId::from("tester-001"),
             instance_id: UUID4::new(),
             pub_tx,
+            publish_budget: None,
             pub_handle: None,
             stream_rx: Some(stream_rx),
             stream_handle: None,
@@ -2300,7 +2416,7 @@ mod serial_tests {
         let signal = Arc::new(AtomicBool::new(false));
 
         // Start the heartbeat task with a short interval
-        let handle = tokio::spawn(run_heartbeat(1, signal.clone(), tx));
+        let handle = tokio::spawn(run_heartbeat(1, signal.clone(), tx, None));
 
         let heartbeat = receive_unbounded_bus_message(&mut rx, Duration::from_secs(2)).await;
 
