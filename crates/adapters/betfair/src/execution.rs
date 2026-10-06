@@ -52,6 +52,11 @@
 //! `OrderUpdated` through the normal report path and enters terminal retention. A terminal reduction
 //! needs no preceding update; its confirmed quantity overrides Betfair's original stake in that
 //! report and later reports.
+//!
+//! Owned report tasks collect HTTP evidence without the live cache. Their core-thread continuation
+//! resolves identities and pending modifications against current OCM state. Ambiguous-replace
+//! rejections cover only the pending replacements captured during collection. The continuation
+//! queues modification events; only the execution engine applies those events.
 
 use std::{
     fmt,
@@ -66,7 +71,7 @@ use std::{
 use ahash::{AHashMap, AHashSet};
 use async_trait::async_trait;
 use nautilus_common::{
-    clients::ExecutionClient,
+    clients::{ExecutionClient, ExecutionReportTask},
     live::{
         runner::{get_data_event_sender, get_exec_event_sender},
         sender::EventSender,
@@ -75,7 +80,8 @@ use nautilus_common::{
         DataEvent, ExecutionReport,
         execution::{
             BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-            GenerateOrderStatusReports, ModifyOrder, QueryOrder, SubmitOrder, SubmitOrderList,
+            GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
+            ModifyOrder, QueryOrder, SubmitOrder, SubmitOrderList,
         },
     },
 };
@@ -101,7 +107,7 @@ use nautilus_model::{
     },
     instruments::InstrumentAny,
     orders::{Order, OrderAny},
-    reports::{ExecutionMassStatus, FillReport, OrderStatusReport},
+    reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Price, Quantity},
 };
 use nautilus_network::{SocketState, SocketStateSink};
@@ -113,7 +119,8 @@ use crate::{
     common::{
         consts::{
             BETFAIR_VENUE, METHOD_CANCEL_ORDERS, METHOD_GET_ACCOUNT_FUNDS,
-            METHOD_LIST_CURRENT_ORDERS, METHOD_PLACE_ORDERS, METHOD_REPLACE_ORDERS,
+            METHOD_LIST_CURRENT_ORDERS, METHOD_LIST_EVENTS, METHOD_LIST_MARKET_CATALOGUE,
+            METHOD_PLACE_ORDERS, METHOD_REPLACE_ORDERS,
         },
         credential::BetfairCredential,
         enums::{
@@ -138,10 +145,11 @@ use crate::{
         error::BetfairHttpError,
         models::{
             AccountFundsResponse, CancelExecutionReport, CancelInstruction, CancelOrdersParams,
-            CurrentOrderSummary, CurrentOrderSummaryReport, LimitOnCloseOrder, LimitOrder,
-            ListCurrentOrdersParams, MarketOnCloseOrder, MarketVersion, PlaceExecutionReport,
-            PlaceInstruction, PlaceInstructionReport, PlaceOrdersParams, ReplaceExecutionReport,
-            ReplaceInstruction, ReplaceInstructionReport, ReplaceOrdersParams, TimeRange,
+            CurrentOrderSummary, CurrentOrderSummaryReport, Event, LimitOnCloseOrder, LimitOrder,
+            ListCurrentOrdersParams, ListMarketCatalogueParams, MarketCatalogue, MarketFilter,
+            MarketOnCloseOrder, MarketVersion, PlaceExecutionReport, PlaceInstruction,
+            PlaceInstructionReport, PlaceOrdersParams, ReplaceExecutionReport, ReplaceInstruction,
+            ReplaceInstructionReport, ReplaceOrdersParams, TimeRange,
         },
         parse::{parse_current_order_fill_report, parse_current_order_report},
     },
@@ -2024,6 +2032,7 @@ impl ExecutionClient for BetfairExecutionClient {
         .await;
 
         let mut fetched = fetched?;
+        assign_report_owners(&mut fetched.reports, &self.ocm_state.lock());
         retain_snapshot_fill_orders(&mut fetched.orders, start, None)?;
 
         let snapshot = MassStatusSnapshot {
@@ -2061,6 +2070,132 @@ impl ExecutionClient for BetfairExecutionClient {
         // No await after commit: cancellation must not consume undelivered fills
         *state = staged_state;
         Ok(Some(mass_status))
+    }
+
+    fn generate_order_status_reports_task(
+        &self,
+        cmd: &GenerateOrderStatusReports,
+    ) -> Option<ExecutionReportTask<Vec<OrderStatusReport>>> {
+        self.process_pending_resync();
+
+        let http_client = Arc::clone(&self.http_client);
+        let stream_client = self.stream_client.clone();
+        let app_key = self.credential.app_key().to_string();
+        let account_id = self.core.account_id;
+        let ts_init = self.clock.get_time_ns();
+        let market_ids = self.reconcile_market_ids();
+        let collection_state = Arc::clone(&self.ocm_state);
+        let state = Arc::clone(&self.ocm_state);
+        let emitter = self.emitter.clone();
+        let command = cmd.clone();
+        let filter = cmd.clone();
+
+        Some(ExecutionReportTask::new(
+            async move {
+                let mut session_refresh = SessionRefresh::default();
+
+                let result = collect_order_status_reports_http(
+                    &http_client,
+                    account_id,
+                    ts_init,
+                    market_ids,
+                    Some(&command),
+                    &collection_state,
+                    StreamSession {
+                        client: stream_client.as_ref(),
+                        app_key: &app_key,
+                    },
+                    &mut session_refresh,
+                )
+                .await;
+
+                apply_stream_session_refresh(
+                    &http_client,
+                    stream_client.as_ref(),
+                    &app_key,
+                    session_refresh,
+                )
+                .await;
+                result
+            },
+            move |fetched| {
+                let reports = finish_order_status_reports(
+                    fetched,
+                    Some(&filter),
+                    &state,
+                    Some(&emitter),
+                    true,
+                );
+                log::debug!("Generated {} order status reports", reports.len());
+                Ok(reports)
+            },
+        ))
+    }
+
+    fn generate_fill_reports_task(
+        &self,
+        cmd: &GenerateFillReports,
+    ) -> Option<ExecutionReportTask<Vec<FillReport>>> {
+        self.process_pending_resync();
+
+        let http_client = Arc::clone(&self.http_client);
+        let stream_client = self.stream_client.clone();
+        let app_key = self.credential.app_key().to_string();
+        let account_id = self.core.account_id;
+        let currency = self.currency;
+        let ts_init = self.clock.get_time_ns();
+        let market_ids = self.reconcile_market_ids();
+        let state = Arc::clone(&self.ocm_state);
+        let command = cmd.clone();
+
+        Some(ExecutionReportTask::new(
+            async move {
+                let date_range = fill_report_date_range(&command);
+                let mut session_refresh = SessionRefresh::default();
+
+                let result = fetch_fill_orders_http(
+                    &http_client,
+                    market_ids,
+                    date_range,
+                    StreamSession {
+                        client: stream_client.as_ref(),
+                        app_key: &app_key,
+                    },
+                    &mut session_refresh,
+                )
+                .await;
+
+                apply_stream_session_refresh(
+                    &http_client,
+                    stream_client.as_ref(),
+                    &app_key,
+                    session_refresh,
+                )
+                .await;
+                let mut orders = result?;
+                retain_fill_orders(&mut orders, &command);
+                Ok(orders)
+            },
+            move |orders| {
+                let reports = finish_fill_reports(&orders, &state, account_id, currency, ts_init)?;
+                log::debug!("Generated {} fill reports", reports.len());
+                Ok(reports)
+            },
+        ))
+    }
+
+    async fn generate_order_status_report(
+        &self,
+        _cmd: &GenerateOrderStatusReport,
+    ) -> anyhow::Result<Option<OrderStatusReport>> {
+        anyhow::bail!("Betfair single-order status reports are not supported")
+    }
+
+    async fn generate_position_status_reports(
+        &self,
+        _cmd: &GeneratePositionStatusReports,
+    ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        anyhow::bail!("Betfair position status reports are not supported")
     }
 
     async fn generate_order_status_reports(
@@ -2106,10 +2241,7 @@ impl ExecutionClient for BetfairExecutionClient {
     ) -> anyhow::Result<Vec<FillReport>> {
         self.process_pending_resync();
 
-        let date_range = (cmd.start.is_some() || cmd.end.is_some()).then(|| TimeRange {
-            from: cmd.start.map(|start| start.to_rfc3339()),
-            to: cmd.end.map(|end| end.to_rfc3339()),
-        });
+        let date_range = fill_report_date_range(&cmd);
 
         let mut session_refresh = SessionRefresh::default();
         let stream_session = StreamSession {
@@ -3738,10 +3870,12 @@ struct UnmatchedOrderContext<'a> {
     ts_init: UnixNanos,
 }
 
+#[derive(Default)]
 struct FetchedOrderStatusReports {
     orders: Vec<CurrentOrderSummary>,
     reports: Vec<OrderStatusReport>,
     active_quantities: AHashMap<String, Quantity>,
+    ambiguous_replaces: AHashMap<(ClientOrderId, String), UUID4>,
 }
 
 /// Paginates `list_current_orders` into `OrderStatusReport`s without touching
@@ -3761,13 +3895,60 @@ async fn fetch_order_status_reports_http(
     stream_session: StreamSession<'_>,
     session_refresh: &mut SessionRefresh,
 ) -> anyhow::Result<Vec<OrderStatusReport>> {
-    // Closed replacement legs must contribute before status and time filtering
+    let fetched = collect_order_status_reports_http(
+        http_client,
+        account_id,
+        ts_init,
+        market_ids,
+        filter,
+        ocm_state,
+        stream_session,
+        session_refresh,
+    )
+    .await?;
+    Ok(finish_order_status_reports(
+        fetched, filter, ocm_state, emitter, false,
+    ))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "report context and stream session state remain explicit at the HTTP boundary"
+)]
+async fn collect_order_status_reports_http(
+    http_client: &Arc<BetfairHttpClient>,
+    account_id: AccountId,
+    ts_init: UnixNanos,
+    market_ids: Option<Vec<String>>,
+    filter: Option<&GenerateOrderStatusReports>,
+    ocm_state: &Arc<Mutex<OcmState>>,
+    stream_session: StreamSession<'_>,
+    session_refresh: &mut SessionRefresh,
+) -> anyhow::Result<FetchedOrderStatusReports> {
+    let market_ids = if let Some(instrument_id) = filter
+        .filter(|filter| filter.open_only)
+        .and_then(|filter| filter.instrument_id)
+    {
+        let market_id = extract_market_id(&instrument_id)?;
+
+        if market_ids
+            .as_ref()
+            .is_some_and(|market_ids| !market_ids.contains(&market_id))
+        {
+            return Ok(FetchedOrderStatusReports::default());
+        }
+
+        Some(vec![market_id])
+    } else {
+        market_ids
+    };
+
     let mut fetched = fetch_order_status_reports_snapshot_http(
         http_client,
         account_id,
         ts_init,
         market_ids,
-        false,
+        filter.is_some_and(|filter| filter.open_only),
         ocm_state,
         stream_session,
         session_refresh,
@@ -3782,20 +3963,51 @@ async fn fetch_order_status_reports_http(
         });
     }
 
+    Ok(fetched)
+}
+
+fn finish_order_status_reports(
+    mut fetched: FetchedOrderStatusReports,
+    filter: Option<&GenerateOrderStatusReports>,
+    ocm_state: &Arc<Mutex<OcmState>>,
+    emitter: Option<&ExecutionEventEmitter>,
+    guard_pending_replaces: bool,
+) -> Vec<OrderStatusReport> {
+    let mut state = ocm_state.lock();
+    assign_report_owners(&mut fetched.reports, &state);
+
     if let Some(emitter) = emitter {
-        resolve_pending_modifies(
+        let updates = resolve_pending_modifies_in_state(
             &mut fetched.reports,
             &fetched.active_quantities,
-            ocm_state,
+            &mut state,
             emitter,
+            guard_pending_replaces.then_some(&fetched.ambiguous_replaces),
         );
+
+        for update in updates {
+            emitter.send_order_event(update);
+        }
     }
+
+    drop(state);
 
     if let Some(filter) = filter {
         retain_order_status_reports(&mut fetched.reports, filter);
     }
 
-    Ok(fetched.reports)
+    fetched.reports
+}
+
+fn assign_report_owners(reports: &mut [OrderStatusReport], state: &OcmState) {
+    for report in reports {
+        if let Some(resolution) = state.resolve_order_owner(
+            report.client_order_id.as_ref().map(ClientOrderId::as_str),
+            report.venue_order_id.as_str(),
+        ) {
+            report.client_order_id = resolution.client_order_id();
+        }
+    }
 }
 
 #[expect(
@@ -3818,56 +4030,129 @@ async fn fetch_order_status_reports_snapshot_http(
         Some(OrderProjection::All)
     };
 
-    let mut orders = Vec::new();
-    let mut indexes = AHashMap::new();
-    let market_id_batches = list_current_orders_market_id_batches(market_ids);
+    let market_id_batches = list_current_orders_market_id_batches(market_ids.clone());
     let merge_batches = market_id_batches.len() > 1;
 
-    for market_ids in market_id_batches {
-        let mut from_record: u32 = 0;
+    let queries = market_id_batches
+        .into_iter()
+        .map(|market_ids| list_current_orders_filter_markets(market_ids, order_projection))
+        .collect();
+
+    let mut orders = Vec::new();
+    let mut indexes = AHashMap::new();
+    fetch_order_status_pages_http(
+        http_client,
+        queries,
+        &mut orders,
+        &mut indexes,
+        stream_session,
+        session_refresh,
+    )
+    .await?;
+
+    let mut ambiguous_replaces = ocm_state.lock().pending_replace_reconciliation_ids();
+
+    if open_only {
+        let bsp_market_ids = fetch_bsp_market_ids_http(
+            http_client,
+            market_ids.clone(),
+            stream_session,
+            session_refresh,
+        )
+        .await?;
+
+        let queries = bsp_market_ids
+            .chunks(MAX_LIST_CURRENT_ORDERS_MARKET_IDS)
+            .map(|market_ids| {
+                list_current_orders_filter_markets(
+                    Some(market_ids.to_vec()),
+                    Some(OrderProjection::All),
+                )
+            })
+            .collect();
+
+        fetch_order_status_pages_http(
+            http_client,
+            queries,
+            &mut orders,
+            &mut indexes,
+            stream_session,
+            session_refresh,
+        )
+        .await?;
+
+        let discovered_bet_ids: AHashSet<_> = indexes.keys().cloned().collect();
+        let (bet_ids, customer_order_refs) =
+            order_status_supplemental_ids(&orders, &ocm_state.lock());
+        let mut queried_customer_order_refs = customer_order_refs.clone();
+        let queries = list_current_orders_supplemental_queries(
+            bet_ids.difference(&discovered_bet_ids).cloned().collect(),
+            customer_order_refs.into_keys().collect(),
+        );
+        fetch_order_status_pages_http(
+            http_client,
+            queries,
+            &mut orders,
+            &mut indexes,
+            stream_session,
+            session_refresh,
+        )
+        .await?;
 
         loop {
-            let params = ListCurrentOrdersParams {
-                bet_ids: None,
-                market_ids: market_ids.clone(),
-                order_projection,
-                customer_order_refs: None,
-                customer_strategy_refs: None,
-                date_range: None,
-                order_by: None,
-                sort_dir: None,
-                from_record: (from_record > 0).then_some(from_record),
-                record_count: None,
+            let (required_bet_ids, pending_customer_order_refs) = {
+                let state = ocm_state.lock();
+                ambiguous_replaces = state.pending_replace_reconciliation_ids();
+                order_status_supplemental_ids(&orders, &state)
             };
 
-            let response = list_current_orders_with_retry(
+            let missing: AHashSet<String> = required_bet_ids
+                .into_iter()
+                .filter(|bet_id| !indexes.contains_key(bet_id))
+                .collect();
+
+            let customer_order_refs: AHashSet<_> = pending_customer_order_refs
+                .iter()
+                .filter(|&(customer_order_ref, bet_ids)| {
+                    queried_customer_order_refs.get(customer_order_ref) != Some(bet_ids)
+                })
+                .map(|(customer_order_ref, _)| customer_order_ref.clone())
+                .collect();
+
+            if missing.is_empty() && customer_order_refs.is_empty() {
+                break;
+            }
+
+            let before = indexes.len();
+            queried_customer_order_refs.extend(pending_customer_order_refs);
+            let queries = list_current_orders_supplemental_queries(missing, customer_order_refs);
+            fetch_order_status_pages_http(
                 http_client,
-                &params,
+                queries,
+                &mut orders,
+                &mut indexes,
                 stream_session,
                 session_refresh,
             )
             .await?;
-            let page_size = response.current_orders.len() as u32;
 
-            if response.more_available && page_size == 0 {
-                anyhow::bail!("listCurrentOrders returned an empty page with moreAvailable=true");
-            }
+            if indexes.len() == before {
+                let (required_bet_ids, _) =
+                    order_status_supplemental_ids(&orders, &ocm_state.lock());
 
-            for order in response.current_orders {
-                if let Some(&index) = indexes.get(&order.bet_id) {
-                    // Offset pages can repeat a bet; retain its last complete observation
-                    orders[index] = order;
-                } else {
-                    indexes.insert(order.bet_id.clone(), orders.len());
-                    orders.push(order);
+                if let Some(bet_id) = required_bet_ids
+                    .iter()
+                    .find(|bet_id| !indexes.contains_key(*bet_id))
+                {
+                    anyhow::bail!("Missing Betfair order history for tracked Bet ID {bet_id}");
                 }
             }
+        }
 
-            if !response.more_available {
-                break;
-            }
-
-            from_record += page_size;
+        if let Some(market_ids) = market_ids {
+            orders.retain(|order| {
+                discovered_bet_ids.contains(&order.bet_id) || market_ids.contains(&order.market_id)
+            });
         }
     }
 
@@ -3875,16 +4160,9 @@ async fn fetch_order_status_reports_snapshot_http(
     let mut active_quantities = AHashMap::new();
 
     for order in &orders {
-        let mut report = parse_current_order_report(order, account_id, ts_init).map_err(|e| {
+        let report = parse_current_order_report(order, account_id, ts_init).map_err(|e| {
             anyhow::anyhow!("Failed to parse order report for {}: {e}", order.bet_id)
         })?;
-
-        if let Some(resolution) = ocm_state.lock().resolve_order_owner(
-            order.customer_order_ref.as_deref(),
-            report.venue_order_id.as_str(),
-        ) {
-            report.client_order_id = resolution.client_order_id();
-        }
 
         let active_quantity = current_order_active_quantity(order).map_err(|e| {
             anyhow::anyhow!("Failed to parse active quantity for {}: {e}", order.bet_id)
@@ -3902,22 +4180,181 @@ async fn fetch_order_status_reports_snapshot_http(
         orders,
         reports,
         active_quantities,
+        ambiguous_replaces,
     })
 }
 
-fn resolve_pending_modifies(
-    reports: &mut Vec<OrderStatusReport>,
-    active_quantities: &AHashMap<String, Quantity>,
-    ocm_state: &Arc<Mutex<OcmState>>,
-    emitter: &ExecutionEventEmitter,
-) {
-    let mut state = ocm_state.lock();
+fn order_status_supplemental_ids(
+    orders: &[CurrentOrderSummary],
+    state: &OcmState,
+) -> (AHashSet<String>, AHashMap<String, AHashSet<String>>) {
+    let client_order_ids = orders
+        .iter()
+        .filter_map(|order| {
+            state
+                .resolve_order_owner(order.customer_order_ref.as_deref(), &order.bet_id)
+                .and_then(CustomerOrderRefResolution::client_order_id)
+                .or_else(|| state.client_order_id_by_venue_order_id(&order.bet_id))
+        })
+        .collect();
 
-    let updates =
-        resolve_pending_modifies_in_state(reports, active_quantities, &mut state, emitter);
-    for update in updates {
-        emitter.send_order_event(update);
+    state.order_status_supplemental_ids(client_order_ids)
+}
+
+fn list_current_orders_supplemental_queries(
+    bet_ids: AHashSet<String>,
+    customer_order_refs: AHashSet<String>,
+) -> Vec<ListCurrentOrdersParams> {
+    let mut bet_ids: Vec<_> = bet_ids.into_iter().collect();
+    bet_ids.sort();
+    let mut customer_order_refs: Vec<_> = customer_order_refs.into_iter().collect();
+    customer_order_refs.sort();
+    let mut queries = Vec::new();
+
+    for batch in bet_ids.chunks(MAX_LIST_CURRENT_ORDERS_MARKET_IDS) {
+        let mut params = list_current_orders_filter_bet_id(batch[0].clone());
+        params.bet_ids = Some(batch.to_vec());
+        params.order_projection = Some(OrderProjection::All);
+        queries.push(params);
     }
+
+    for customer_order_ref in customer_order_refs {
+        let mut params = list_current_orders_filter_ref(customer_order_ref);
+        params.order_projection = Some(OrderProjection::All);
+        queries.push(params);
+    }
+
+    queries
+}
+
+#[derive(serde::Deserialize)]
+struct BspEvent {
+    event: Event,
+}
+
+async fn fetch_bsp_market_ids_http(
+    http_client: &Arc<BetfairHttpClient>,
+    market_ids: Option<Vec<String>>,
+    stream_session: StreamSession<'_>,
+    session_refresh: &mut SessionRefresh,
+) -> anyhow::Result<Vec<String>> {
+    const CATALOGUE_LIMIT: u32 = 1000;
+
+    let filter = MarketFilter {
+        bsp_only: Some(true),
+        with_orders: Some(vec![BetfairOrderStatus::ExecutionComplete.to_string()]),
+        ..Default::default()
+    };
+
+    let filters = if let Some(market_ids) = market_ids {
+        market_ids
+            .chunks(MAX_LIST_CURRENT_ORDERS_MARKET_IDS)
+            .map(|market_ids| MarketFilter {
+                market_ids: Some(market_ids.to_vec()),
+                ..filter.clone()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let events: Vec<BspEvent> = send_betting_with_retry(
+            http_client,
+            METHOD_LIST_EVENTS,
+            &serde_json::json!({"filter": filter}),
+            stream_session,
+            session_refresh,
+        )
+        .await?;
+        events
+            .into_iter()
+            .map(|event| {
+                let event_id = event.event.id.ok_or_else(|| {
+                    anyhow::anyhow!("Betfair BSP event discovery returned an event without an ID")
+                })?;
+
+                Ok(MarketFilter {
+                    event_ids: Some(vec![event_id]),
+                    ..filter.clone()
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?
+    };
+
+    let mut bsp_market_ids = AHashSet::new();
+
+    for filter in filters {
+        let market_scoped = filter.market_ids.is_some();
+
+        let params = ListMarketCatalogueParams {
+            filter,
+            market_projection: None,
+            sort: None,
+            max_results: Some(CATALOGUE_LIMIT),
+            locale: None,
+        };
+
+        let catalogues: Vec<MarketCatalogue> = send_betting_with_retry(
+            http_client,
+            METHOD_LIST_MARKET_CATALOGUE,
+            &params,
+            stream_session,
+            session_refresh,
+        )
+        .await?;
+        anyhow::ensure!(
+            market_scoped || catalogues.len() < CATALOGUE_LIMIT as usize,
+            "Betfair BSP market discovery reached the catalogue limit for event {:?}",
+            params.filter.event_ids,
+        );
+        bsp_market_ids.extend(catalogues.into_iter().map(|market| market.market_id));
+    }
+
+    let mut bsp_market_ids: Vec<_> = bsp_market_ids.into_iter().collect();
+    bsp_market_ids.sort_unstable();
+    Ok(bsp_market_ids)
+}
+
+async fn fetch_order_status_pages_http(
+    http_client: &Arc<BetfairHttpClient>,
+    queries: Vec<ListCurrentOrdersParams>,
+    orders: &mut Vec<CurrentOrderSummary>,
+    indexes: &mut AHashMap<String, usize>,
+    stream_session: StreamSession<'_>,
+    session_refresh: &mut SessionRefresh,
+) -> anyhow::Result<()> {
+    for mut params in queries {
+        let mut from_record = 0;
+
+        loop {
+            params.from_record = (from_record > 0).then_some(from_record);
+            let response = list_current_orders_with_retry(
+                http_client,
+                &params,
+                stream_session,
+                session_refresh,
+            )
+            .await?;
+            let page_size = response.current_orders.len() as u32;
+            if response.more_available && page_size == 0 {
+                anyhow::bail!("listCurrentOrders returned an empty page with moreAvailable=true");
+            }
+
+            for order in response.current_orders {
+                if let Some(&index) = indexes.get(&order.bet_id) {
+                    orders[index] = order;
+                } else {
+                    indexes.insert(order.bet_id.clone(), orders.len());
+                    orders.push(order);
+                }
+            }
+
+            if !response.more_available {
+                break;
+            }
+
+            from_record += page_size;
+        }
+    }
+
+    Ok(())
 }
 
 fn resolve_pending_modifies_in_state(
@@ -3925,6 +4362,7 @@ fn resolve_pending_modifies_in_state(
     active_quantities: &AHashMap<String, Quantity>,
     state: &mut OcmState,
     emitter: &ExecutionEventEmitter,
+    eligible_replaces: Option<&AHashMap<(ClientOrderId, String), UUID4>>,
 ) -> Vec<OrderEventAny> {
     let mut updates = Vec::new();
     let replaced_fills = replaced_leg_fills_from_reports(reports, state);
@@ -3986,43 +4424,12 @@ fn resolve_pending_modifies_in_state(
         }
     }
 
-    let non_actionable_replaces = reports
-        .iter()
-        .filter_map(|report| {
-            let bet_id = report.venue_order_id.to_string();
-            let (client_order_id, strategy_id) = report_correlation(state, report)?;
-            state
-                .pending_replace_awaits_reconciliation(&client_order_id, &bet_id)
-                .then_some((client_order_id, strategy_id, bet_id, report.clone()))
-        })
-        .collect::<Vec<_>>();
-
-    for (client_order_id, strategy_id, bet_id, report) in non_actionable_replaces {
-        if report.order_status.is_closed() {
-            if report.client_order_id == Some(client_order_id) {
-                state.take_pending_replace(client_order_id, &bet_id);
-                state.retain_terminal_order(client_order_id, &bet_id);
-            } else {
-                state.retain_terminal_order(client_order_id, &bet_id);
-            }
-        } else {
-            state.take_pending_replace(client_order_id, &bet_id);
-            state.mark_order_active(&client_order_id, &bet_id);
-            updates.push(OrderEventAny::ModifyRejected(OrderModifyRejected::new(
-                emitter.trader_id(),
-                strategy_id,
-                report.instrument_id,
-                client_order_id,
-                Ustr::from("Original bet remained executable after ambiguous replace"),
-                UUID4::new(),
-                report.ts_last,
-                report.ts_init,
-                true,
-                Some(report.venue_order_id),
-                Some(emitter.account_id()),
-            )));
-        }
-    }
+    updates.extend(resolve_ambiguous_replaces(
+        reports,
+        state,
+        emitter,
+        eligible_replaces,
+    ));
 
     accumulate_replaced_leg_fills(reports, state);
 
@@ -4030,6 +4437,70 @@ fn resolve_pending_modifies_in_state(
         let bet_id = report.venue_order_id.as_str();
         !state.should_suppress_replaced_report(bet_id) && !resolved_bet_ids.contains(bet_id)
     });
+
+    updates
+}
+
+fn resolve_ambiguous_replaces(
+    reports: &[OrderStatusReport],
+    state: &mut OcmState,
+    emitter: &ExecutionEventEmitter,
+    eligible_replaces: Option<&AHashMap<(ClientOrderId, String), UUID4>>,
+) -> Vec<OrderEventAny> {
+    let mut updates = Vec::new();
+    let current_replace_ids = eligible_replaces.map(|_| state.pending_replace_reconciliation_ids());
+
+    let non_actionable_replaces = reports
+        .iter()
+        .filter_map(|report| {
+            let bet_id = report.venue_order_id.to_string();
+            let (client_order_id, strategy_id) = report_correlation(state, report)?;
+
+            if let Some(eligible_replaces) = eligible_replaces {
+                let key = (client_order_id, bet_id.clone());
+                let current_id = current_replace_ids
+                    .as_ref()
+                    .and_then(|ids| ids.get(&key))
+                    .copied();
+
+                if current_id.is_none() || current_id != eligible_replaces.get(&key).copied() {
+                    return None;
+                }
+            }
+
+            state
+                .pending_replace_awaits_reconciliation(&client_order_id, &bet_id)
+                .then_some((client_order_id, strategy_id, bet_id, report))
+        })
+        .collect::<Vec<_>>();
+
+    for (client_order_id, strategy_id, bet_id, report) in non_actionable_replaces {
+        if report.order_status.is_closed() {
+            if report.client_order_id == Some(client_order_id) {
+                state.take_pending_replace(client_order_id, &bet_id);
+            }
+
+            state.retain_terminal_order(client_order_id, &bet_id);
+            continue;
+        }
+
+        state.take_pending_replace(client_order_id, &bet_id);
+        state.mark_order_active(&client_order_id, &bet_id);
+        updates.push(OrderEventAny::ModifyRejected(OrderModifyRejected::new(
+            emitter.trader_id(),
+            strategy_id,
+            report.instrument_id,
+            client_order_id,
+            Ustr::from("Original bet remained executable after ambiguous replace"),
+            UUID4::new(),
+            report.ts_last,
+            report.ts_init,
+            true,
+            Some(report.venue_order_id),
+            Some(emitter.account_id()),
+        )));
+    }
+
     updates
 }
 
@@ -4322,22 +4793,43 @@ async fn fetch_fill_reports_http(
     .await?;
 
     if let Some(filter) = filter {
-        orders.retain(|order| {
-            filter
-                .venue_order_id
-                .is_none_or(|venue_order_id| venue_order_id.as_str() == order.bet_id)
-                && filter.instrument_id.is_none_or(|instrument_id| {
-                    make_instrument_id(&order.market_id, order.selection_id, order.handicap)
-                        == instrument_id
-                })
-        });
+        retain_fill_orders(&mut orders, filter);
     }
 
+    finish_fill_reports(&orders, ocm_state, account_id, currency, ts_init)
+}
+
+fn fill_report_date_range(filter: &GenerateFillReports) -> Option<TimeRange> {
+    (filter.start.is_some() || filter.end.is_some()).then(|| TimeRange {
+        from: filter.start.map(|start| start.to_rfc3339()),
+        to: filter.end.map(|end| end.to_rfc3339()),
+    })
+}
+
+fn retain_fill_orders(orders: &mut Vec<CurrentOrderSummary>, filter: &GenerateFillReports) {
+    orders.retain(|order| {
+        filter
+            .venue_order_id
+            .is_none_or(|venue_order_id| venue_order_id.as_str() == order.bet_id)
+            && filter.instrument_id.is_none_or(|instrument_id| {
+                make_instrument_id(&order.market_id, order.selection_id, order.handicap)
+                    == instrument_id
+            })
+    });
+}
+
+fn finish_fill_reports(
+    orders: &[CurrentOrderSummary],
+    ocm_state: &Arc<Mutex<OcmState>>,
+    account_id: AccountId,
+    currency: Currency,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Vec<FillReport>> {
     let mut state = ocm_state.lock();
     let customer_order_refs = state.customer_order_refs.clone();
     let mut fill_tracker = state.fill_tracker.clone();
     let reports = build_incremental_fill_reports(
-        &orders,
+        orders,
         &mut fill_tracker,
         &customer_order_refs,
         account_id,
@@ -4407,6 +4899,24 @@ async fn fetch_fill_orders_http(
 }
 
 const MAX_LIST_CURRENT_ORDERS_MARKET_IDS: usize = 250;
+
+fn list_current_orders_filter_markets(
+    market_ids: Option<Vec<String>>,
+    order_projection: Option<OrderProjection>,
+) -> ListCurrentOrdersParams {
+    ListCurrentOrdersParams {
+        bet_ids: None,
+        market_ids,
+        order_projection,
+        customer_order_refs: None,
+        customer_strategy_refs: None,
+        date_range: None,
+        order_by: None,
+        sort_dir: None,
+        from_record: None,
+        record_count: None,
+    }
+}
 
 fn list_current_orders_market_id_batches(
     market_ids: Option<Vec<String>>,
@@ -4531,6 +5041,7 @@ impl MassStatusSnapshot {
             &self.active_quantities,
             state,
             emitter,
+            None,
         );
         let fill_reports = build_incremental_fill_reports(
             &self.fill_orders,
@@ -4716,6 +5227,7 @@ async fn fetch_post_reconnect_mass_status(
         session_refresh,
     )
     .await?;
+    assign_report_owners(&mut fetched_orders.reports, &ocm_state.lock());
     retain_snapshot_fill_orders(&mut fetched_orders.orders, Some(start), Some(ts_now))?;
     Ok(MassStatusSnapshot {
         client_id,
@@ -4829,12 +5341,26 @@ async fn list_current_orders_with_retry(
     stream_session: StreamSession<'_>,
     session_refresh: &mut SessionRefresh,
 ) -> anyhow::Result<CurrentOrderSummaryReport> {
+    send_betting_with_retry(
+        http_client,
+        METHOD_LIST_CURRENT_ORDERS,
+        params,
+        stream_session,
+        session_refresh,
+    )
+    .await
+}
+
+async fn send_betting_with_retry<T: serde::de::DeserializeOwned, P: serde::Serialize>(
+    http_client: &Arc<BetfairHttpClient>,
+    method: &str,
+    params: &P,
+    stream_session: StreamSession<'_>,
+    session_refresh: &mut SessionRefresh,
+) -> anyhow::Result<T> {
     const RATE_LIMIT_RETRY_DELAY_SECS: u64 = 5;
 
-    match http_client
-        .send_betting(METHOD_LIST_CURRENT_ORDERS, params)
-        .await
-    {
+    match http_client.send_betting(method, params).await {
         Ok(r) => Ok(r),
         Err(e) if e.is_session_error() || e.is_rate_limit_error() => {
             if e.is_rate_limit_error() {
@@ -4858,7 +5384,7 @@ async fn list_current_orders_with_retry(
                 }
             }
             http_client
-                .send_betting(METHOD_LIST_CURRENT_ORDERS, params)
+                .send_betting(method, params)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))
         }
@@ -5231,7 +5757,7 @@ mod tests {
         events::{OrderDenied, OrderSubmitted},
         identifiers::{StrategyId, TraderId},
         orders::builder::OrderTestBuilder,
-        types::{Price, Quantity},
+        types::{Money, Price, Quantity},
     };
     use rstest::rstest;
     use rust_decimal::Decimal;
@@ -6336,8 +6862,13 @@ mod tests {
             Decimal::from(3),
         );
         let mut reports = vec![report];
-        let updates =
-            resolve_pending_modifies_in_state(&mut reports, &AHashMap::new(), &mut state, &emitter);
+        let updates = resolve_pending_modifies_in_state(
+            &mut reports,
+            &AHashMap::new(),
+            &mut state,
+            &emitter,
+            None,
+        );
 
         assert!(processed);
         assert!(updates.is_empty());
@@ -8142,6 +8673,212 @@ mod tests {
     }
 
     #[rstest]
+    #[case::known(true, false, true)]
+    #[case::new(false, false, false)]
+    #[case::reregistered(true, true, false)]
+    fn test_report_finalization_rejects_only_the_collected_replace(
+        #[case] collected: bool,
+        #[case] reregistered: bool,
+        #[case] rejected: bool,
+    ) {
+        let account_id = AccountId::from("BETFAIR-001");
+        let client_order_id = ClientOrderId::from("O-REPORT-REPLACE");
+        let bet_id = "report-bet";
+        let mut order = make_summary(
+            bet_id,
+            "1.100",
+            12345,
+            Decimal::ZERO,
+            BetfairOrderStatus::Executable,
+            "2026-08-25T00:00:00Z",
+        );
+        order.customer_order_ref = Some(make_customer_order_ref(client_order_id.as_str()));
+        let report = parse_current_order_report(&order, account_id, UnixNanos::default()).unwrap();
+        let mut expected_report = report.clone();
+        expected_report.client_order_id = Some(client_order_id);
+        let state = Arc::new(Mutex::new(OcmState::default()));
+        {
+            let mut state = state.lock();
+            state.restore_order(
+                client_order_id,
+                StrategyId::from("S-001"),
+                VenueOrderId::from(bet_id),
+            );
+            state.register_pending_replace(
+                client_order_id,
+                bet_id.to_string(),
+                Some(Quantity::from(10)),
+            );
+            state.mark_pending_replace_ambiguous(client_order_id, bet_id);
+        }
+
+        let ambiguous_replaces = if collected {
+            state.lock().pending_replace_reconciliation_ids()
+        } else {
+            AHashMap::new()
+        };
+
+        if reregistered {
+            let mut state = state.lock();
+            state.take_pending_replace(client_order_id, bet_id);
+            state.register_pending_replace(
+                client_order_id,
+                bet_id.to_string(),
+                Some(Quantity::from(10)),
+            );
+            state.mark_pending_replace_ambiguous(client_order_id, bet_id);
+        }
+
+        let fetched = FetchedOrderStatusReports {
+            orders: vec![order],
+            reports: vec![report],
+            ambiguous_replaces,
+            ..Default::default()
+        };
+
+        let (emitter, mut receiver) = emitter_with_receiver(account_id);
+
+        let reports = finish_order_status_reports(fetched, None, &state, Some(&emitter), true);
+        let events: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+
+        assert_eq!(reports, vec![expected_report.clone()]);
+        assert_eq!(
+            state
+                .lock()
+                .pending_replace_awaits_reconciliation(&client_order_id, bet_id),
+            !rejected
+        );
+        assert_eq!(events.len(), usize::from(rejected));
+
+        if rejected {
+            let ExecutionEvent::Order(OrderEventAny::ModifyRejected(event)) = &events[0] else {
+                panic!("expected modification rejection, was {:?}", events[0]);
+            };
+
+            assert_eq!(
+                *event,
+                OrderModifyRejected::new(
+                    emitter.trader_id(),
+                    StrategyId::from("S-001"),
+                    expected_report.instrument_id,
+                    client_order_id,
+                    Ustr::from("Original bet remained executable after ambiguous replace"),
+                    event.event_id,
+                    expected_report.ts_last,
+                    expected_report.ts_init,
+                    true,
+                    Some(VenueOrderId::from(bet_id)),
+                    Some(account_id),
+                )
+            );
+        }
+    }
+
+    #[rstest]
+    fn test_report_owners_use_current_reference_resolution() {
+        let account_id = AccountId::from("BETFAIR-001");
+        let client_order_id = ClientOrderId::from("O-REPORT-OWNER");
+        let mut order = make_summary(
+            "owner-bet",
+            "1.100",
+            12345,
+            Decimal::ZERO,
+            BetfairOrderStatus::Executable,
+            "2026-08-25T00:00:00Z",
+        );
+        let reference = make_customer_order_ref(client_order_id.as_str());
+        order.customer_order_ref = Some(reference.clone());
+        let report = parse_current_order_report(&order, account_id, UnixNanos::default()).unwrap();
+        let mut expected_report = report.clone();
+        expected_report.client_order_id = None;
+        let mut state = OcmState::default();
+        state
+            .customer_order_refs
+            .insert(reference, CustomerOrderRefResolution::Ambiguous);
+        let mut reports = vec![report];
+
+        assign_report_owners(&mut reports, &state);
+
+        assert_eq!(reports, vec![expected_report]);
+    }
+
+    #[rstest]
+    fn test_fill_finalization_uses_current_tracker_atomically() {
+        let account_id = AccountId::from("BETFAIR-001");
+        let currency = Currency::GBP();
+        let mut order = make_summary(
+            "fill-bet",
+            "1.100",
+            12345,
+            Decimal::ZERO,
+            BetfairOrderStatus::Executable,
+            "2026-08-25T00:00:00Z",
+        );
+        order.size_matched = Some(Decimal::from(7));
+        order.average_price_matched = Some(Decimal::from(3));
+        let state = Arc::new(Mutex::new(OcmState::default()));
+        state.lock().fill_tracker.advance_cumulative_fill(
+            "fill-bet",
+            Decimal::from(4),
+            Some(Decimal::from(3)),
+            Decimal::from(3),
+        );
+
+        let mut invalid_order = order.clone();
+        invalid_order.bet_id = "fill-invalid".to_string();
+        invalid_order.placed_date = "invalid-date".to_string();
+        let failed = finish_fill_reports(
+            &[order.clone(), invalid_order],
+            &state,
+            account_id,
+            currency,
+            UnixNanos::default(),
+        )
+        .unwrap_err();
+
+        let reports = finish_fill_reports(
+            &[order.clone()],
+            &state,
+            account_id,
+            currency,
+            UnixNanos::default(),
+        )
+        .unwrap();
+        let repeated =
+            finish_fill_reports(&[order], &state, account_id, currency, UnixNanos::default())
+                .unwrap();
+
+        assert_eq!(
+            failed.to_string(),
+            format!(
+                "Failed to parse fill report for fill-invalid: {}",
+                parse_betfair_timestamp("invalid-date").unwrap_err(),
+            )
+        );
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0],
+            FillReport::new(
+                account_id,
+                InstrumentId::from("1.100-12345.BETFAIR"),
+                VenueOrderId::from("fill-bet"),
+                TradeId::from("fill-bet-7.00"),
+                OrderSide::Sell,
+                Quantity::from("3.00"),
+                Price::from("3.00"),
+                Money::zero(currency),
+                LiquiditySide::NoLiquiditySide,
+                None,
+                None,
+                parse_betfair_timestamp("2026-08-25T00:00:00Z").unwrap(),
+                UnixNanos::default(),
+                Some(reports[0].report_id),
+            )
+        );
+        assert!(repeated.is_empty());
+    }
+
+    #[rstest]
     fn test_reconciliation_resolves_unique_closed_replace_without_new_bet() {
         let account_id = AccountId::from("BETFAIR-001");
         let client_order_id = ClientOrderId::from("O-RECOVERY-REPLACE-CANCELED");
@@ -8171,8 +8908,13 @@ mod tests {
         state.mark_pending_replace_ambiguous(client_order_id, old_bet_id);
         let (emitter, _receiver) = emitter_with_receiver(account_id);
 
-        let updates =
-            resolve_pending_modifies_in_state(&mut reports, &AHashMap::new(), &mut state, &emitter);
+        let updates = resolve_pending_modifies_in_state(
+            &mut reports,
+            &AHashMap::new(),
+            &mut state,
+            &emitter,
+            None,
+        );
 
         assert!(updates.is_empty());
         assert_eq!(reports.len(), 1);
@@ -8228,8 +8970,13 @@ mod tests {
             .insert(old_bet_id.to_string());
         let (emitter, _receiver) = emitter_with_receiver(account_id);
 
-        let updates =
-            resolve_pending_modifies_in_state(&mut reports, &AHashMap::new(), &mut state, &emitter);
+        let updates = resolve_pending_modifies_in_state(
+            &mut reports,
+            &AHashMap::new(),
+            &mut state,
+            &emitter,
+            None,
+        );
 
         assert!(updates.is_empty());
         assert_eq!(reports.len(), 1);
@@ -8311,8 +9058,13 @@ mod tests {
             .insert(second_bet_id.to_string());
         let (emitter, _receiver) = emitter_with_receiver(account_id);
 
-        let updates =
-            resolve_pending_modifies_in_state(&mut reports, &AHashMap::new(), &mut state, &emitter);
+        let updates = resolve_pending_modifies_in_state(
+            &mut reports,
+            &AHashMap::new(),
+            &mut state,
+            &emitter,
+            None,
+        );
 
         assert!(updates.is_empty());
         let successor = reports
@@ -8371,8 +9123,13 @@ mod tests {
             .insert(old_bet_id.to_string());
         let (emitter, _receiver) = emitter_with_receiver(account_id);
 
-        let updates =
-            resolve_pending_modifies_in_state(&mut reports, &AHashMap::new(), &mut state, &emitter);
+        let updates = resolve_pending_modifies_in_state(
+            &mut reports,
+            &AHashMap::new(),
+            &mut state,
+            &emitter,
+            None,
+        );
 
         assert!(updates.is_empty());
         // The retained terminal identity keeps the predecessor leg in the mass
@@ -8461,6 +9218,7 @@ mod tests {
             &AHashMap::from([(new_bet_id.to_string(), Quantity::from(4))]),
             &mut state,
             &emitter,
+            None,
         );
 
         assert_eq!(state.reduced_quantity(new_bet_id), Some(Quantity::from(8)));
@@ -8728,8 +9486,13 @@ mod tests {
             .insert(old_bet_id.to_string());
         let (emitter, _receiver) = emitter_with_receiver(account_id);
 
-        let updates =
-            resolve_pending_modifies_in_state(&mut reports, &AHashMap::new(), &mut state, &emitter);
+        let updates = resolve_pending_modifies_in_state(
+            &mut reports,
+            &AHashMap::new(),
+            &mut state,
+            &emitter,
+            None,
+        );
 
         assert!(updates.is_empty());
         let successor = reports
@@ -8791,8 +9554,13 @@ mod tests {
         );
         let (emitter, _receiver) = emitter_with_receiver(account_id);
 
-        let updates =
-            resolve_pending_modifies_in_state(&mut reports, &AHashMap::new(), &mut state, &emitter);
+        let updates = resolve_pending_modifies_in_state(
+            &mut reports,
+            &AHashMap::new(),
+            &mut state,
+            &emitter,
+            None,
+        );
 
         assert_eq!(updates.len(), 1);
 
@@ -8856,6 +9624,7 @@ mod tests {
             &active_quantities,
             &mut state,
             &emitter,
+            None,
         );
 
         assert!(updates.is_empty());
@@ -8906,6 +9675,7 @@ mod tests {
             &active_quantities,
             &mut state,
             &emitter,
+            None,
         );
         let late_rest =
             state.complete_pending_reduction(&client_order_id, bet_id, Quantity::from(4));
@@ -9906,6 +10676,76 @@ mod tests {
         assert!(params.sort_dir.is_none());
         assert!(params.from_record.is_none());
         assert!(params.record_count.is_none());
+    }
+
+    #[rstest]
+    fn test_list_current_orders_supplemental_queries_batch_and_deduplicate_ids() {
+        let bet_ids: Vec<_> = (0..251).map(|index| format!("bet-{index:03}")).collect();
+        let queries = list_current_orders_supplemental_queries(
+            bet_ids.iter().chain(&bet_ids).cloned().collect(),
+            ["reference-b", "reference-a", "reference-a"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        );
+        let actual: Vec<_> = queries
+            .into_iter()
+            .map(|query| serde_json::to_value(query).unwrap())
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                serde_json::json!({"betIds": bet_ids[..250], "orderProjection": "ALL"}),
+                serde_json::json!({"betIds": bet_ids[250..], "orderProjection": "ALL"}),
+                serde_json::json!({"customerOrderRefs": ["reference-a"], "orderProjection": "ALL"}),
+                serde_json::json!({"customerOrderRefs": ["reference-b"], "orderProjection": "ALL"}),
+            ]
+        );
+        assert!(
+            list_current_orders_supplemental_queries(AHashSet::new(), AHashSet::new()).is_empty()
+        );
+    }
+
+    #[rstest]
+    fn test_order_status_supplemental_ids_use_known_bet_when_reference_is_ambiguous() {
+        let first = ClientOrderId::from("12345678901234567890123456789012-first");
+        let second = ClientOrderId::from("12345678901234567890123456789012-second");
+        let mut state = OcmState::default();
+        state.restore_order(
+            first,
+            StrategyId::from("S-001"),
+            VenueOrderId::from("first-old"),
+        );
+        state.register_pending_replace(first, "first-old".to_string(), Some(Quantity::from(10)));
+        state
+            .complete_pending_replace(first, "first-old", VenueOrderId::from("first-new"))
+            .unwrap();
+        state.restore_order(
+            second,
+            StrategyId::from("S-002"),
+            VenueOrderId::from("second-new"),
+        );
+        let mut order = make_summary(
+            "first-new",
+            "1.100",
+            12345,
+            Decimal::ZERO,
+            BetfairOrderStatus::Executable,
+            "2026-10-01T00:00:00Z",
+        );
+        order.customer_order_ref = Some(make_customer_order_ref_legacy(first.as_str()));
+        assert_eq!(
+            state.customer_order_ref_resolution(order.customer_order_ref.as_ref().unwrap()),
+            Some(CustomerOrderRefResolution::Ambiguous)
+        );
+        let state = Arc::new(Mutex::new(state));
+        assert_eq!(
+            order_status_supplemental_ids(&[order], &state.lock()),
+            (
+                AHashSet::from_iter(["first-old".to_string(), "first-new".to_string(),]),
+                AHashMap::new()
+            )
+        );
     }
 
     #[rstest]

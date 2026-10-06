@@ -26,11 +26,12 @@ use datafusion::{
     arrow::{
         array::{
             Array, ArrayRef, BinaryViewArray, FixedSizeBinaryBuilder, FixedSizeListArray,
-            ListArray, StringArray, StringViewArray, new_empty_array, new_null_array,
+            ListArray, StringArray, StringViewArray, UInt32Array, new_empty_array, new_null_array,
         },
         buffer::{OffsetBuffer, ScalarBuffer},
-        compute::{cast, concat},
+        compute::{cast, concat, take_record_batch},
         datatypes::{DataType, Schema},
+        error::ArrowError,
         record_batch::RecordBatch,
     },
     catalog::TableProvider,
@@ -41,6 +42,7 @@ use datafusion::{
 use futures::{Stream, StreamExt, TryStreamExt};
 use nautilus_common::live::{block_on_nautilus_with, get_runtime};
 use nautilus_core::UnixNanos;
+use nautilus_serialization::arrow::{KEY_IDENTIFIER, StringColumnRef};
 use object_store::ObjectStore;
 use tokio::{
     sync::mpsc::{self, Receiver},
@@ -126,7 +128,7 @@ impl DataBackendSession {
         self.session_ctx.register_object_store(url, object_store);
     }
 
-    /// Registers an OpenDAL-backed storage backend with the session context.
+    /// Registers a storage backend's object store with the session context.
     ///
     /// External catalog implementations can call this before adding native table providers or
     /// object-store-relative file paths to the session.
@@ -193,6 +195,19 @@ impl DataBackendSession {
         Ok(self.execute_registered(table_name, sql_query)?)
     }
 
+    // Returns `false` without registering when the files' schemas cannot merge, such as files
+    // written at different precisions.
+    pub(crate) fn try_register_parquet_files_table(
+        &mut self,
+        table_name: &str,
+        file_paths: Vec<String>,
+    ) -> anyhow::Result<bool> {
+        match self.register_parquet_files_table(table_name, file_paths) {
+            Err(e) if is_schema_merge_error(&e) => Ok(false),
+            result => result.map(|()| true),
+        }
+    }
+
     fn register_parquet_files_table(
         &mut self,
         table_name: &str,
@@ -238,6 +253,15 @@ impl DataBackendSession {
         // Create a new session context to completely reset the DataFusion state
         self.session_ctx = SessionContext::new_with_config(session_config());
     }
+}
+
+fn is_schema_merge_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<ArrowError>(),
+            Some(ArrowError::SchemaError(_))
+        )
+    })
 }
 
 pub(crate) fn session_config() -> SessionConfig {
@@ -477,6 +501,44 @@ pub fn identifiers_from_record_batches(batches: &[RecordBatch]) -> anyhow::Resul
     let mut identifiers = identifiers.into_iter().collect::<Vec<_>>();
     identifiers.sort();
     Ok(identifiers)
+}
+
+/// Keeps the rows whose catalog identifier satisfies `matches`.
+///
+/// Each row's identifier comes from the `identifier` column, or `fallback_identifier` when the
+/// batch has no such column or the row value is null. Returns `None` when no row matches.
+pub(crate) fn filter_record_batch_by_identifier(
+    batch: &RecordBatch,
+    fallback_identifier: Option<&str>,
+    matches: impl Fn(Option<&str>) -> bool,
+) -> anyhow::Result<Option<RecordBatch>> {
+    let Some(column) = batch.column_by_name(KEY_IDENTIFIER) else {
+        return Ok(matches(fallback_identifier).then(|| batch.clone()));
+    };
+
+    let identifiers = StringColumnRef::try_from_array(column.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("Identifier column must be an Arrow string type"))?;
+
+    let indices = (0..batch.num_rows())
+        .filter_map(|row| {
+            let identifier = (!identifiers.is_null(row))
+                .then(|| identifiers.value(row))
+                .or(fallback_identifier);
+            matches(identifier).then(|| u32::try_from(row))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if indices.is_empty() {
+        return Ok(None);
+    }
+
+    if indices.len() == batch.num_rows() {
+        return Ok(Some(batch.clone()));
+    }
+
+    take_record_batch(batch, &UInt32Array::from(indices))
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("Failed to filter catalog batch by identifier: {e}"))
 }
 
 #[cfg(test)]

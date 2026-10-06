@@ -354,11 +354,10 @@ impl ParquetDataCatalog {
             timestamps_to_filename(UnixNanos::from(intervals[0].0), UnixNanos::from(last_end));
         let path = make_object_store_path(directory, [&file_name]);
 
-        // Convert string paths to ObjectPath for the function call
-        let object_paths: Vec<ObjectPath> = files_to_consolidate
+        let object_paths = files_to_consolidate
             .iter()
-            .map(|(path, _)| ObjectPath::from(path.as_str()))
-            .collect();
+            .map(|(path, _)| self.to_object_path_parsed(path))
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         self.execute_async(|| async {
             combine_parquet_files_from_object_store(
@@ -846,13 +845,13 @@ impl ParquetDataCatalog {
         let mut file_start_ns: Option<u64> = None; // Track contiguity across periods
 
         for query_info in queries_to_execute {
-            // Query data for this period using query_typed_data
+            // Query data for this period
             let instrument_ids = identifier.map(|id| vec![id.to_string()]);
 
             // Use optimize_file_loading=false to match Python behavior:
             // During consolidation, we want to read only the specific files being consolidated,
             // not the entire directory. This ensures precise file control during consolidation.
-            let period_data = self.query_typed_data::<T>(
+            let period_data = self.query::<T>(
                 instrument_ids,
                 Some(UnixNanos::from(query_info.query_start)),
                 Some(UnixNanos::from(query_info.query_end)),

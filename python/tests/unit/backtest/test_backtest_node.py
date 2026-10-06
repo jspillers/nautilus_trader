@@ -36,6 +36,7 @@ from nautilus_trader.analysis import create_tearsheet
 from nautilus_trader.analysis import tearsheet
 from nautilus_trader.analysis.reporter import ReportProvider
 from nautilus_trader.backtest import BacktestDataConfig
+from nautilus_trader.backtest import BacktestEngine
 from nautilus_trader.backtest import BacktestEngineConfig
 from nautilus_trader.backtest import BacktestNode
 from nautilus_trader.backtest import BacktestRunConfig
@@ -58,6 +59,7 @@ from nautilus_trader.model import StandardMarginModel
 from nautilus_trader.model import Venue
 from nautilus_trader.persistence import DataCatalogConfig
 from nautilus_trader.persistence import ParquetDataCatalog
+from nautilus_trader.persistence import RotationConfig
 from nautilus_trader.persistence import StreamingConfig
 from nautilus_trader.trading import EmaCrossConfig
 from nautilus_trader.trading import ImportableExecutionAlgorithmConfig
@@ -477,12 +479,10 @@ def test_node_streams_output_to_new_or_replaced_directory(
             run_analysis=False,
             instance_id=instance_id,
             streaming=StreamingConfig(
-                catalog_path=str(output_path),
-                fs_protocol="file",
+                writer_path=str(output_path),
                 flush_interval_ms=1,
                 replace_existing=replace_existing,
-                rotation_mode="SIZE",
-                max_file_size=1,
+                rotation_config=RotationConfig.size(1),
             ),
         ),
     )
@@ -499,6 +499,93 @@ def test_node_streams_output_to_new_or_replaced_directory(
         assert len(quote_files) == 3
     finally:
         node.dispose()
+
+
+def test_engine_reset_reopens_streaming_writer(tmp_path: Path) -> None:
+    """
+    Test a reset engine streams the rows of its next run.
+    """
+    instance_id = UUID4()
+    output_path = tmp_path / "output"
+    instrument = TestInstrumentProvider.ethusdt_binance()
+    quotes = _whipsaw_quotes(instrument, count=3)
+    engine = BacktestEngine(
+        BacktestEngineConfig(
+            bypass_logging=True,
+            run_analysis=False,
+            instance_id=instance_id,
+            streaming=StreamingConfig(writer_path=str(output_path), flush_interval_ms=1),
+        ),
+    )
+    engine.add_venue(
+        venue=Venue("BINANCE"),
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.MARGIN,
+        starting_balances=[Money.from_str("1_000_000 USDT")],
+        book_type=BookType.L1_MBP,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
+    )
+    engine.add_instrument(instrument)
+    engine.add_data(quotes)
+
+    try:
+        engine.run()
+        engine.reset()
+        engine.run()
+        streamed = ParquetDataCatalog(str(output_path)).read_backtest(str(instance_id))
+
+        assert streamed == [quote for quote in quotes for _ in range(2)]
+    finally:
+        engine.dispose()
+
+
+def test_engine_streaming_promotes_into_separate_catalog(tmp_path: Path) -> None:
+    """
+    Test streaming stages under the writer path and promotes into the catalog.
+    """
+    instance_id = UUID4()
+    writer_path = tmp_path / "stream"
+    catalog_path = tmp_path / "catalog"
+    instrument = TestInstrumentProvider.ethusdt_binance()
+    quotes = _whipsaw_quotes(instrument, count=3)
+    engine = BacktestEngine(
+        BacktestEngineConfig(
+            bypass_logging=True,
+            run_analysis=False,
+            instance_id=instance_id,
+            streaming=StreamingConfig(
+                writer_path=str(writer_path),
+                catalog=DataCatalogConfig(path=str(catalog_path)),
+                data_types=[NautilusDataType.QuoteTick],
+            ),
+        ),
+    )
+    engine.add_venue(
+        venue=Venue("BINANCE"),
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.MARGIN,
+        starting_balances=[Money.from_str("1_000_000 USDT")],
+        book_type=BookType.L1_MBP,
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
+    )
+    engine.add_instrument(instrument)
+    engine.add_data(quotes)
+
+    try:
+        engine.run()
+        promoted = ParquetDataCatalog(str(catalog_path)).query_quote_ticks()
+
+        assert promoted == quotes
+        assert (writer_path / "backtest" / str(instance_id) / "quotes").is_dir()
+        assert not (catalog_path / "backtest").exists()
+    finally:
+        engine.dispose()
 
 
 def test_node_builds_with_configured_catalog(tmp_path: Path) -> None:

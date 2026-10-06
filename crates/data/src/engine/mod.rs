@@ -70,6 +70,8 @@ use handlers::{
     BAR_AGGREGATOR_PRIORITY, BarBarHandler, BarQuoteHandler, BarTradeHandler, SpreadQuoteHandler,
 };
 use indexmap::IndexMap;
+#[cfg(feature = "defi")]
+use nautilus_common::messages::defi::PoolSnapshotResponse;
 use nautilus_common::{
     cache::Cache,
     clock::Clock,
@@ -111,7 +113,8 @@ use nautilus_model::{
         PriceType, RecordFlag,
     },
     identifiers::{
-        ClientId, GENERIC_SPREAD_ID_SEPARATOR, InstrumentId, OptionSeriesId, Symbol, Venue,
+        ClientId, GENERIC_SPREAD_ID_SEPARATOR, InstrumentId, OptionSeriesId, Venue,
+        parse_generic_spread_id_legs,
     },
     instruments::{Instrument, InstrumentAny, SyntheticInstrument},
     orderbook::OrderBook,
@@ -209,9 +212,7 @@ pub struct DataEngine {
     #[cfg(feature = "defi")]
     pub(crate) pool_updaters: AHashMap<InstrumentId, Rc<PoolUpdater>>,
     #[cfg(feature = "defi")]
-    pub(crate) pool_updaters_pending: AHashSet<InstrumentId>,
-    #[cfg(feature = "defi")]
-    pub(crate) pool_snapshot_pending: AHashSet<InstrumentId>,
+    pub(crate) pool_snapshot_pending: AHashMap<InstrumentId, UUID4>,
     #[cfg(feature = "defi")]
     pub(crate) pool_event_buffers: AHashMap<InstrumentId, Vec<DefiData>>,
 }
@@ -288,9 +289,7 @@ impl DataEngine {
             #[cfg(feature = "defi")]
             pool_updaters: AHashMap::new(),
             #[cfg(feature = "defi")]
-            pool_updaters_pending: AHashSet::new(),
-            #[cfg(feature = "defi")]
-            pool_snapshot_pending: AHashSet::new(),
+            pool_snapshot_pending: AHashMap::new(),
             #[cfg(feature = "defi")]
             pool_event_buffers: AHashMap::new(),
         }
@@ -698,6 +697,9 @@ impl DataEngine {
 
         self.deferred_cmd_queue.borrow_mut().clear();
 
+        #[cfg(feature = "defi")]
+        self.clear_pool_updaters();
+
         self.clock.borrow_mut().cancel_timers();
 
         self.command_count = 0;
@@ -779,6 +781,11 @@ impl DataEngine {
             .collect();
 
         let results = join_all(futures).await;
+
+        // A closed session cannot answer, so discard its pending bootstraps
+        #[cfg(feature = "defi")]
+        self.abandon_pool_snapshots();
+
         let errors: Vec<_> = results.into_iter().filter_map(Result::err).collect();
 
         if errors.is_empty() {
@@ -1084,6 +1091,12 @@ impl DataEngine {
                 if cmd.bar_type.is_internally_aggregated() {
                     return Ok(());
                 }
+            }
+            SubscribeCommand::OptionChain(cmd) if cmd.snapshot_interval_ms == Some(0) => {
+                anyhow::bail!(
+                    "Cannot subscribe option chain {} with a zero `snapshot_interval_ms`; use `None` for raw mode",
+                    cmd.series_id,
+                );
             }
             SubscribeCommand::OptionChain(cmd) => {
                 self.subscribe_option_chain(cmd);
@@ -1571,7 +1584,7 @@ impl DataEngine {
             active.cursor_ns = UnixNanos::from(segment.end_ns.saturating_add(1));
         }
 
-        self.dispatch_request_to_client(child).map(|_| ())
+        self.execute_request(child)
     }
 
     fn apply_continuous_future_adjustment(
@@ -1747,9 +1760,11 @@ impl DataEngine {
                 })
                 .collect();
             let cache = self.cache.clone();
-            let validate_sequence = self.config.validate_data_sequence;
             let handler: Box<dyn FnMut(Bar)> = Box::new(move |bar: Bar| {
-                process_engine_bar(&cache, validate_sequence, false, bar);
+                // Request-generated bars are delivered only through the cache.
+                if let Err(e) = cache.as_ref().borrow_mut().add_bar_historical(bar) {
+                    log_error_on_cache_insert(&e);
+                }
 
                 for aggregator in &downstream {
                     aggregator.borrow_mut().handle_bar(bar);
@@ -1822,6 +1837,12 @@ impl DataEngine {
         } else if let Some(custom) = data.downcast_ref::<CustomData>() {
             self.handle_custom_data(custom);
         } else {
+            #[cfg(feature = "defi")]
+            if let Some(response) = data.downcast_ref::<PoolSnapshotResponse>() {
+                self.handle_pool_snapshot_response(response);
+                return;
+            }
+
             log::error!("Cannot process data {data:?}, type is unrecognized");
         }
     }
@@ -1927,7 +1948,10 @@ impl DataEngine {
         manager_rc.borrow_mut().handle_greeks(greeks);
 
         if manager_rc.borrow().is_bootstrapped() {
-            self.finish_option_chain_greeks_bootstrap(series_id, &manager_rc);
+            // Apply the chain's own subscribes before releasing the bootstrap owner, so a sample
+            // inside the active window keeps its feed without a physical unsubscribe.
+            self.drain_deferred_commands();
+            self.stop_option_chain_greeks_bootstrap(series_id);
         }
     }
 
@@ -1998,14 +2022,15 @@ impl DataEngine {
 
         resp.trim_to_bounds();
 
+        let Some(resp) = self.handle_request_pipeline_response(resp) else {
+            return;
+        };
+
+        // Catalog legs inherit the child's params, so route only the assembled segment
         if let Some(parent_id) = continuous_future_parent_request_id(response_params(&resp)) {
             self.handle_continuous_future_child_response(parent_id, &resp);
             return;
         }
-
-        let Some(resp) = self.handle_request_pipeline_response(resp) else {
-            return;
-        };
 
         if let Some(parent_id) = self
             .time_range_pipeline_parent_request_id
@@ -3632,31 +3657,24 @@ impl DataEngine {
             }
         }
 
-        // After stopping a composite, check if the source aggregator is now orphaned
-        if bar_type.is_composite() {
-            let source_type = bar_type.composite();
-            let source_topic = switchboard::get_bars_topic(source_type);
-            if msgbus::exact_subscriber_count_bars(source_topic) == 0
-                && self
-                    .bar_aggregators
-                    .contains_key(&bar_aggregator_key(source_type, None))
+        // After stopping a composite, release its source through `unsubscribe_bars`, which frees
+        // the client feed recorded in the source's retained command.
+        if command.bar_type.is_composite() {
+            let source_type = command.bar_type.composite();
+
+            if self
+                .bar_aggregators
+                .contains_key(&bar_aggregator_key(source_type, None))
             {
-                match self.stop_bar_aggregator(source_type, None) {
-                    // Release the underlying client subscription too, otherwise the
-                    // venue stream keeps flowing with no consumer
-                    Ok(()) => self.unsubscribe_bar_aggregator(&UnsubscribeBars::new(
-                        source_type,
-                        command.client_id,
-                        command.venue,
-                        UUID4::new(),
-                        command.ts_init,
-                        Some(command.command_id),
-                        command.params.clone(),
-                    )),
-                    Err(e) => {
-                        log::error!("Error stopping source bar aggregator for {source_type}: {e}");
-                    }
-                }
+                self.unsubscribe_bars(&UnsubscribeBars::new(
+                    source_type,
+                    command.client_id,
+                    command.venue,
+                    UUID4::new(),
+                    command.ts_init,
+                    Some(command.command_id),
+                    command.params.clone(),
+                ));
             }
         }
     }
@@ -3984,28 +4002,6 @@ impl DataEngine {
             )))
         {
             log::error!("Failed to subscribe option-chain bootstrap Greeks for {series_id}: {e}");
-        }
-    }
-
-    fn finish_option_chain_greeks_bootstrap(
-        &mut self,
-        series_id: OptionSeriesId,
-        manager: &Rc<RefCell<OptionChainManager>>,
-    ) {
-        let sample_is_active = self
-            .option_chain_greeks_bootstraps
-            .get(&series_id)
-            .is_some_and(|bootstrap| {
-                manager
-                    .borrow()
-                    .is_instrument_active(&bootstrap.instrument_id)
-            });
-        let Some(bootstrap) = self.remove_option_chain_greeks_bootstrap(series_id) else {
-            return;
-        };
-
-        if !sample_is_active {
-            self.release_option_chain_greeks_bootstrap(&bootstrap);
         }
     }
 
@@ -5696,39 +5692,7 @@ fn spread_instrument_legs(instrument: &InstrumentAny) -> Option<Vec<(InstrumentI
         return Some(vec![(instrument_id, 1)]);
     }
 
-    symbol
-        .split(GENERIC_SPREAD_ID_SEPARATOR)
-        .map(|component| parse_spread_leg(component, instrument_id.venue))
-        .collect()
-}
-
-fn parse_spread_leg(component: &str, venue: Venue) -> Option<(InstrumentId, i64)> {
-    if let Some(rest) = component.strip_prefix("((") {
-        let (ratio, symbol) = rest.split_once("))")?;
-        return parse_spread_leg_parts(ratio, symbol, venue, -1);
-    }
-
-    let rest = component.strip_prefix('(')?;
-    let (ratio, symbol) = rest.split_once(')')?;
-    parse_spread_leg_parts(ratio, symbol, venue, 1)
-}
-
-fn parse_spread_leg_parts(
-    ratio: &str,
-    symbol: &str,
-    venue: Venue,
-    sign: i64,
-) -> Option<(InstrumentId, i64)> {
-    if symbol.is_empty() {
-        return None;
-    }
-
-    let ratio = ratio.parse::<i64>().ok()?.checked_mul(sign)?;
-    if ratio == 0 {
-        return None;
-    }
-
-    Some((InstrumentId::new(Symbol::new(symbol), venue), ratio))
+    parse_generic_spread_id_legs(&instrument_id).ok()
 }
 
 #[inline(always)]
@@ -5986,8 +5950,8 @@ fn derive_quote_from_depth(depth: &OrderBookDepth) -> Option<QuoteTick> {
 }
 
 // Validates a bar against `last_bar` before writing and (optionally) publishing.
-// Shared by `handle_bar` and aggregator-emitted bars so both honor
-// `validate_data_sequence`.
+// Live bars and aggregator emissions honor `validate_data_sequence`;
+// request-generated bars use `Cache::add_bar_historical`.
 fn process_engine_bar(
     cache: &Rc<RefCell<Cache>>,
     validate_sequence: bool,
@@ -6038,8 +6002,6 @@ fn validate_bar_sequence(cache: &Rc<RefCell<Cache>>, validate_sequence: bool, ba
         return false;
     }
 
-    // Bar revision overwrite needs a `Bar.is_revision` field on the model;
-    // not present today. Tracked under #8 in the data engine parity plan
     true
 }
 

@@ -498,6 +498,76 @@ pub fn record_path_prefix(record_type: &NautilusRecordType) -> Cow<'static, str>
     }
 }
 
+/// Parses a stored catalog type path back into its catalog type.
+///
+/// Accepts the shared-table `record/<type>` and `instrument/<class>` paths, `custom/<type>` data
+/// paths, and the flat Parquet data, record, and instrument class directories.
+///
+/// # Errors
+///
+/// Returns an error if `path` names no catalog type.
+pub fn catalog_data_type_from_path(path: &str) -> anyhow::Result<CatalogDataType> {
+    if let Some(record_type) = path.strip_prefix("record/") {
+        return Ok(CatalogDataType::Record(record_type.parse()?));
+    }
+
+    if let Some(instrument_type) = path.strip_prefix("instrument/") {
+        return Ok(CatalogDataType::Instrument(instrument_type.parse()?));
+    }
+
+    if let Ok(data_type) = data_type_from_data_path_prefix(path) {
+        return Ok(CatalogDataType::Data(data_type));
+    }
+
+    if let Ok(record_type) = path.parse::<NautilusRecordType>() {
+        return Ok(CatalogDataType::Record(record_type));
+    }
+
+    path.parse::<NautilusInstrumentType>()
+        .map(CatalogDataType::Instrument)
+        .map_err(|_| anyhow::anyhow!("Unknown catalog type path '{path}'"))
+}
+
+/// Returns the shared-table catalog prefix for a record type.
+///
+/// Shared-table backends store records under `record/<type>` and instrument classes under
+/// `instrument/<class>`, where Parquet keeps the flat [`record_path_prefix`] directory.
+#[must_use]
+pub fn record_table_path_prefix(record_type: &NautilusRecordType) -> Cow<'static, str> {
+    Cow::Owned(format!("record/{}", record_path_prefix(record_type)))
+}
+
+/// Returns the shared-table catalog prefix for an instrument class.
+#[must_use]
+pub fn instrument_table_path_prefix(instrument_type: &NautilusInstrumentType) -> Cow<'static, str> {
+    Cow::Owned(format!(
+        "instrument/{}",
+        instrument_path_prefix(instrument_type)
+    ))
+}
+
+/// Returns the shared-table catalog prefix for a catalog type.
+#[must_use]
+pub fn catalog_data_type_path_prefix(catalog_type: &CatalogDataType) -> Cow<'static, str> {
+    match catalog_type {
+        CatalogDataType::Data(data_type) => {
+            let prefix = data_path_prefix(data_type);
+
+            // A data prefix the flat record parser also claims, such as DeFi's `defi`, uses the
+            // type name so it parses back as data
+            if prefix.parse::<NautilusRecordType>().is_ok() {
+                Cow::Owned(data_type.to_string())
+            } else {
+                prefix
+            }
+        }
+        CatalogDataType::Record(record_type) => record_table_path_prefix(record_type),
+        CatalogDataType::Instrument(instrument_type) => {
+            instrument_table_path_prefix(instrument_type)
+        }
+    }
+}
+
 /// Returns the SQL-safe table-name stem identifying a catalog type.
 ///
 /// The aggregate instrument family spans several class directories, so its stem is the shared
@@ -541,6 +611,13 @@ pub trait HasCatalogDataType {
     fn catalog_data_type() -> NautilusDataType;
 }
 
+/// Maps a Rust type a streaming writer stages to its catalog data or record family.
+///
+/// Every instrument class belongs to the aggregate instrument family.
+pub trait CatalogFamily {
+    fn catalog_family() -> CatalogDataType;
+}
+
 macro_rules! impl_catalog_data_families {
     ($(($variant:ident, $type:ident, $data:ident, $batch:ident, $prefix:literal)),+ $(,)?) => {
         $(
@@ -553,6 +630,12 @@ macro_rules! impl_catalog_data_families {
             impl CatalogPathPrefix for $type {
                 fn path_prefix() -> &'static str {
                     $prefix
+                }
+            }
+
+            impl CatalogFamily for $type {
+                fn catalog_family() -> CatalogDataType {
+                    CatalogDataType::Data(NautilusDataType::$variant)
                 }
             }
         )+
@@ -571,36 +654,48 @@ macro_rules! impl_catalog_path_prefix {
     };
 }
 
-impl_catalog_path_prefix!(AccountState, "account_state");
-impl_catalog_path_prefix!(OrderInitialized, "order_initialized");
-impl_catalog_path_prefix!(OrderDenied, "order_denied");
-impl_catalog_path_prefix!(OrderEmulated, "order_emulated");
-impl_catalog_path_prefix!(OrderSubmitted, "order_submitted");
-impl_catalog_path_prefix!(OrderAccepted, "order_accepted");
-impl_catalog_path_prefix!(OrderRejected, "order_rejected");
-impl_catalog_path_prefix!(OrderPendingCancel, "order_pending_cancel");
-impl_catalog_path_prefix!(OrderCanceled, "order_canceled");
-impl_catalog_path_prefix!(OrderCancelRejected, "order_cancel_rejected");
-impl_catalog_path_prefix!(OrderExpired, "order_expired");
-impl_catalog_path_prefix!(OrderTriggered, "order_triggered");
-impl_catalog_path_prefix!(OrderPendingUpdate, "order_pending_update");
-impl_catalog_path_prefix!(OrderReleased, "order_released");
-impl_catalog_path_prefix!(OrderModifyRejected, "order_modify_rejected");
-impl_catalog_path_prefix!(OrderUpdated, "order_updated");
-impl_catalog_path_prefix!(OrderFilled, "order_filled");
-impl_catalog_path_prefix!(OrderFillVoided, "order_fill_voided");
-impl_catalog_path_prefix!(PositionOpened, "position_opened");
-impl_catalog_path_prefix!(PositionChanged, "position_changed");
-impl_catalog_path_prefix!(PositionClosed, "position_closed");
-impl_catalog_path_prefix!(PositionAdjusted, "position_adjusted");
-impl_catalog_path_prefix!(OrderSnapshot, "order_snapshot");
-impl_catalog_path_prefix!(PositionSnapshot, "position_snapshot");
+macro_rules! impl_catalog_record_family {
+    ($type:ident, $path:expr) => {
+        impl_catalog_path_prefix!($type, $path);
+
+        impl CatalogFamily for $type {
+            fn catalog_family() -> CatalogDataType {
+                CatalogDataType::Record(NautilusRecordType::$type)
+            }
+        }
+    };
+}
+
+impl_catalog_record_family!(AccountState, "account_state");
+impl_catalog_record_family!(OrderInitialized, "order_initialized");
+impl_catalog_record_family!(OrderDenied, "order_denied");
+impl_catalog_record_family!(OrderEmulated, "order_emulated");
+impl_catalog_record_family!(OrderSubmitted, "order_submitted");
+impl_catalog_record_family!(OrderAccepted, "order_accepted");
+impl_catalog_record_family!(OrderRejected, "order_rejected");
+impl_catalog_record_family!(OrderPendingCancel, "order_pending_cancel");
+impl_catalog_record_family!(OrderCanceled, "order_canceled");
+impl_catalog_record_family!(OrderCancelRejected, "order_cancel_rejected");
+impl_catalog_record_family!(OrderExpired, "order_expired");
+impl_catalog_record_family!(OrderTriggered, "order_triggered");
+impl_catalog_record_family!(OrderPendingUpdate, "order_pending_update");
+impl_catalog_record_family!(OrderReleased, "order_released");
+impl_catalog_record_family!(OrderModifyRejected, "order_modify_rejected");
+impl_catalog_record_family!(OrderUpdated, "order_updated");
+impl_catalog_record_family!(OrderFilled, "order_filled");
+impl_catalog_record_family!(OrderFillVoided, "order_fill_voided");
+impl_catalog_record_family!(PositionOpened, "position_opened");
+impl_catalog_record_family!(PositionChanged, "position_changed");
+impl_catalog_record_family!(PositionClosed, "position_closed");
+impl_catalog_record_family!(PositionAdjusted, "position_adjusted");
+impl_catalog_record_family!(OrderSnapshot, "order_snapshot");
+impl_catalog_record_family!(PositionSnapshot, "position_snapshot");
 impl_catalog_path_prefix!(PortfolioSnapshot, "portfolio_snapshot");
 
-impl_catalog_path_prefix!(FillReport, "fill_report");
-impl_catalog_path_prefix!(OrderStatusReport, "order_status_report");
-impl_catalog_path_prefix!(PositionStatusReport, "position_status_report");
-impl_catalog_path_prefix!(ExecutionMassStatus, "execution_mass_status");
+impl_catalog_record_family!(FillReport, "fill_report");
+impl_catalog_record_family!(OrderStatusReport, "order_status_report");
+impl_catalog_record_family!(PositionStatusReport, "position_status_report");
+impl_catalog_record_family!(ExecutionMassStatus, "execution_mass_status");
 
 impl NautilusDataTypePrefix for NautilusDataType {
     fn path_prefix(&self) -> Cow<'static, str> {
@@ -730,6 +825,69 @@ mod tests {
         assert_eq!(
             CatalogDataType::from(NautilusInstrumentType::Equity),
             CatalogDataType::Instrument(NautilusInstrumentType::Equity)
+        );
+    }
+
+    #[rstest]
+    #[case::data(CatalogDataType::Data(NautilusDataType::QuoteTick), "quotes")]
+    #[case::custom(
+        CatalogDataType::Data(NautilusDataType::Custom {
+            type_name: "Signal".to_string(),
+        }),
+        "custom/Signal",
+    )]
+    #[case::record(
+        CatalogDataType::Record(NautilusRecordType::AccountState),
+        "record/account_state"
+    )]
+    #[case::instrument(
+        CatalogDataType::Instrument(NautilusInstrumentType::CurrencyPair),
+        "instrument/currency_pair"
+    )]
+    fn catalog_data_type_path_prefix_round_trips(
+        #[case] catalog_type: CatalogDataType,
+        #[case] prefix: &str,
+    ) {
+        assert_eq!(catalog_data_type_path_prefix(&catalog_type), prefix);
+        assert_eq!(catalog_data_type_from_path(prefix).unwrap(), catalog_type);
+    }
+
+    #[rstest]
+    fn catalog_data_type_path_prefix_round_trips_every_family() {
+        let mut catalog_types = NautilusRecordType::iter()
+            .map(CatalogDataType::Record)
+            .chain(NautilusInstrumentType::iter().map(CatalogDataType::Instrument))
+            .collect::<Vec<_>>();
+
+        macro_rules! push_data_types {
+            ($(($variant:ident, $type:ident, $data:ident, $batch:ident, $prefix:literal)),+ $(,)?) => {
+                $(catalog_types.push(CatalogDataType::Data(NautilusDataType::$variant));)+
+            };
+        }
+        nautilus_model::for_each_data_type!(push_data_types);
+
+        // DeFi data exists whenever the model enables DeFi, even without this crate's feature
+        if let Ok(defi) = "Defi".parse::<NautilusDataType>() {
+            catalog_types.push(CatalogDataType::Data(defi));
+        }
+
+        for catalog_type in catalog_types {
+            let prefix = catalog_data_type_path_prefix(&catalog_type);
+            assert_eq!(
+                catalog_data_type_from_path(&prefix).unwrap(),
+                catalog_type,
+                "{prefix}"
+            );
+        }
+    }
+
+    #[rstest]
+    fn catalog_data_type_from_path_rejects_unknown_shared_table_record() {
+        let error = catalog_data_type_from_path("record/not_a_type").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid `NautilusRecordType`: 'not_a_type'"
         );
     }
 

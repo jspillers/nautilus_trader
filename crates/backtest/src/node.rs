@@ -26,7 +26,11 @@ use nautilus_model::{
     types::Money,
 };
 use nautilus_persistence::{
-    catalog::traits::{CatalogInstrumentQuery, CatalogQuery, DataCatalog},
+    backend::default_catalog_factories,
+    catalog::{
+        factory as catalog_factory,
+        traits::{CatalogInstrumentQuery, CatalogQuery, DataCatalog},
+    },
     config::DataCatalogConfig,
 };
 
@@ -52,6 +56,7 @@ use crate::{
 pub struct BacktestNode {
     configs: Vec<BacktestRunConfig>,
     engines: AHashMap<String, BacktestEngine>,
+    disposed: bool,
 }
 
 impl BacktestNode {
@@ -71,6 +76,7 @@ impl BacktestNode {
         Ok(Self {
             configs,
             engines: AHashMap::new(),
+            disposed: false,
         })
     }
 
@@ -86,12 +92,17 @@ impl BacktestNode {
     /// instruments from the catalog. If building a config fails with
     /// [`BacktestRunConfig::raise_exception`] disabled, logs the error and skips that config;
     /// successful return does not guarantee an engine for every config.
+    /// A disposed node cannot be built again; create a new node instead.
     ///
     /// # Errors
     ///
-    /// Returns an error if building an engine from a config fails and
-    /// [`BacktestRunConfig::raise_exception`] is enabled for that config.
+    /// Returns an error if:
+    /// - This node has been disposed.
+    /// - Building an engine from a config fails and
+    ///   [`BacktestRunConfig::raise_exception`] is enabled for that config.
     pub fn build(&mut self) -> anyhow::Result<()> {
+        self.ensure_not_disposed()?;
+
         for config in &self.configs {
             if self.engines.contains_key(config.id()) {
                 continue;
@@ -137,12 +148,18 @@ impl BacktestNode {
     /// Configs without a built engine are skipped. If a run fails with
     /// [`BacktestRunConfig::raise_exception`] disabled, logs the error, clears its loaded data,
     /// leaves the engine undisposed, and omits its result.
+    /// A node disposed by a completed run or by [`dispose()`](Self::dispose)
+    /// cannot run again; create a new node instead.
     ///
     /// # Errors
     ///
-    /// Returns an error if building, data loading, or engine execution fails and
-    /// [`BacktestRunConfig::raise_exception`] is enabled for the run config.
+    /// Returns an error if:
+    /// - This node has been disposed.
+    /// - Building, data loading, or engine execution fails and
+    ///   [`BacktestRunConfig::raise_exception`] is enabled for the run config.
     pub fn run(&mut self) -> anyhow::Result<Vec<BacktestResult>> {
+        self.ensure_not_disposed()?;
+
         // Auto-build if not already done
         if self.engines.is_empty() {
             self.build()?;
@@ -174,6 +191,7 @@ impl BacktestNode {
 
             if config.dispose_on_completion() {
                 engine.dispose();
+                self.disposed = true;
             } else {
                 engine.clear_data();
             }
@@ -205,11 +223,23 @@ impl BacktestNode {
     }
 
     /// Disposes all engines and releases resources.
+    /// Subsequent calls to [`run()`](Self::run) or [`build()`](Self::build)
+    /// return an error; create a new node to run again.
     pub fn dispose(&mut self) {
+        self.disposed = true;
+
         for engine in self.engines.values_mut() {
             engine.dispose();
         }
         self.engines.clear();
+    }
+
+    fn ensure_not_disposed(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.disposed,
+            "BacktestNode has been disposed; create a new BacktestNode to run again"
+        );
+        Ok(())
     }
 }
 
@@ -549,7 +579,7 @@ fn take_aligned_chunk<I: Iterator<Item = anyhow::Result<Data>>>(
 }
 
 fn create_catalog(config: &BacktestDataConfig) -> anyhow::Result<DataCatalog> {
-    DataCatalogConfig::new(
+    let catalog_config = DataCatalogConfig::new(
         config.catalog_path().to_string(),
         config.catalog_fs_protocol().map(str::to_string),
         Some(config.catalog_backend()),
@@ -559,8 +589,12 @@ fn create_catalog(config: &BacktestDataConfig) -> anyhow::Result<DataCatalog> {
             .catalog_fs_rust_storage_options()
             .cloned()
             .or_else(|| config.catalog_fs_storage_options().cloned()),
+    );
+    catalog_factory::create_catalog(
+        catalog_config.catalog_backend(),
+        &catalog_config.connect_config(),
+        &default_catalog_factories(),
     )
-    .create_catalog()
 }
 
 fn load_data(

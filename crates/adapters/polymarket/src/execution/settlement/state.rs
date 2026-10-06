@@ -80,6 +80,9 @@ pub(crate) enum LegApplication {
 /// still permits application when it drains. A `report_routed` leg was delivered through a fill
 /// report for an order without captured context, so its application, if core performs it, is
 /// observed through applied events rather than awaited.
+///
+/// Venue evidence remains comparable after core application; reconstructed core events may
+/// contain normalized quantities and cannot establish the original stream economics.
 #[derive(Debug)]
 pub(crate) struct SettlementLeg {
     pub venue_order_id: VenueOrderId,
@@ -96,6 +99,7 @@ pub(crate) struct SettlementLeg {
     pub applied_fill: Option<Box<OrderFilled>>,
     pub authorized: bool,
     pub report_routed: bool,
+    pub venue_evidence: bool,
 }
 
 impl SettlementLeg {
@@ -114,6 +118,7 @@ impl SettlementLeg {
             applied_fill: None,
             authorized: false,
             report_routed: false,
+            venue_evidence: true,
         }
     }
 
@@ -143,6 +148,8 @@ pub(crate) enum SettlementAction {
 pub(crate) enum UncertainOrderKind {
     /// The submit outcome is unknown.
     Submit,
+    /// The local order closed before its submit resolved; venue cancellation and trades remain due.
+    SubmitClosed,
     /// The order was live while the user stream was disconnected, and the stream does not replay
     /// trades missed during the outage.
     StreamGap,

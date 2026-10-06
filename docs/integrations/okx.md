@@ -620,10 +620,14 @@ The list is retained from instrument definitions, including
 #### Account activation
 
 :::warning
-Before trading a `Crypto-USDC` instrument, call `OKXHttpClient.activate_feature("1")`
-once per master account and once per sub-account to enable USDC order book trading, if
-that account has not already traded USDC. The adapter never activates accounts
-implicitly.
+Call `OKXHttpClient.activate_feature("1")` to enable USDC order book trading only after OKX
+rejects a `Crypto-USDC` order with error code `54109`, then submit the order again.
+Activation is shared between a master account and its sub-accounts, so one successful call
+from any of them covers all of them. The adapter never activates accounts implicitly.
+
+Error code `51773` from `activate_feature` means OKX does not support activation for the
+account. It does not mean USDC trading is unavailable; a successful order confirms that
+the account can trade the instrument.
 :::
 
 ### Client order ID requirements
@@ -744,6 +748,18 @@ the Rust configuration option `use_mm_mass_cancel` is `true`.
 Side-filtered cancellation excludes orders absent from the cache and orders still in `SUBMITTED` state.
 Without a side filter, ordinary non-spread cancellation also uses cached open orders by default;
 spread instruments and the Rust mass-cancel option use venue bulk endpoints.
+
+### Rejection reasons
+
+When OKX rejects an order, modify, or cancel request with an error code, the `reason` on
+`OrderRejected`, `OrderModifyRejected`, or `OrderCancelRejected` has the form
+`OKX error <code>: <message>`, for example `OKX error 51000: Parameter instId error`. A WebSocket
+response without a message produces `OKX error <code>` alone, and one that also carries a
+`subCode` appends it as `(subCode=<code>)`. A conditional order that fails after acceptance
+reports only its code, such as `OKX error 51008`, because OKX sends only a `failCode`.
+
+Rejections the adapter raises before contacting OKX, such as local validation failures, carry
+the adapter's own message and no OKX error code.
 
 ### Position management
 
@@ -1270,6 +1286,7 @@ available.
 | --------------------------------------- | --------------- | ----------------------------------------- |
 | `okx:global`                            | 250             | Adapter-level shared bucket.              |
 | `/api/v5/account/set-position-mode`     | 2               | OKX 5 requests / 2 seconds, rounded down. |
+| `/api/v5/account/activate-feature`      | 2               | OKX 5 requests / 2 seconds, rounded down. |
 | `/api/v5/account/balance`               | 5               | OKX 10 requests / 2 seconds.              |
 | `/api/v5/account/trade-fee`             | 2               | OKX 5 requests / 2 seconds, rounded down. |
 | `/api/v5/account/instruments`           | 10              | OKX 20 requests / 2 seconds.              |
@@ -1372,6 +1389,36 @@ the whole position when it triggers. REST order status reports use the size of t
 OKX links to the order through `closeOrderAlgo`. Without a linked position, the report keeps a zero
 quantity and the adapter logs a warning. Reconciliation does not load an external order with zero
 quantity.
+
+### Unacknowledged submissions
+
+OKX defines `50004` and `51149` as [unknown request outcomes](https://my.okx.com/docs-v5/en/#error-code).
+The adapter leaves these submissions unresolved, but the default execution policy can still resolve
+them locally when reconciliation checks exhaust. OKX does not enable submission retention automatically.
+
+To retain unacknowledged submissions, including those with no response, select the existing engine
+policy when constructing the node:
+
+```rust
+use nautilus_live::{
+    config::LiveExecutionEngineConfig,
+    execution::submission::SubmissionRecoveryPolicy,
+};
+
+let exec_engine = LiveExecutionEngineConfig {
+    submission_recovery_policy: SubmissionRecoveryPolicy::RetainUnresolved,
+    ..Default::default()
+};
+```
+
+This is a node execution-engine policy, not an OKX client setting. Recovery queries remain bounded;
+exhaustion publishes `SubmissionRecoveryExhausted` once and preserves the submission identity for
+later authoritative evidence without resubmitting the order. See
+[submission recovery](../concepts/execution/reconciliation.md#submission-recovery)
+for confirmation and query-budget rules. Retained submissions still unresolved at the node's
+`delay_post_stop` boundary produce an [incomplete-recovery shutdown error](../concepts/live.md#submission-recovery-at-shutdown)
+after teardown. The policy does not change timeout resolution for commands on already accepted
+orders, provide crash-durable recovery, or prove that positions are flat.
 
 ## Configuration
 

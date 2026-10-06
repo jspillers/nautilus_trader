@@ -311,7 +311,10 @@ pub trait Instrument: 'static + Send {
     }
 
     fn allows_negative_price(&self) -> bool {
-        self.instrument_class().allows_negative_price()
+        // Inverse valuation divides by price, so it requires a positive price
+        let instrument_class = self.instrument_class();
+        instrument_class.allows_negative_price()
+            && !instrument_class.divides_notional_by_price(self.is_inverse())
     }
 
     fn is_inverse(&self) -> bool;
@@ -771,7 +774,7 @@ pub(crate) fn try_notional_value(
 ) -> anyhow::Result<Money> {
     let amount = if is_inverse && use_quote_for_inverse {
         quantity.as_decimal()
-    } else if is_inverse && !instrument_class.is_premium_based() {
+    } else if instrument_class.divides_notional_by_price(is_inverse) {
         anyhow::ensure!(
             price.is_positive(),
             "price must be positive for inverse notional valuation"
@@ -2240,5 +2243,27 @@ mod tests {
         #[case] expected: bool,
     ) {
         assert_eq!(instrument_class.has_expiration(), expected);
+    }
+
+    #[rstest]
+    #[case::linear(false, true)]
+    #[case::inverse(true, false)]
+    fn test_crypto_future_allows_negative_price(
+        mut crypto_future_btcusdt: CryptoFuture,
+        #[case] is_inverse: bool,
+        #[case] expected: bool,
+    ) {
+        crypto_future_btcusdt.is_inverse = is_inverse;
+
+        assert_eq!(crypto_future_btcusdt.allows_negative_price(), expected);
+    }
+
+    #[rstest]
+    fn test_inverse_crypto_option_allows_negative_price(
+        mut crypto_option_btc_deribit: CryptoOption,
+    ) {
+        crypto_option_btc_deribit.is_inverse = true;
+
+        assert!(crypto_option_btc_deribit.allows_negative_price());
     }
 }

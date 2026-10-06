@@ -24,6 +24,7 @@ LYCHEE_VERSION := $(shell bash scripts/cargo-tool-version.sh lychee)
 PREK_VERSION := $(shell bash scripts/tool-version.sh prek)
 NIGHTLY_TOOLCHAIN := $(shell bash scripts/tool-version.sh miri) # Pinned nightly, shared with Miri
 DOCSRS_TOOLCHAIN := $(shell bash scripts/tool-version.sh nightly)
+SOCKET_CLI_VERSION := $(shell bash scripts/tool-version.sh socket-cli)
 UV_VERSION := $(shell bash scripts/uv-version.sh)
 UV_REQUIRED_SPEC := $(shell awk -F'"' '\
 	/^\[tool\.uv\]/ { in_section=1; next } \
@@ -568,6 +569,7 @@ outdated: check-edit-installed  #-- Check for outdated dependencies
 .PHONY: update
 update: cargo-update update-uv  #-- Update all dependencies (cargo and uv)
 	$Q cd python && VIRTUAL_ENV= uv lock --upgrade
+	$Q $(MAKE) --no-print-directory socket-scan
 
 .PHONY: update-uv
 update-uv:  #-- Install or upgrade uv to the version pinned in the shared tool catalog
@@ -611,6 +613,18 @@ cargo-deny: check-deny-installed  #-- Run cargo-deny checks (advisories, sources
 .PHONY: cargo-vet
 cargo-vet: check-vet-installed  #-- Run cargo-vet supply chain audit
 	cargo vet
+
+.PHONY: socket-scan
+socket-scan:  #-- Scan dependency manifests with Socket and report alerts without failing
+	$(info $(M) Running Socket scan...)
+	@if ! command -v socket >/dev/null 2>&1; then \
+		printf "$(YELLOW)Skipping Socket scan: socket CLI is not installed$(RESET)\n"; \
+		printf "Install with: $(CYAN)npm install -g @socketsecurity/cli@%s$(RESET), then run $(CYAN)socket login$(RESET)\n" \
+			"$(SOCKET_CLI_VERSION)"; \
+	elif ! socket scan create . --repo=nautilus_trader --branch=local --exclude-paths=target \
+		--no-interactive --report --markdown; then \
+		printf "$(YELLOW)Socket scan found error-level alerts or could not run; see the output above$(RESET)\n"; \
+	fi
 
 #== Documentation
 
@@ -865,6 +879,7 @@ test-scripts:  #-- Run repository script tests
 	$(info $(M) Running script tests...)
 	$Q bash .pre-commit-hooks/test_cargo_machete.sh
 	$Q bash .pre-commit-hooks/test_check_cargo_conventions.sh
+	$Q bash .pre-commit-hooks/test_check_copyright_year.bash
 	$Q python3 -B .pre-commit-hooks/test_check_dependency_features.py
 	$Q bash .pre-commit-hooks/test_check_docs_conventions.sh
 	$Q bash .pre-commit-hooks/test_check_dst_conventions.sh
@@ -1366,6 +1381,15 @@ init-db:  #-- Initialize PostgreSQL database schema
 
 PYTHON_TEST_ENV = PYTHONWARNDEFAULTENCODING=1 PYTHONWARNINGS="$(if $(PYTHONWARNINGS),$(PYTHONWARNINGS)$(comma))error::EncodingWarning,ignore::EncodingWarning:plotly.validator_cache"
 
+# `pytest -n logical` reads this pytest-xdist worker count, capped by host CPU count like the
+# Rust defaults. Override with PYTEST_XDIST_AUTO_NUM_WORKERS when needed
+ifeq ($(origin PYTEST_XDIST_AUTO_NUM_WORKERS),undefined)
+export PYTEST_XDIST_AUTO_NUM_WORKERS := $(shell \
+	n='$(HOST_CPU_COUNT)'; \
+	[ "$$n" -gt 32 ] && n=32; \
+	printf '%s' "$$n")
+endif
+
 .PHONY: pytest-collect-fast
 pytest-collect-fast:  #-- Collect Python tests against the existing extension
 	@if [ -z "$(PYTHON_EXTENSION_PATH)" ]; then \
@@ -1378,7 +1402,7 @@ pytest-collect-fast:  #-- Collect Python tests against the existing extension
 .PHONY: pytest
 pytest: build-debug  #-- Run Python tests
 	$(info $(M) Running Python tests...)
-	$Q cd python && $(PYTHON_TEST_ENV) VIRTUAL_ENV= uv run --no-sync pytest -qq -rfE tests/ --ignore=tests/unit/test_live_node.py
+	$Q cd python && $(PYTHON_TEST_ENV) VIRTUAL_ENV= uv run --no-sync pytest -qq -rfE -n logical tests/ --ignore=tests/unit/test_live_node.py
 	$Q cd python && $(PYTHON_TEST_ENV) VIRTUAL_ENV= uv run --no-sync pytest -qq -rfE tests/unit/test_live_node.py
 
 .PHONY: pytest-isolated

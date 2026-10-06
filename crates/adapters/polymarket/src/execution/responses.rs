@@ -35,7 +35,7 @@ use rust_decimal::Decimal;
 use super::{
     cancellations::execute_deferred_cancel,
     context::OrderContextRegistry,
-    order_fill_tracker::{BufferedFill, OrderFillTrackerMap},
+    fill_tracker::{BufferedFill, OrderFillTrackerMap},
     pending::{PendingCancelTracker, PendingSubmitTracker},
     reconciliation::{cap_order_report_filled_qty, validate_client_bound_order_quantity},
     reports::get_pusd_currency,
@@ -131,7 +131,7 @@ pub(super) async fn handle_batch_order_responses(
         };
 
         if deferred_cancel.is_some() || fok_order_id.is_some() {
-            follow_ups.push((batch_order.clone(), deferred_cancel, fok_order_id));
+            follow_ups.push((batch_order, deferred_cancel, fok_order_id));
         }
     }
 
@@ -158,7 +158,7 @@ pub(super) async fn handle_batch_order_responses(
         );
 
         if deferred_cancel.is_some() {
-            follow_ups.push((batch_order.clone(), deferred_cancel, None));
+            follow_ups.push((batch_order, deferred_cancel, None));
         }
     }
 
@@ -338,13 +338,16 @@ pub(super) fn confirm_modify_replacement(
         promotion.venue_order_id,
         Some(promotion.client_order_id),
         promotion.leg_quantity,
+        promotion.quantity.saturating_sub(promotion.leg_quantity),
         context.identity.order_side,
     );
     let buffered = fill_tracker.take_pending_reports(&promotion.venue_order_id);
-    for report in buffered
-        .iter()
-        .filter(|report| report.order_status == OrderStatus::Canceled)
-    {
+    for report in buffered.iter().filter(|report| {
+        matches!(
+            report.order_status,
+            OrderStatus::Canceled | OrderStatus::Expired
+        )
+    }) {
         state.record_terminal_cancel_report(report.clone());
     }
 
@@ -483,7 +486,7 @@ pub(super) fn handle_unknown_submit_result(
         expected_venue_order_id
     );
 
-    order_contexts.register_context(expected_venue_order_id, OrderContext::from(order));
+    order_contexts.recover_context(expected_venue_order_id, OrderContext::from(order));
     pending_submits.insert(expected_venue_order_id, order.client_order_id());
 
     drain_pending_reports_for_known_order(
@@ -559,6 +562,7 @@ pub(super) fn drain_pending_reports_for_known_order(
             venue_order_id,
             Some(order.client_order_id()),
             tracker_quantity,
+            Quantity::zero(tracker_quantity.precision),
             order.order_side(),
         )
     } else {
@@ -665,7 +669,7 @@ pub(super) fn handle_order_response(
                     let decision = order_response_decision(response.status);
                     let ts_now = clock.get_time_ns();
 
-                    order_contexts.register_context(venue_order_id, OrderContext::from(order));
+                    order_contexts.recover_context(venue_order_id, OrderContext::from(order));
                     settlement.note_order_accepted(
                         expected_venue_order_id,
                         venue_order_id,
@@ -681,6 +685,7 @@ pub(super) fn handle_order_response(
                         venue_order_id,
                         Some(order.client_order_id()),
                         order.quantity(),
+                        Quantity::zero(order.quantity().precision),
                         order.order_side(),
                     );
 
@@ -1211,7 +1216,7 @@ mod tests {
             PolymarketOrderStatus, PolymarketOutcome, PolymarketTradeStatus,
         },
         execution::{
-            order_fill_tracker::FillCorrectionMetadata,
+            fill_tracker::FillCorrectionMetadata,
             reconciliation::FillReportScope,
             settlement::{
                 AdmittedLeg, TradeEvidence, admission::AdmittedTrade, admit_trade_evidence,
@@ -1407,25 +1412,25 @@ mod tests {
         }
     }
 
+    // The replacement venue order carries 100 of a 120 order, so a BUY overfill on it raises the
+    // order quantity by the overfill rather than to the replacement's own fills.
     #[rstest]
-    fn test_confirm_modify_replacement_preserves_shared_context() {
+    fn test_confirm_modify_replacement_bumps_order_level_qty() {
         let instrument = test_instrument();
-        let order = test_limit_order("O-CONTEXT-REPLACE", instrument.id());
-        let old_id = VenueOrderId::from("V-CONTEXT-OLD");
-        let new_id = VenueOrderId::from("V-CONTEXT-NEW");
-        let original = OrderContext::from(&order);
+        let order = test_limit_order("O-REPLACE-OVERFILL", instrument.id());
+        let old_id = VenueOrderId::from("V-REPLACE-OLD");
+        let new_id = VenueOrderId::from("V-REPLACE-NEW");
         let registry = OrderContextRegistry::default();
-        registry.register_context(old_id, original);
-        let quantity = Quantity::from("12.34");
-        let price = Price::from("0.6789");
+        registry.register_context(old_id, OrderContext::from(&order));
+        registry.mark_accepted(old_id);
         let mut state = WsDispatchState::default();
         assert!(state.begin_modify(order.client_order_id(), old_id, instrument.id()));
         assert!(state.set_modify_replacement(
             order.client_order_id(),
             new_id,
-            quantity,
-            Quantity::from("9.87"),
-            price,
+            Quantity::from("120.000000"),
+            Quantity::from("100.000000"),
+            Price::from("0.5000"),
         ));
         let state = Arc::new(Mutex::new(state));
         let tracker = Arc::new(OrderFillTrackerMap::new());
@@ -1442,8 +1447,99 @@ mod tests {
             &registry,
             &state,
         );
+        tracker.record_fill(&new_id, Quantity::from("100.000058"));
+        let bumped = tracker.buy_overfill_bump(&new_id);
 
         assert!(promoted);
+        assert_eq!(bumped, Some(Quantity::from("120.000058")));
+    }
+
+    #[rstest]
+    fn test_confirm_modify_replacement_preserves_shared_context(
+        #[values(None, Some(false), Some(true))] late_submit_success: Option<bool>,
+    ) {
+        let instrument = test_instrument();
+        let order = test_limit_order("O-CONTEXT-REPLACE", instrument.id());
+        let old_id = VenueOrderId::from("V-CONTEXT-OLD");
+        let new_id = VenueOrderId::from("V-CONTEXT-NEW");
+        let original = OrderContext::from(&order);
+        let registry = OrderContextRegistry::default();
+        registry.register_context(old_id, original);
+        registry.mark_accepted(old_id);
+        let quantity = Quantity::from("12.34");
+        let price = Price::from("0.6789");
+        let mut state = WsDispatchState::default();
+        assert!(state.begin_modify(order.client_order_id(), old_id, instrument.id()));
+        assert!(state.set_modify_replacement(
+            order.client_order_id(),
+            new_id,
+            quantity,
+            Quantity::from("9.87"),
+            price,
+        ));
+        let state = Arc::new(Mutex::new(state));
+        let tracker = Arc::new(OrderFillTrackerMap::new());
+        let settlement = SettlementRegistry::new(AccountId::from("POLY-001"));
+        let (emitter, mut receiver) = test_emitter();
+
+        let promoted = confirm_modify_replacement(
+            &order,
+            new_id,
+            &emitter,
+            nautilus_core::time::get_atomic_clock_realtime(),
+            &tracker,
+            &settlement,
+            &registry,
+            &state,
+        );
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ExecutionEvent::Order(OrderEventAny::Updated(_)))
+        ));
+        let pending_cancels = PendingCancelTracker::default();
+        let clock = nautilus_core::time::get_atomic_clock_realtime();
+
+        let deferred = match late_submit_success {
+            Some(true) => handle_order_response(
+                Ok(successful_order_response(
+                    old_id,
+                    Some(OrderResponseStatus::Live),
+                )),
+                &order,
+                old_id,
+                &emitter,
+                clock,
+                &tracker,
+                &settlement,
+                &registry,
+                &pending_cancels,
+                AccountId::from("POLY-001"),
+                instrument.size_precision(),
+                instrument.price_precision(),
+            ),
+            Some(false) => handle_unknown_submit_result(
+                &order,
+                old_id,
+                "submit response timed out after replacement",
+                None,
+                &emitter,
+                clock,
+                &tracker,
+                &settlement,
+                &registry,
+                &PendingSubmitTracker::default(),
+                &pending_cancels,
+                AccountId::from("POLY-001"),
+                instrument.size_precision(),
+                instrument.price_precision(),
+            ),
+            None => None,
+        };
+
+        assert!(promoted);
+        assert!(deferred.is_none());
+        assert!(receiver.try_recv().is_err());
         assert_eq!(registry.get(&old_id), Some(original));
         assert_eq!(
             registry.get(&new_id),
@@ -1928,6 +2024,9 @@ mod tests {
             api_key: "00000000-0000-0000-0000-000000000001",
             pusd: Currency::pUSD(),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
+            settlement: std::sync::Arc::new(crate::execution::settlement::SettlementRegistry::new(
+                AccountId::from("POLY-001"),
+            )),
         };
 
         let (reports, _) = crate::execution::reconciliation::build_fill_reports_from_trades(
@@ -1973,6 +2072,9 @@ mod tests {
             api_key: "ffffffff-ffff-ffff-ffff-ffffffffffff",
             pusd: Currency::pUSD(),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
+            settlement: std::sync::Arc::new(crate::execution::settlement::SettlementRegistry::new(
+                AccountId::from("POLY-001"),
+            )),
         };
 
         let (reports, discards) = crate::execution::reconciliation::build_fill_reports_from_trades(
@@ -2022,6 +2124,9 @@ mod tests {
             api_key: foreign_api_key,
             pusd: Currency::pUSD(),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
+            settlement: std::sync::Arc::new(crate::execution::settlement::SettlementRegistry::new(
+                AccountId::from("POLY-001"),
+            )),
         };
 
         let (reports, discards) = crate::execution::reconciliation::build_fill_reports_from_trades(
@@ -2064,6 +2169,9 @@ mod tests {
             api_key: "00000000-0000-0000-0000-000000000001",
             pusd: Currency::pUSD(),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
+            settlement: std::sync::Arc::new(crate::execution::settlement::SettlementRegistry::new(
+                AccountId::from("POLY-001"),
+            )),
         };
 
         let (reports, discards) = crate::execution::reconciliation::build_fill_reports_from_trades(
@@ -2107,6 +2215,9 @@ mod tests {
             api_key: "ffffffff-ffff-ffff-ffff-ffffffffffff",
             pusd: Currency::pUSD(),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
+            settlement: std::sync::Arc::new(crate::execution::settlement::SettlementRegistry::new(
+                AccountId::from("POLY-001"),
+            )),
         };
 
         let (reports, discards) = crate::execution::reconciliation::build_fill_reports_from_trades(
@@ -2153,6 +2264,9 @@ mod tests {
             api_key: "00000000-0000-0000-0000-000000000001",
             pusd: Currency::pUSD(),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
+            settlement: std::sync::Arc::new(crate::execution::settlement::SettlementRegistry::new(
+                AccountId::from("POLY-001"),
+            )),
         };
 
         let (maker_reports, _) = crate::execution::reconciliation::build_fill_reports_from_trades(
@@ -2215,6 +2329,9 @@ mod tests {
             api_key: "ffffffff-ffff-ffff-ffff-ffffffffffff",
             pusd: Currency::pUSD(),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
+            settlement: std::sync::Arc::new(crate::execution::settlement::SettlementRegistry::new(
+                AccountId::from("POLY-001"),
+            )),
         };
 
         let build = |scope| {
@@ -2270,6 +2387,9 @@ mod tests {
             api_key: "00000000-0000-0000-0000-000000000001",
             pusd: Currency::pUSD(),
             clock: nautilus_core::time::get_atomic_clock_realtime(),
+            settlement: std::sync::Arc::new(crate::execution::settlement::SettlementRegistry::new(
+                AccountId::from("POLY-001"),
+            )),
         };
 
         let result = crate::execution::reconciliation::build_fill_reports_from_trades(
@@ -2456,6 +2576,15 @@ mod tests {
             other => panic!("expected accepted event, was {other:?}"),
         }
 
+        // The drained BUY overfill raises the quantity to the venue fill first.
+        match receiver.try_recv().expect("expected overfill update") {
+            ExecutionEvent::Order(OrderEventAny::Updated(event)) => {
+                assert_eq!(event.client_order_id, order.client_order_id());
+                assert_eq!(event.quantity, Quantity::new(18.181, 3));
+            }
+            other => panic!("expected updated event, was {other:?}"),
+        }
+
         // The drained own-order fill emits an OrderFilled event, not a report.
         let fill = receiver.try_recv().expect("expected filled event");
         match fill {
@@ -2463,7 +2592,7 @@ mod tests {
                 assert_eq!(event.client_order_id, order.client_order_id());
                 assert_eq!(event.venue_order_id, venue_order_id);
                 assert_eq!(event.order_side, OrderSide::Buy);
-                assert_eq!(event.last_qty, Quantity::new(18.180, 3));
+                assert_eq!(event.last_qty, Quantity::new(18.181, 3));
             }
             other => panic!("expected filled event, was {other:?}"),
         }
@@ -2471,7 +2600,7 @@ mod tests {
         assert!(fill_tracker.contains(&venue_order_id));
         assert_eq!(
             fill_tracker.get_cumulative_filled(&venue_order_id),
-            Some(Quantity::new(18.18, 3))
+            Some(Quantity::new(18.181, 3))
         );
         assert!(!fill_tracker.has_pending_fill(&venue_order_id));
     }

@@ -190,6 +190,13 @@ fn spot_quote_priority(symbol: &str) -> u8 {
     })
 }
 
+// OKX omits `data` from gateway errors such as authentication failures
+#[derive(Deserialize)]
+struct OKXErrorEnvelope {
+    code: String,
+    msg: String,
+}
+
 fn resolve_okx_error_code(response_body: &[u8], envelope_code: &str) -> String {
     if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(response_body)
         && let Some(s_code) = payload
@@ -304,6 +311,8 @@ fn retry_after(headers: &HashMap<String, String>, now: Timestamp) -> Option<Dura
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use anyhow::Context;
     use nautilus_testkit::http::assert_http_redirect_rejected;
     use rstest::rstest;
@@ -401,6 +410,18 @@ mod tests {
         }"#;
 
         assert_eq!(resolve_okx_error_code(body, "1"), "50013");
+    }
+
+    #[rstest]
+    fn test_activate_feature_quota_fits_five_per_two_seconds() {
+        let keys = OKXRawHttpClient::rate_limit_keys("/api/v5/account/activate-feature");
+        let quota = OKXRawHttpClient::rate_limiter_quotas()
+            .into_iter()
+            .find_map(|(key, quota)| (key == keys[1].as_str()).then_some(quota))
+            .expect("activate-feature quota");
+
+        assert_eq!(quota.burst_size().get(), 2);
+        assert_eq!(quota.replenish_interval(), Duration::from_millis(500));
     }
 
     #[rstest]
@@ -632,7 +653,7 @@ impl OKXRawHttpClient {
             ),
             (
                 "okx:/api/v5/account/activate-feature".to_string(),
-                Quota::per_second(NonZeroU32::new(3).expect("non-zero")).expect("valid constant"),
+                Quota::per_second(NonZeroU32::new(2).expect("non-zero")).expect("valid constant"),
             ),
             (
                 "okx:/api/v5/account/balance".to_string(),
@@ -1094,9 +1115,9 @@ impl OKXRawHttpClient {
                         );
                     }
 
-                    if let Ok(parsed_error) = deserialize_okx_response::<T>(&resp.body) {
-                        let error_code = resolve_okx_error_code(&resp.body, &parsed_error.code);
-                        let message = resolve_okx_error_message(&resp.body, &parsed_error.msg);
+                    if let Ok(envelope) = serde_json::from_slice::<OKXErrorEnvelope>(&resp.body) {
+                        let error_code = resolve_okx_error_code(&resp.body, &envelope.code);
+                        let message = resolve_okx_error_message(&resp.body, &envelope.msg);
                         return Err(OKXHttpError::from_venue_response(
                             error_code,
                             message,
@@ -1191,9 +1212,11 @@ impl OKXRawHttpClient {
 
     /// Activates an account feature such as USDC order book trading.
     ///
-    /// Activation is one-time per master account and per sub-account. This method
-    /// does not run implicitly; callers must invoke it before trading a
-    /// `Crypto-USDC` instrument if the account has not already traded USDC.
+    /// This method does not run implicitly. Call it only after order placement
+    /// returns error code `54109`. Activation is shared between a master account and
+    /// its sub-accounts, so one successful call covers all of them. Error code
+    /// `51773` means the account does not support activation, not that USDC trading
+    /// is unavailable.
     ///
     /// # Errors
     ///
@@ -1837,6 +1860,9 @@ impl OKXRawHttpClient {
     /// Requests fee rates for the account.
     ///
     /// Returns fee rates for the specified instrument type and the user's VIP level.
+    /// Incentive-program rates require `inst_id` for SPOT/MARGIN or `inst_family` for
+    /// FUTURES/SWAP/OPTION; a `group_id` query alone does not provide equivalent rates.
+    /// Fee selection remains with the caller. The endpoint does not reflect zero-fee promotions.
     ///
     /// # Errors
     ///
@@ -1849,6 +1875,12 @@ impl OKXRawHttpClient {
         &self,
         params: GetTradeFeeParams,
     ) -> Result<Vec<OKXFeeRate>, OKXHttpError> {
+        if params.group_id.is_some() && (params.inst_id.is_some() || params.inst_family.is_some()) {
+            return Err(OKXHttpError::ValidationError(
+                "group_id cannot be combined with inst_id or inst_family".to_string(),
+            ));
+        }
+
         self.send_request(
             Method::GET,
             "/api/v5/account/trade-fee",
@@ -2512,9 +2544,12 @@ impl OKXHttpClient {
 
     /// Activates an account feature such as USDC order book trading.
     ///
-    /// This does not run at client start. Call it once per master account and
-    /// once per sub-account before trading a `Crypto-USDC` instrument if that
-    /// account has not already traded USDC.
+    /// This does not run at client start. Call it only after OKX rejects a
+    /// `Crypto-USDC` order with error code `54109`. Activation is shared between a
+    /// master account and its sub-accounts, so one successful call covers all of
+    /// them. Error code `51773` means the account does not support activation, not
+    /// that USDC trading is unavailable; a successful order confirms the account can
+    /// trade the instrument.
     ///
     /// # Errors
     ///

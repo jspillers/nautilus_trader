@@ -138,21 +138,73 @@ trades and aggregating bars locally) rather than `EXTERNAL` exchange-provided ba
 
 Kraken uses different Bitcoin symbol conventions across their APIs:
 
-| Market  | Symbol Format | Example            | Notes                                       |
-| ------- | ------------- | ------------------ | ------------------------------------------- |
-| Spot    | `BTC`         | `BTC/USD.KRAKEN`   | Adapter normalizes XBT to BTC at load time. |
-| Futures | `XBT`         | `PI_XBTUSD.KRAKEN` | Uses Kraken's native XBT format.            |
+| Market  | Symbol Format | Example            | Notes                                        |
+| ------- | ------------- | ------------------ | -------------------------------------------- |
+| Spot    | `BTC`         | `BTC/USD.KRAKEN`   | Adapter normalizes XBT to BTC at load time.  |
+| Futures | `XBT`         | `PI_XBTUSD.KRAKEN` | Instrument symbols keep Kraken's native XBT. |
 
 :::note
 Kraken's REST API can return `XBT` for Bitcoin, while its WebSocket v2 API
 requires `BTC`. The adapter normalizes Spot symbols to `BTC` when loading
 instruments, whether `XBT` appears as the base currency (for example, `XBT/USD`
 to `BTC/USD`) or quote currency (for example, `ETH/XBT` to `ETH/BTC`). Futures
-retain Kraken's native `XBT` format.
+instrument symbols retain Kraken's native `XBT` format; futures currency codes do
+not, and are mapped like every other code (see Currency codes).
 :::
 
 Kraken also uses `XDG` for Dogecoin in some Spot responses. The adapter
 normalizes it to `DOGE`, including in quote currency symbols.
+
+### Currency codes
+
+Kraken reports some assets under legacy codes, prefixing them with `X` or `Z`: `XXBT` for Bitcoin,
+`ZEUR` for the euro. The adapter maps those to the standard code used everywhere else on the
+platform, so instruments, balances, fees and currency configuration all agree: `XXBT` and `XBT`
+become `BTC`, `XXDG` and `XDG` become `DOGE`, `ZEUR` becomes `EUR`, `ZUSD` becomes `USD`.
+
+The mapping is an explicit table rather than a prefix rule, because the prefix is not a rule. `XTZ`,
+`XRP`, `XLM`, `XAUT`, `ZRX` and `ZEC` legitimately begin with those letters, and a code the table
+does not list passes through unchanged. Kraken's own CLI normalizes the same way.
+
+Fees are booked in the currency the venue reports, where it reports one. Futures fills carry a fee
+currency, which on an inverse contract is the base rather than the quote. Kraken's Spot
+`TradesHistory` reports a fee amount without a currency, so those fills are booked in the
+instrument's quote currency.
+
+:::warning
+This changes the currency codes the adapter emits, in three places that previously disagreed with
+each other.
+
+Instruments carried Kraken's codes unchanged, so stored instruments were denominated in `XXBT`,
+`XETH`, `XXDG`, `ZUSD` and `ZEUR`, and so were the fills and positions that reference them. Those
+become `BTC`, `ETH`, `DOGE`, `USD` and `EUR`.
+
+Spot balances and the margin balance asset stripped one leading `X` or `Z`, so stored records carry
+`XBT` and `XDG` rather than `BTC` and `DOGE`, and the corrupted forms `TZ`, `RX` and `AUT` rather
+than `XTZ`, `ZRX` and `XAUT`. `KFEE` becomes `FEE`.
+
+Futures balances used the venue's own spelling, which differs per wallet: cash and margin wallets
+key an asset `xbt` while the flex wallet keys it `XBT`. Both become `BTC`, and `usd` becomes `USD`.
+Because the spellings now meet under one code, an asset held in several wallets is reported as one
+balance whose total and locked amounts are the sum of the wallets', each wallet's locked amount
+bounded to its own total first and the sums then reported as they are. Free can therefore be
+negative when one wallet's reservation exceeds the combined holding, which is a real shortfall
+rather than something to clamp away. Previously each wallet produced its own entry and the account
+kept whichever it read last.
+
+A cache or database written by an earlier version needs migrating or rebuilding.
+
+Configuration follows the same mapping and accepts either spelling, so
+`spot_positions_quote_currency="ZEUR"` and `"EUR"` both match a euro-quoted instrument.
+
+Money precision changes where a code now resolves to a built-in currency. `ZEUR` and `ZUSD` were
+unknown to the platform and were registered as 8-decimal crypto; `EUR` and `USD` are built-in fiat
+with 2 decimals, and `JPY` with none. That affects the instrument quote currency, REST fill
+commissions and the PnL derived from them. Account balances keep their 8-decimal precision, because
+the balance parsers construct their own currency from the code rather than resolving a registered
+one. The single exception runs the other way: the futures flex `portfolioValue` entry was built on
+the 2-decimal `USD` and now shares the 8-decimal balance currency, which widens it without loss.
+:::
 
 ### Spot markets
 
@@ -547,8 +599,18 @@ flag.
   `raw_symbol`, and the altname (`XBTEUR`). `OpenPositions` returns the key, while `OpenOrders`
   and `TradesHistory` return the altname.
 - The adapter resolves both spellings, so an order or fill on a legacy-named pair is reported.
-- An open order whose pair cannot be resolved to a cached instrument fails the read, rather than
-  being omitted from an otherwise successful one.
+- A read scoped to one instrument resolves each row and compares instrument IDs, rather than
+  comparing a cached `raw_symbol` against the venue's spelling, so a scoped read returns that
+  pair's own records whichever way Kraken spells it.
+- A read scoped to an instrument the client does not hold returns nothing. Spot and futures IDs
+  share the `KRAKEN` venue, so a futures ID can reach the spot client and the reverse; neither
+  falls back to returning every instrument's records.
+- A spot instrument whose altname differs from its `AssetPairs` key carries the altname in its
+  `info` map, so a client whose instruments arrive through `cache_instrument` or
+  `cache_instruments` resolves altname-spelled records without refetching `AssetPairs`.
+- On an unscoped read, an open order whose pair cannot be resolved to a cached instrument fails the
+  read, rather than being omitted from an otherwise successful one. A scoped read skips a record it
+  cannot resolve, since it cannot belong to the requested instrument.
 - A closed order or fill that cannot be resolved is logged as a warning and skipped, preserving the
   records that do resolve. Historical records routinely outlive the loaded instrument set.
 
@@ -560,18 +622,62 @@ flag.
   resting orders. For accounts with a credit line, net credit (`credit - credit_used`)
   is included in `AccountBalance.total`, so `free` matches Kraken's available balance
   of `balance + credit - credit_used - hold_trade`.
+- Zero balances: An asset Kraken lists at zero is reported at zero rather than omitted,
+  on both spot and futures. The engine only ever inserts balances, so a currency left out
+  of a snapshot keeps its previous value. On futures the zero joins the per-currency sum,
+  so a funded wallet alongside an empty one of the same asset reports the funded amount.
+  An asset Kraken drops from the response entirely still keeps its last reported value.
 
 **Margin position reports** (when `spot_account_type=Margin`):
 
 - Open positions: Fetched from `POST /0/private/OpenPositions` and aggregated
-  by (pair, side) into `PositionStatusReport` entries.
-- Synthetic FLAT cleanup: If the local cache has an open spot margin position
-  that no longer appears on the venue (Kraken omits closed positions from
-  `OpenPositions`), the adapter emits a synthetic FLAT report on the next
-  position-check tick so the engine reconciles to closed.
+  by pair into `PositionStatusReport` entries. Kraken returns one entry per lot,
+  so opposing lots for the same pair net into a single report.
+- Entry average: Each report carries `avg_px_open`, derived from the lot `cost`
+  and `vol` fields and weighted by the volume still open. Long and short lots are
+  averaged separately, so the reported average describes the side that survives
+  netting. Reconciliation needs this value to open a position from a report when
+  the cache holds no order or fill history for it.
+- The average is marked `AvgPxReconciliation::OpeningOnly`, because Kraken closes margin lots
+  FIFO and drops a fully closed one from `OpenPositions`. After a partial close the average
+  therefore describes the lots that remain open rather than the opening fills, and would not match
+  a netting position's average. Reconciliation uses it to open a position from flat and never
+  compares it. Futures keeps the default, since that endpoint reports one netted position whose
+  price Kraken documents as the average entry price.
+- No synthetic FLAT cleanup: `OpenPositions` reports leveraged positions only, so an
+  unleveraged spot holding never appears there and its absence is not evidence that the
+  position is closed. The bulk read reports only what the venue returns.
 - Margin balances: `POST /0/private/TradeBalance` is called alongside the
   account-state refresh; used margin populates `MarginBalance.initial`, while
   equity and free margin populate the summary balance (see Spot margin trading).
+
+:::warning
+A leveraged position closed while the node was down is not recovered from its closing fill when
+`reconciliation_lookback_mins` is set. A fully closed lot is absent from `OpenPositions`, so the
+instrument carries no position report, and the engine projects that order's fill as order-only:
+the order reaches `FILLED`, while the cached position keeps both its quantity and its realized
+PnL, so the closing PnL is never recorded. This is the shared engine's documented behavior for an
+instrument with no in-scope position report, not a Kraken rule. See
+[Order-only fill projection](../concepts/execution/reconciliation.md#order-only-fill-projection).
+Removing the synthetic FLAT is what exposes Kraken spot margin to it, because the sweep previously
+supplied an explicit FLAT.
+
+A periodic position check does not recover it either, since margin mode declares no bulk position
+coverage, and that skip is logged at debug level. The condition also persists across restarts: the
+closing order is then cached as `FILLED` and matches the venue exactly, so reconciliation treats it
+as already in sync.
+
+Leaving `reconciliation_lookback_mins` unset avoids the projection but is not a general remedy.
+The closing order is external to the cache, so it is attributed to the `EXTERNAL` strategy and keys
+a netting position by instrument and strategy. Unless the cached position is itself `EXTERNAL`-owned
+or the instrument is claimed through `external_order_claim`, the recovered fill opens a second,
+opposite position rather than closing the cached one: net exposure reaches zero, but the stale
+position and its realized PnL remain.
+
+Until this is addressed, reconcile a margin position closed during downtime manually, or run
+`spot_account_type=Cash` with `use_spot_position_reports=True`, where the wallet read enumerates
+every holding it covers and an absent report is genuine evidence of flat.
+:::
 
 ### Futures reconciliation
 
@@ -614,6 +720,8 @@ trading).
 - When enabled, wallet balances are converted to `PositionStatusReport` objects.
 - Positive balances are reported as `LONG` positions.
 - Only instruments matching the configured quote currency are reported (default: `USDT`).
+  The same filter decides which instruments the client declares bulk position coverage for,
+  so an instrument quoted in anything else is never reconciled to flat from a missing report.
 - This prevents duplicate reports when the same asset is available with multiple
   quote currencies (e.g., BTC/USD, BTC/USDT, BTC/EUR).
 
@@ -715,10 +823,16 @@ that dictionary to `AccountState.info`.
 ### Position reconciliation
 
 Open spot margin positions are surfaced via `POST /0/private/OpenPositions`
-on each `position_check_interval_secs` tick. Closed positions on the venue
-that still appear open in the local cache are reconciled to FLAT on the next
-sweep. This path is independent of `use_spot_position_reports` (which is
-wallet-derived, cash-mode-only).
+on each `position_check_interval_secs` tick. This path is independent of
+`use_spot_position_reports` (which is wallet-derived, cash-mode-only).
+
+The spot client declares bulk position coverage per instrument, and only for instruments the
+read would actually enumerate: cash mode with `use_spot_position_reports=True`, and the
+instrument quoted in `spot_positions_quote_currency` (see Spot position reports, which applies
+the same filter). Under `spot_account_type=Margin` the source is `OpenPositions`, which omits
+unleveraged lots, and cash mode without wallet-derived reports returns nothing at all. Wherever
+coverage is not declared, an absent report leaves the cached position untouched instead of
+closing it.
 
 ## Funding rates
 
@@ -825,7 +939,7 @@ The product type for each client is specified via the `product_type` option.
 | `spot_account_type`             | `CASH`    | Account type for spot trading; `MARGIN` enables leverage and reports. |
 | `default_leverage`              | `None`    | Default spot margin leverage sent as `"N:1"` when set.                |
 | `use_spot_position_reports`     | `False`   | Report wallet balances as positions; cash mode only.                  |
-| `spot_positions_quote_currency` | `"USDT"`  | Quote currency filter for spot wallet position reports.               |
+| `spot_positions_quote_currency` | `"USDT"`  | Quote filter for spot wallet position reports and their coverage.     |
 | `margin_balance_asset`          | `None`    | Summary asset for `TradeBalance`; `None` defaults to `ZUSD`.          |
 | `use_ws_trade`                  | `True`    | Use Spot WebSocket v2 for order operations when active.               |
 | `ws_request_timeout_secs`       | `5`       | Spot WebSocket order response timeout.                                |
