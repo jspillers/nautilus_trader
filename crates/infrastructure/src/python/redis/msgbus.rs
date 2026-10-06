@@ -68,6 +68,7 @@ impl RedisMessageBusConfig {
             exponent_base: exponent_base.unwrap_or(default.exponent_base),
             max_delay: max_delay.unwrap_or(default.max_delay),
             factor: factor.unwrap_or(default.factor),
+            ..default
         }
     }
 
