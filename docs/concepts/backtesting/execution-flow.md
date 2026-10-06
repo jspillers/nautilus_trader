@@ -83,6 +83,13 @@ When driving `SimulatedExchange` directly, schedule expiry processing after that
 or explicitly set `defer_option_settlement` to `false` for immediate settlement. Immediate settlement
 can use an older underlying price if an update with the same timestamp has yet to be processed.
 
+The Rust imperative `SimulatedVenueConfig.settle_expired_positions` defaults to `true`.
+Set it to `false` for an inventory-retention simulation without inferred settlement payouts.
+This passes the existing native matching-engine policy through the simulated exchange:
+expiry still cancels resting orders and rejects new orders, while automatic expiry and
+explicit contract-close events retain positions. This does not model actual venue settlement.
+The declarative `BacktestVenueConfig` continues to use the default settlement policy.
+
 ### Command settling
 
 #### Same-cycle commands

@@ -191,6 +191,7 @@ pub struct SimulatedExchange {
     queue_position: bool,
     oto_full_trigger: bool,
     defer_option_settlement: bool,
+    settle_expired_positions: bool,
     price_protection_points: u32,
     liquidation_enabled: bool,
     liquidation_trigger_ratio: f64,
@@ -281,6 +282,7 @@ impl SimulatedExchange {
             queue_position: config.queue_position,
             oto_full_trigger: config.oto_full_trigger,
             defer_option_settlement: config.defer_option_settlement,
+            settle_expired_positions: config.settle_expired_positions,
             price_protection_points: config.price_protection_points,
             liquidation_enabled: config.liquidation_enabled,
             liquidation_trigger_ratio: config.liquidation_trigger_ratio,
@@ -486,6 +488,7 @@ impl SimulatedExchange {
             .queue_position(self.queue_position)
             .oto_full_trigger(self.oto_full_trigger)
             .defer_option_settlement(self.defer_option_settlement)
+            .settle_expired_positions(self.settle_expired_positions)
             .maybe_price_protection_points(price_protection)
             .build();
         let instrument_id = instrument.id();

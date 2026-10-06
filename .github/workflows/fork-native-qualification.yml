@@ -65,10 +65,19 @@ jobs:
         run: >-
           cargo test --locked --profile ci-pr -p nautilus-persistence
           --lib writer::feather::tests -- --test-threads=1
+      - name: Test native Backtest expiry and inventory retention
+        run: |
+          cargo test --locked --profile ci-pr -p nautilus-backtest --lib config::tests
+          cargo test --locked --profile ci-pr -p nautilus-backtest --test integration \
+            test_binary_inventory_retention_ignores_duplicate_close_payouts -- --test-threads=1
+          cargo test --locked --profile ci-pr -p nautilus-backtest --test integration \
+            test_option_expiry_timer_closes_position_without_data_at_expiration -- --test-threads=1
+          cargo test --locked --profile ci-pr -p nautilus-backtest --test integration \
+            test_instrument_close_precedes_expiration_timer_at_same_timestamp -- --test-threads=1
       - name: Lint the affected native crates
         run: >-
           cargo clippy --locked --profile ci-pr -p nautilus-infrastructure
-          -p nautilus-sandbox -p nautilus-persistence --all-targets -- -D warnings
+          -p nautilus-sandbox -p nautilus-persistence -p nautilus-backtest --all-targets -- -D warnings
       - name: Shut down test-only Redis
         if: always()
         run: redis-cli -h 127.0.0.1 -p 6379 shutdown nosave
