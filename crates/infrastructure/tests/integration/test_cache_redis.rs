@@ -17,7 +17,11 @@
 #[cfg(feature = "redis")]
 #[cfg(target_os = "linux")] // Databases only tested and supported on Linux
 mod serial_tests {
-    use std::{sync::OnceLock, time::Duration};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::OnceLock,
+        time::Duration,
+    };
 
     use ahash::AHashMap;
     use bytes::Bytes;
@@ -40,14 +44,17 @@ mod serial_tests {
             DataType, InstrumentClose,
             stubs::{ensure_stub_custom_data_registered, stub_custom_data},
         },
-        enums::{InstrumentCloseType, OrderSide, OrderStatus, OrderType, TimeInForce},
+        enums::{InstrumentCloseType, OrderSide, OrderStatus, OrderType, TimeInForce, TriggerType},
         events::{
             AccountState, OrderEventAny, OrderFilled, OrderSnapshot,
             account::stubs::{
                 cash_account_state_multi, cash_account_state_multi_changed_btc,
                 wallet_account_state, wallet_account_state_changed,
             },
-            order::spec::OrderFillVoidedSpec,
+            order::spec::{
+                OrderEmulatedSpec, OrderFillVoidedSpec, OrderPendingCancelSpec, OrderRejectedSpec,
+                OrderReleasedSpec,
+            },
             position::snapshot::PositionSnapshot,
         },
         identifiers::{
@@ -58,7 +65,7 @@ mod serial_tests {
             Instrument, InstrumentAny, SyntheticInstrument,
             stubs::{binary_option, crypto_perpetual_ethusdt},
         },
-        orders::{Order, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
+        orders::{Order, OrderAny, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
         position::Position,
         types::{Currency, Money, Price, Quantity},
     };
@@ -2084,6 +2091,441 @@ mod serial_tests {
 
         let mut adapter = adapter;
         adapter.flush().unwrap();
+    }
+
+    // Connects an adapter for `trader_id` with the given writer buffer interval.
+    async fn connect_redis_cache_adapter_with(
+        trader_id: &str,
+        buffer_interval_ms: usize,
+    ) -> RedisCacheDatabaseAdapter {
+        let config = CacheConfig {
+            buffer_interval_ms: Some(buffer_interval_ms),
+            ..Default::default()
+        };
+        let database = RedisCacheDatabase::new(
+            TraderId::from(trader_id),
+            UUID4::new(),
+            config,
+            redis_cache_config(),
+        )
+        .await
+        .expect("A running Redis service is required for this test");
+
+        RedisCacheDatabaseAdapter { database }
+    }
+
+    // A writer buffer interval long enough that queued writes drain as one batch on close.
+    const SINGLE_BATCH_INTERVAL_MS: usize = 600_000;
+
+    async fn redis_command_calls(adapter: &RedisCacheDatabaseAdapter, command: &str) -> u64 {
+        let mut conn = adapter.database.con.clone();
+        let info: String = redis::cmd("INFO")
+            .arg("commandstats")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let prefix = format!("cmdstat_{command}:calls=");
+        info.lines()
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
+            .map_or(0, |stats| stats.split(',').next().unwrap().parse().unwrap())
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum StoredValue {
+        List(Vec<Vec<u8>>),
+        Set(BTreeSet<Vec<u8>>),
+        Hash(BTreeMap<Vec<u8>, Vec<u8>>),
+        String(Vec<u8>),
+    }
+
+    // Reads every key under the adapter's trader key, keyed by the key without that prefix.
+    async fn trader_keyspace(adapter: &RedisCacheDatabaseAdapter) -> BTreeMap<String, StoredValue> {
+        let mut conn = adapter.database.con.clone();
+        let prefix = format!("{}:", adapter.database.trader_key);
+        let keys: Vec<String> = conn.keys(format!("{prefix}*")).await.unwrap();
+        let mut keyspace = BTreeMap::new();
+
+        for key in keys {
+            let key_type: String = redis::cmd("TYPE")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            let value = match key_type.as_str() {
+                "list" => StoredValue::List(conn.lrange(&key, 0, -1).await.unwrap()),
+                "set" => StoredValue::Set(conn.smembers(&key).await.unwrap()),
+                "hash" => StoredValue::Hash(conn.hgetall(&key).await.unwrap()),
+                "string" => StoredValue::String(conn.get(&key).await.unwrap()),
+                other => panic!("Unexpected Redis type {other} at {key}"),
+            };
+            keyspace.insert(key.strip_prefix(&prefix).unwrap().to_string(), value);
+        }
+
+        keyspace
+    }
+
+    async fn order_index_members(
+        adapter: &RedisCacheDatabaseAdapter,
+        index: &str,
+    ) -> BTreeSet<String> {
+        let mut conn = adapter.database.con.clone();
+        conn.smembers(format!("{}:index:{index}", adapter.database.trader_key))
+            .await
+            .unwrap()
+    }
+
+    // Asserts every order index set holds exactly the orders whose state requires membership.
+    async fn assert_order_indexes_match(adapter: &RedisCacheDatabaseAdapter, orders: &[OrderAny]) {
+        let members = |predicate: fn(&OrderAny) -> bool| {
+            orders
+                .iter()
+                .filter(|order| predicate(order))
+                .map(|order| order.client_order_id().to_string())
+                .collect::<BTreeSet<_>>()
+        };
+
+        assert_eq!(
+            order_index_members(adapter, "orders").await,
+            members(|_| true)
+        );
+        assert_eq!(
+            order_index_members(adapter, "order_ids").await,
+            members(|order| order.venue_order_id().is_some())
+        );
+        assert_eq!(
+            order_index_members(adapter, "orders_inflight").await,
+            members(|order| order.is_inflight())
+        );
+        assert_eq!(
+            order_index_members(adapter, "orders_open").await,
+            members(|order| order.is_open())
+        );
+        assert_eq!(
+            order_index_members(adapter, "orders_closed").await,
+            members(|order| order.is_closed())
+        );
+        assert_eq!(
+            order_index_members(adapter, "orders_emulated").await,
+            members(|order| order.emulation_trigger().is_some() && !order.is_closed())
+        );
+    }
+
+    enum OrderStep {
+        Add(Box<OrderAny>, Option<ClientId>),
+        // An applied event with the order state after applying it
+        Event(Box<(OrderEventAny, OrderAny)>),
+        Delete(ClientOrderId),
+    }
+
+    fn apply_order_event(steps: &mut Vec<OrderStep>, order: &mut OrderAny, event: OrderEventAny) {
+        order.apply(event.clone()).unwrap();
+        steps.push(OrderStep::Event(Box::new((event, order.clone()))));
+    }
+
+    struct MixedOrderEvents {
+        steps: Vec<OrderStep>,
+        // Final states of the orders expected to remain persisted
+        persisted: Vec<OrderAny>,
+        // Orders whose events must be skipped because no event list exists
+        skipped: Vec<ClientOrderId>,
+    }
+
+    // Interleaves order lifecycles in one writer batch: fills, rejection, emulation and release,
+    // events for missing or deleted event lists, and an event queued before its order insert.
+    fn mixed_order_events() -> MixedOrderEvents {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let account_id = AccountId::new("BINANCE-001");
+        let mut steps = Vec::new();
+
+        let mut limit = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("2.0"))
+            .price(Price::from("1000.00"))
+            .client_order_id(ClientOrderId::new("O-19700101-000000-001-001-1"))
+            .build();
+        let mut market = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("1.0"))
+            .client_order_id(ClientOrderId::new("O-19700101-000000-001-001-2"))
+            .build();
+        let mut emulated = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .price(Price::from("1000.00"))
+            .emulation_trigger(TriggerType::BidAsk)
+            .client_order_id(ClientOrderId::new("O-19700101-000000-001-001-3"))
+            .build();
+        let mut missing = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .client_order_id(ClientOrderId::new("O-19700101-000000-001-001-4"))
+            .build();
+        let mut deleted = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("1.0"))
+            .price(Price::from("1001.00"))
+            .client_order_id(ClientOrderId::new("O-19700101-000000-001-001-5"))
+            .build();
+
+        steps.push(OrderStep::Add(
+            Box::new(limit.clone()),
+            Some(ClientId::new("BINANCE")),
+        ));
+
+        // Queued before the market order insert, so no event list exists yet
+        let mut early_market = market.clone();
+        let early_submitted = TestOrderEventStubs::submitted(&early_market, account_id);
+        apply_order_event(&mut steps, &mut early_market, early_submitted);
+
+        let submitted = TestOrderEventStubs::submitted(&limit, account_id);
+        apply_order_event(&mut steps, &mut limit, submitted);
+        steps.push(OrderStep::Add(Box::new(emulated.clone()), None));
+        steps.push(OrderStep::Add(Box::new(market.clone()), None));
+        let submitted = TestOrderEventStubs::submitted(&market, account_id);
+        apply_order_event(&mut steps, &mut market, submitted);
+        let submitted = TestOrderEventStubs::submitted(&missing, account_id);
+        apply_order_event(&mut steps, &mut missing, submitted);
+        let accepted = TestOrderEventStubs::accepted(&limit, account_id, VenueOrderId::new("V-1"));
+        apply_order_event(&mut steps, &mut limit, accepted);
+        let emulation = OrderEventAny::Emulated(
+            OrderEmulatedSpec::builder()
+                .trader_id(emulated.trader_id())
+                .strategy_id(emulated.strategy_id())
+                .instrument_id(emulated.instrument_id())
+                .client_order_id(emulated.client_order_id())
+                .build(),
+        );
+        apply_order_event(&mut steps, &mut emulated, emulation);
+        steps.push(OrderStep::Add(Box::new(deleted.clone()), None));
+        let submitted = TestOrderEventStubs::submitted(&deleted, account_id);
+        apply_order_event(&mut steps, &mut deleted, submitted);
+        let release = OrderEventAny::Released(
+            OrderReleasedSpec::builder()
+                .trader_id(emulated.trader_id())
+                .strategy_id(emulated.strategy_id())
+                .instrument_id(emulated.instrument_id())
+                .client_order_id(emulated.client_order_id())
+                .released_price(Price::from("1000.00"))
+                .build(),
+        );
+        apply_order_event(&mut steps, &mut emulated, release);
+        let pending_cancel = OrderEventAny::PendingCancel(
+            OrderPendingCancelSpec::builder()
+                .trader_id(limit.trader_id())
+                .strategy_id(limit.strategy_id())
+                .instrument_id(limit.instrument_id())
+                .client_order_id(limit.client_order_id())
+                .account_id(account_id)
+                .venue_order_id(VenueOrderId::new("V-1"))
+                .build(),
+        );
+        apply_order_event(&mut steps, &mut limit, pending_cancel);
+        steps.push(OrderStep::Delete(deleted.client_order_id()));
+        let accepted =
+            TestOrderEventStubs::accepted(&deleted, account_id, VenueOrderId::new("V-5"));
+        apply_order_event(&mut steps, &mut deleted, accepted);
+        let rejected = OrderEventAny::Rejected(
+            OrderRejectedSpec::builder()
+                .trader_id(market.trader_id())
+                .strategy_id(market.strategy_id())
+                .instrument_id(market.instrument_id())
+                .client_order_id(market.client_order_id())
+                .account_id(account_id)
+                .build(),
+        );
+        apply_order_event(&mut steps, &mut market, rejected);
+        let partial_fill = TestOrderEventStubs::filled(
+            &limit,
+            &instrument,
+            Some(TradeId::new("T-1")),
+            None,
+            None,
+            Some(Quantity::from("1.0")),
+            None,
+            None,
+            None,
+            Some(account_id),
+        );
+        apply_order_event(&mut steps, &mut limit, partial_fill);
+        let submitted = TestOrderEventStubs::submitted(&emulated, account_id);
+        apply_order_event(&mut steps, &mut emulated, submitted);
+        let accepted =
+            TestOrderEventStubs::accepted(&emulated, account_id, VenueOrderId::new("V-3"));
+        apply_order_event(&mut steps, &mut emulated, accepted);
+        let canceled =
+            TestOrderEventStubs::canceled(&emulated, account_id, Some(VenueOrderId::new("V-3")));
+        apply_order_event(&mut steps, &mut emulated, canceled);
+
+        MixedOrderEvents {
+            steps,
+            persisted: vec![limit, market, emulated],
+            skipped: vec![missing.client_order_id(), deleted.client_order_id()],
+        }
+    }
+
+    // Applies each step through the adapter, using the post-event order state when
+    // `with_order_state` is set, otherwise the event-only path that replays stored history.
+    fn write_order_steps(
+        adapter: &RedisCacheDatabaseAdapter,
+        steps: &[OrderStep],
+        with_order_state: bool,
+    ) {
+        for step in steps {
+            match step {
+                OrderStep::Add(order, client_id) => adapter.add_order(order, *client_id).unwrap(),
+                OrderStep::Event(applied) if with_order_state => {
+                    adapter.update_order_state(&applied.1).unwrap();
+                }
+                OrderStep::Event(applied) => adapter.update_order(&applied.0).unwrap(),
+                OrderStep::Delete(client_order_id) => {
+                    adapter.delete_order(client_order_id).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_update_order_state_batch_appends_events_and_indexes_in_one_transaction() {
+        let _guard = redis_test_mutex().lock().await;
+        let mut adapter =
+            connect_redis_cache_adapter_with("test-trader", SINGLE_BATCH_INTERVAL_MS).await;
+        adapter.database.flushdb().await;
+
+        let MixedOrderEvents {
+            steps,
+            persisted,
+            skipped,
+        } = mixed_order_events();
+        let event_count = steps
+            .iter()
+            .filter(|step| matches!(step, OrderStep::Event(..)))
+            .count() as u64;
+
+        write_order_steps(&adapter, &steps, true);
+
+        let mut conn = adapter.database.con.clone();
+        redis::cmd("CONFIG")
+            .arg("RESETSTAT")
+            .query_async::<()>(&mut conn)
+            .await
+            .unwrap();
+        adapter.close().unwrap();
+
+        // The whole batch commits in one transaction without reading order history
+        assert_eq!(redis_command_calls(&adapter, "exec").await, 1);
+        assert_eq!(redis_command_calls(&adapter, "eval").await, event_count);
+        assert_eq!(redis_command_calls(&adapter, "lrange").await, 0);
+
+        let encoding = adapter.database.get_encoding();
+        for order in &persisted {
+            let key = format!(
+                "{}:orders:{}",
+                adapter.database.trader_key,
+                order.client_order_id()
+            );
+            let frames: Vec<Bytes> = conn.lrange(&key, 0, -1).await.unwrap();
+            let events: Vec<OrderEventAny> = frames
+                .iter()
+                .map(|frame| DatabaseQueries::deserialize_payload(encoding, frame).unwrap())
+                .collect();
+            assert_eq!(
+                events,
+                order.events().into_iter().cloned().collect::<Vec<_>>()
+            );
+        }
+
+        for client_order_id in &skipped {
+            let key = format!("{}:orders:{client_order_id}", adapter.database.trader_key);
+            assert!(!conn.exists::<_, bool>(&key).await.unwrap());
+        }
+        assert_order_indexes_match(&adapter, &persisted).await;
+
+        adapter.database.flushdb().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_update_order_state_matches_event_history_replay() {
+        let _guard = redis_test_mutex().lock().await;
+        let mut replay_adapter =
+            connect_redis_cache_adapter_with("test-trader-replay", SINGLE_BATCH_INTERVAL_MS).await;
+        replay_adapter.database.flushdb().await;
+        let mut state_adapter =
+            connect_redis_cache_adapter_with("test-trader", SINGLE_BATCH_INTERVAL_MS).await;
+
+        let MixedOrderEvents { steps, .. } = mixed_order_events();
+        write_order_steps(&replay_adapter, &steps, false);
+        write_order_steps(&state_adapter, &steps, true);
+        replay_adapter.close().unwrap();
+        state_adapter.close().unwrap();
+
+        let replayed = trader_keyspace(&replay_adapter).await;
+        let from_state = trader_keyspace(&state_adapter).await;
+
+        assert!(replayed.keys().any(|key| key.starts_with("orders:")));
+        assert!(replayed.keys().any(|key| key.starts_with("index:")));
+        assert_eq!(from_state, replayed);
+
+        replay_adapter.database.flushdb().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cache_order_updates_reload_equal_after_restart() {
+        let _guard = redis_test_mutex().lock().await;
+        let adapter = connect_redis_cache_adapter_with("test-trader", 1).await;
+        let mut conn = adapter.database.con.clone();
+        redis::cmd("FLUSHDB")
+            .query_async::<()>(&mut conn)
+            .await
+            .unwrap();
+        let mut cache = Cache::new(None, Some(Box::new(adapter)));
+
+        let MixedOrderEvents { steps, .. } = mixed_order_events();
+        for step in steps {
+            match step {
+                OrderStep::Add(order, client_id) => {
+                    cache.add_order(*order, None, client_id, false).unwrap();
+                }
+                OrderStep::Event(applied) => {
+                    // Events for orders absent from the cache never reach the database
+                    let event = &applied.0;
+                    if cache.order_exists(&event.client_order_id()) {
+                        cache.update_order(event).unwrap();
+                    }
+                }
+                OrderStep::Delete(_) => {}
+            }
+        }
+        let cached: Vec<OrderAny> = cache
+            .orders(None, None, None, None, None)
+            .iter()
+            .map(|order| order.cloned())
+            .collect();
+        // Closing the database drains the writer before the restart
+        cache.dispose();
+
+        let restarted_adapter = connect_redis_cache_adapter()
+            .await
+            .expect("Failed to create adapter");
+        let loaded = restarted_adapter.load_orders().await.unwrap();
+
+        assert_eq!(loaded.len(), cached.len());
+        for order in &cached {
+            let reloaded = &loaded[&order.client_order_id()];
+            assert_eq!(reloaded.events(), order.events());
+            assert_eq!(reloaded.status(), order.status());
+            assert_eq!(reloaded.filled_qty(), order.filled_qty());
+            assert_eq!(reloaded.venue_order_id(), order.venue_order_id());
+            assert_eq!(reloaded.emulation_trigger(), order.emulation_trigger());
+        }
+        assert_order_indexes_match(&restarted_adapter, &cached).await;
+
+        let mut restarted_adapter = restarted_adapter;
+        restarted_adapter.flush().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
