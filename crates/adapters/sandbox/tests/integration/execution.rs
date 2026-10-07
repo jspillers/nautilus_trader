@@ -29,8 +29,9 @@ use nautilus_common::{
     messages::{
         ExecutionEvent,
         execution::{
-            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
-            SubmitOrder, SubmitOrderList, TradingCommand,
+            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
+            GeneratePositionStatusReports, ModifyOrder, SubmitOrder, SubmitOrderList,
+            TradingCommand,
         },
     },
     msgbus::{
@@ -4444,6 +4445,385 @@ async fn test_generate_mass_status_returns_empty_report(
     assert!(mass_status.order_reports().is_empty());
     assert!(mass_status.fill_reports().is_empty());
     assert!(mass_status.position_reports().is_empty());
+}
+
+fn position_report_fixture(
+    instrument: &InstrumentAny,
+    account_id: AccountId,
+    position_id: &str,
+    side: OrderSide,
+    strategy_id: StrategyId,
+) -> Position {
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .client_order_id(ClientOrderId::new(position_id))
+        .strategy_id(strategy_id)
+        .side(side)
+        .quantity(Quantity::from("0.400"))
+        .build();
+    let OrderEventAny::Filled(fill) = TestOrderEventStubs::filled(
+        &order,
+        instrument,
+        None,
+        Some(PositionId::new(position_id)),
+        Some(Price::from("100.00")),
+        None,
+        None,
+        None,
+        Some(UnixNanos::from(7)),
+        Some(account_id),
+    ) else {
+        unreachable!("filled stub produces a fill");
+    };
+    Position::new(instrument, fill)
+}
+
+#[rstest]
+#[case(OmsType::Netting, OrderSide::Buy)]
+#[case(OmsType::Netting, OrderSide::Sell)]
+#[case(OmsType::Hedging, OrderSide::Buy)]
+#[case(OmsType::Hedging, OrderSide::Sell)]
+#[tokio::test]
+async fn test_generate_position_reports_preserve_simulated_positions(
+    trader_id: TraderId,
+    account_id: AccountId,
+    instrument: InstrumentAny,
+    #[case] oms_type: OmsType,
+    #[case] side: OrderSide,
+) {
+    let context =
+        create_test_context_with(trader_id, account_id, instrument.id().venue, |config| {
+            config.oms_type = oms_type;
+        });
+    context
+        .test_clock
+        .borrow_mut()
+        .advance_time(UnixNanos::from(20), true);
+    let position = position_report_fixture(
+        &instrument,
+        account_id,
+        "P-REPORT",
+        side,
+        StrategyId::from("REPORT-001"),
+    );
+    context
+        .cache
+        .borrow_mut()
+        .add_position_without_order(&position, oms_type)
+        .unwrap();
+    let cmd = GeneratePositionStatusReports::new(
+        UUID4::new(),
+        UnixNanos::from(20),
+        Some(instrument.id()),
+        None,
+        None,
+        None,
+        None,
+    );
+    let reports = context
+        .client
+        .generate_position_status_reports(&cmd)
+        .await
+        .unwrap();
+    assert_eq!(reports.len(), 1);
+    let report = &reports[0];
+    assert_eq!(report.account_id, account_id);
+    assert_eq!(report.instrument_id, position.instrument_id);
+    assert_eq!(report.position_side, position.side);
+    assert_eq!(report.quantity, position.quantity);
+    assert_eq!(report.signed_decimal_qty, position.signed_decimal_qty());
+    assert_eq!(report.ts_last, position.ts_last);
+    assert_eq!(report.ts_init, UnixNanos::from(20));
+    assert_eq!(
+        report.venue_position_id,
+        (oms_type == OmsType::Hedging).then_some(position.id)
+    );
+    assert_eq!(report.avg_px_open, None);
+
+    let mass = context
+        .client
+        .generate_mass_status(None)
+        .await
+        .unwrap()
+        .unwrap();
+    let mass_reports = &mass.position_reports()[&instrument.id()];
+    assert_eq!(mass_reports.len(), 1);
+    assert_eq!(
+        mass_reports[0].signed_decimal_qty,
+        report.signed_decimal_qty
+    );
+    assert_eq!(
+        context
+            .cache
+            .borrow()
+            .position(&position.id)
+            .unwrap()
+            .quantity,
+        position.quantity
+    );
+}
+
+#[rstest]
+#[case(OmsType::Netting)]
+#[case(OmsType::Hedging)]
+#[tokio::test]
+async fn test_generate_position_reports_scope_account_venue_and_instrument(
+    trader_id: TraderId,
+    account_id: AccountId,
+    instrument: InstrumentAny,
+    #[case] oms_type: OmsType,
+) {
+    let context =
+        create_test_context_with(trader_id, account_id, instrument.id().venue, |config| {
+            config.oms_type = oms_type;
+        });
+    let mut other_instrument = crypto_perpetual_ethusdt();
+    other_instrument.id = InstrumentId::from("OTHER.BINANCE");
+    let other_instrument = InstrumentAny::CryptoPerpetual(other_instrument);
+    let mut other_venue = crypto_perpetual_ethusdt();
+    other_venue.id = InstrumentId::from("ETHUSDT.OTHER");
+    let other_venue = InstrumentAny::CryptoPerpetual(other_venue);
+
+    for (instrument, account_id, id, side, strategy) in [
+        (
+            &instrument,
+            account_id,
+            "P-FIRST",
+            OrderSide::Buy,
+            "FIRST-001",
+        ),
+        (
+            &instrument,
+            account_id,
+            "P-SECOND",
+            OrderSide::Sell,
+            "SECOND-002",
+        ),
+        (
+            &other_instrument,
+            account_id,
+            "P-INSTRUMENT",
+            OrderSide::Buy,
+            "FIRST-001",
+        ),
+        (
+            &instrument,
+            AccountId::from("OTHER-001"),
+            "P-ACCOUNT",
+            OrderSide::Buy,
+            "FIRST-001",
+        ),
+        (
+            &other_venue,
+            account_id,
+            "P-VENUE",
+            OrderSide::Buy,
+            "FIRST-001",
+        ),
+    ] {
+        let position =
+            position_report_fixture(instrument, account_id, id, side, StrategyId::from(strategy));
+        context
+            .cache
+            .borrow_mut()
+            .add_position_without_order(&position, oms_type)
+            .unwrap();
+    }
+    let cmd = GeneratePositionStatusReports::new(
+        UUID4::new(),
+        UnixNanos::from(20),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let reports = context
+        .client
+        .generate_position_status_reports(&cmd)
+        .await
+        .unwrap();
+    assert_eq!(
+        reports.len(),
+        if oms_type == OmsType::Netting { 2 } else { 3 }
+    );
+    assert!(reports.iter().all(|report| report.account_id == account_id
+        && report.instrument_id.venue == instrument.id().venue));
+    let mut selected = cmd;
+    selected.instrument_id = Some(instrument.id());
+    let reports = context
+        .client
+        .generate_position_status_reports(&selected)
+        .await
+        .unwrap();
+    assert_eq!(
+        reports.len(),
+        if oms_type == OmsType::Netting { 1 } else { 2 }
+    );
+    assert_eq!(
+        reports
+            .iter()
+            .map(|report| report.signed_decimal_qty)
+            .sum::<Decimal>(),
+        Decimal::ZERO
+    );
+
+    if oms_type == OmsType::Netting {
+        assert_eq!(reports[0].position_side, PositionSide::Flat);
+        assert!(reports[0].quantity.is_zero());
+        assert_eq!(reports[0].venue_position_id, None);
+    } else {
+        assert!(
+            reports
+                .iter()
+                .any(|report| report.position_side == PositionSide::Long)
+        );
+        assert!(
+            reports
+                .iter()
+                .any(|report| report.position_side == PositionSide::Short)
+        );
+        assert_eq!(
+            reports
+                .iter()
+                .filter_map(|report| report.venue_position_id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            2
+        );
+    }
+    let mass = context
+        .client
+        .generate_mass_status(None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        mass.position_reports()[&instrument.id()].len(),
+        reports.len()
+    );
+    selected.instrument_id = Some(InstrumentId::from("UNKNOWN.BINANCE"));
+    assert!(
+        context
+            .client
+            .generate_position_status_reports(&selected)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[rstest]
+#[case(OrderSide::Buy, OrderSide::Sell, Decimal::from_str_exact("0.400").unwrap())]
+#[case(OrderSide::Sell, OrderSide::Buy, Decimal::from_str_exact("-0.400").unwrap())]
+#[tokio::test]
+async fn test_generate_position_reports_aggregate_strategy_net_quantities(
+    trader_id: TraderId,
+    account_id: AccountId,
+    instrument: InstrumentAny,
+    #[case] majority: OrderSide,
+    #[case] minority: OrderSide,
+    #[case] expected: Decimal,
+) {
+    let context = create_test_context(trader_id, account_id, instrument.id().venue);
+    for (id, side, strategy) in [
+        ("P-NET-1", majority, "FIRST-001"),
+        ("P-NET-2", majority, "SECOND-002"),
+        ("P-NET-3", minority, "THIRD-003"),
+    ] {
+        let position = position_report_fixture(
+            &instrument,
+            account_id,
+            id,
+            side,
+            StrategyId::from(strategy),
+        );
+        context
+            .cache
+            .borrow_mut()
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+    let mass = context
+        .client
+        .generate_mass_status(None)
+        .await
+        .unwrap()
+        .unwrap();
+    let reports = &mass.position_reports()[&instrument.id()];
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].signed_decimal_qty, expected);
+    assert_eq!(reports[0].quantity, Quantity::from("0.400"));
+    assert_eq!(reports[0].venue_position_id, None);
+    assert_eq!(
+        context
+            .cache
+            .borrow()
+            .positions_open_refs(None, None, None, None, None)
+            .len(),
+        3
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_position_reports_exclude_closed_positions(
+    trader_id: TraderId,
+    account_id: AccountId,
+    instrument: InstrumentAny,
+) {
+    let context = create_test_context(trader_id, account_id, instrument.id().venue);
+    let mut position = position_report_fixture(
+        &instrument,
+        account_id,
+        "P-CLOSED",
+        OrderSide::Buy,
+        StrategyId::from("REPORT-001"),
+    );
+    context
+        .cache
+        .borrow_mut()
+        .add_position_without_order(&position, OmsType::Netting)
+        .unwrap();
+    let mut closing = position.events[0].clone();
+    closing.order_side = OrderSide::Sell;
+    closing.trade_id = TradeId::new("T-CLOSE");
+    closing.client_order_id = ClientOrderId::new("O-CLOSE");
+    closing.event_id = UUID4::new();
+    closing.ts_event = UnixNanos::from(9);
+    position.apply(&closing);
+    context
+        .cache
+        .borrow_mut()
+        .update_position(&position)
+        .unwrap();
+    let cmd = GeneratePositionStatusReports::new(
+        UUID4::new(),
+        UnixNanos::from(20),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(
+        context
+            .client
+            .generate_position_status_reports(&cmd)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        context
+            .client
+            .generate_mass_status(None)
+            .await
+            .unwrap()
+            .unwrap()
+            .position_reports()
+            .is_empty()
+    );
 }
 
 #[rstest]
