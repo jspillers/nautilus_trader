@@ -66,6 +66,8 @@ pub struct WriterConfig {
     /// Submit-side stall ceiling. A submit that blocks longer than this fires the halt
     /// callback once and returns [`SubmitError::HaltSignaled`].
     pub halt_threshold: Duration,
+    /// Rejects a full queue immediately instead of waiting for backend progress.
+    pub nonblocking_submit: bool,
 }
 
 impl Default for WriterConfig {
@@ -75,6 +77,7 @@ impl Default for WriterConfig {
             max_batch_entries: DEFAULT_MAX_BATCH_ENTRIES,
             max_batch_latency: DEFAULT_MAX_BATCH_LATENCY,
             halt_threshold: DEFAULT_HALT_THRESHOLD,
+            nonblocking_submit: false,
         }
     }
 }
@@ -123,6 +126,9 @@ impl EntryDraft {
 /// Errors returned by [`EventStoreWriter::submit`].
 #[derive(Debug, thiserror::Error)]
 pub enum SubmitError {
+    /// Nonblocking submission found the bounded queue full and signaled halt.
+    #[error("nonblocking event store queue is full")]
+    QueueFull,
     /// The writer is shut down or the writer thread has exited.
     #[error("writer is closed")]
     Closed,
@@ -169,6 +175,7 @@ mod imp {
         high_watermark: Arc<AtomicU64>,
         halt: HaltCallback,
         halt_threshold: Duration,
+        nonblocking_submit: bool,
         // Shared with the writer thread so any halt fire latches it exactly once;
         // subsequent submits return Closed instead of re-entering the retry loop.
         halted: Arc<AtomicBool>,
@@ -216,6 +223,7 @@ mod imp {
             let halt_for_thread = Arc::clone(&halt);
             let halted_for_thread = Arc::clone(&halted);
             let halt_threshold = config.halt_threshold;
+            let nonblocking_submit = config.nonblocking_submit;
             let config_for_thread = config;
 
             let handle = thread::Builder::new()
@@ -238,6 +246,7 @@ mod imp {
                 high_watermark,
                 halt,
                 halt_threshold,
+                nonblocking_submit,
                 halted,
                 clock,
             })
@@ -246,7 +255,8 @@ mod imp {
         /// Submits a captured entry. Stamps `ts_publish` from the clock at receive time
         /// and hands the draft to the writer thread.
         ///
-        /// Blocks (with retry) when the channel is full. If the cumulative wait exceeds
+        /// With `nonblocking_submit`, a full channel signals halt immediately and returns
+        /// [`SubmitError::QueueFull`]. Otherwise it blocks (with retry). If the wait exceeds
         /// the halt threshold, signals halt, firing the callback unless an earlier
         /// condition already did, and returns [`SubmitError::HaltSignaled`];
         /// subsequent submits return [`SubmitError::Closed`] without blocking.
@@ -279,6 +289,7 @@ mod imp {
                     stalled_for: elapsed,
                     threshold: self.halt_threshold,
                 }),
+                Err(EnqueueFailure::Full) => Err(SubmitError::QueueFull),
                 Err(EnqueueFailure::Closed) => Err(SubmitError::Closed),
             }
         }
@@ -330,6 +341,11 @@ mod imp {
                             self.halt_threshold,
                         )));
                     }
+                    EnqueueFailure::Full => {
+                        return Err(EventStoreError::Backend(
+                            "nonblocking event store queue is full".to_string(),
+                        ));
+                    }
                     EnqueueFailure::Closed => return Err(EventStoreError::Closed),
                 }
             }
@@ -350,12 +366,57 @@ mod imp {
             }
         }
 
+        /// Returns whether captures and snapshot callbacks must avoid waiting for disk.
+        #[must_use]
+        pub fn nonblocking_submit(&self) -> bool {
+            self.nonblocking_submit
+        }
+
+        /// Queues an ordered snapshot anchor without awaiting its durable acknowledgement.
+        ///
+        /// The writer still flushes earlier entries and derives the durable high-watermark.
+        /// Success means accepted into the queue, not committed to disk.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if the writer is halted, closed, or its bounded queue is full.
+        pub fn queue_snapshot_anchor(
+            &self,
+            blob_ref: impl Into<String>,
+            content_hash: impl Into<String>,
+        ) -> Result<(), EventStoreError> {
+            if self.halted.load(Ordering::Acquire) {
+                return Err(EventStoreError::Closed);
+            }
+            let tx = self.tx.as_ref().ok_or(EventStoreError::Closed)?;
+            let (ack, _) = mpsc::sync_channel(1);
+            let pending = WriterMessage::RecordSnapshotAnchor {
+                blob_ref: blob_ref.into(),
+                content_hash: content_hash.into(),
+                ack,
+            };
+            self.enqueue_with_backpressure(tx, pending, Instant::now())
+                .map_err(|_| {
+                    EventStoreError::Backend("snapshot anchor queue unavailable".to_string())
+                })
+        }
+
         fn enqueue_with_backpressure(
             &self,
             tx: &SyncSender<WriterMessage>,
             mut pending: WriterMessage,
             start: Instant,
         ) -> Result<(), EnqueueFailure> {
+            if self.nonblocking_submit {
+                return match tx.try_send(pending) {
+                    Ok(()) => Ok(()),
+                    Err(TrySendError::Full(_)) => {
+                        halt::fire_once(&self.halt, &self.halted, HaltReason::QueueFull);
+                        Err(EnqueueFailure::Full)
+                    }
+                    Err(TrySendError::Disconnected(_)) => Err(EnqueueFailure::Closed),
+                };
+            }
             // Check elapsed before each try_send (including after a sleep) so that a
             // stall which exceeds the threshold fires halt even when the next attempt
             // would have succeeded. The first iteration's elapsed is ~0, so it falls
@@ -435,6 +496,7 @@ mod imp {
     }
 
     enum EnqueueFailure {
+        Full,
         Stalled(Duration),
         Closed,
     }
@@ -598,6 +660,26 @@ mod imp {
             }
         }
 
+        /// Simulation keeps deterministic synchronous commits without a background queue.
+        #[must_use]
+        pub fn nonblocking_submit(&self) -> bool {
+            false
+        }
+
+        /// Records an anchor synchronously in deterministic simulation.
+        ///
+        /// # Errors
+        ///
+        /// Forwards backend errors from the original synchronous simulation writer.
+        pub fn queue_snapshot_anchor(
+            &self,
+            blob_ref: impl Into<String>,
+            content_hash: impl Into<String>,
+        ) -> Result<(), EventStoreError> {
+            self.record_snapshot_anchor(blob_ref, content_hash)
+                .map(|_| ())
+        }
+
         /// Commits `run_ended` synchronously as the final entry and seals the manifest.
         ///
         /// # Errors
@@ -648,9 +730,12 @@ pub use imp::EventStoreWriter;
 #[cfg(test)]
 #[cfg(not(madsim))]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Instant,
     };
 
     use bytes::Bytes;
@@ -1080,6 +1165,7 @@ mod tests {
             max_batch_entries: 2,
             max_batch_latency: Duration::from_secs(30),
             halt_threshold: Duration::from_secs(30),
+            nonblocking_submit: false,
         };
 
         let clock = get_atomic_clock_static();
@@ -1096,6 +1182,129 @@ mod tests {
         // 6 submits + 1 RunEnded == 7 entries, batch=2 -> 4 commits (3 size-driven + 1 close).
         assert_eq!(final_hwm, 7);
         assert_eq!(appends_seen.load(Ordering::SeqCst), 4);
+    }
+
+    #[rstest]
+    fn nonblocking_submit_rejects_full_queue_without_waiting_for_disk(
+        captured_halt: (HaltCallback, Arc<Mutex<Vec<HaltReason>>>),
+    ) {
+        let (halt, captured) = captured_halt;
+        let inner = Arc::new(Mutex::new(MemoryBackend::new()));
+        inner
+            .lock()
+            .open_run(manifest("run-nonblocking-full"))
+            .expect("open");
+        let gate = Arc::new((Mutex::new(false), parking_lot::Condvar::new()));
+        let appends_seen = Arc::new(AtomicUsize::new(0));
+        let backend = BlockingBackend::new(
+            Arc::clone(&inner),
+            Arc::clone(&gate),
+            Arc::clone(&appends_seen),
+        );
+
+        let writer = EventStoreWriter::spawn(
+            Box::new(backend),
+            get_atomic_clock_static(),
+            halt,
+            WriterConfig {
+                channel_capacity: 1,
+                max_batch_entries: 1,
+                nonblocking_submit: true,
+                halt_threshold: Duration::from_secs(1),
+                ..Default::default()
+            },
+        )
+        .expect("spawn");
+        writer.submit(entry_draft(10)).expect("first submit");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while appends_seen.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let blocked = appends_seen.load(Ordering::SeqCst) != 0;
+        let queued = writer.submit(entry_draft(11));
+        let start = Instant::now();
+        let full = writer.submit(entry_draft(12));
+        let elapsed = start.elapsed();
+        // Release the backend before assertions so failures cannot strand the writer
+        *gate.0.lock() = true;
+        gate.1.notify_all();
+        assert!(blocked, "backend did not enter the injected disk wait");
+        queued.expect("second submit fits bounded queue");
+        assert!(matches!(full, Err(SubmitError::QueueFull)), "was {full:?}");
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "nonblocking submit took {elapsed:?}"
+        );
+        assert!(matches!(
+            captured.lock().as_slice(),
+            [HaltReason::QueueFull]
+        ));
+        assert!(matches!(
+            writer.submit(entry_draft(13)),
+            Err(SubmitError::Closed)
+        ));
+    }
+
+    #[rstest]
+    fn queued_snapshot_anchor_keeps_ordered_durability_without_caller_wait(
+        captured_halt: (HaltCallback, Arc<Mutex<Vec<HaltReason>>>),
+    ) {
+        let (halt, captured) = captured_halt;
+        let inner = Arc::new(Mutex::new(MemoryBackend::new()));
+        inner
+            .lock()
+            .open_run(manifest("run-async-anchor"))
+            .expect("open");
+        let gate = Arc::new((Mutex::new(false), parking_lot::Condvar::new()));
+        let appends_seen = Arc::new(AtomicUsize::new(0));
+        let backend = BlockingBackend::new(
+            Arc::clone(&inner),
+            Arc::clone(&gate),
+            Arc::clone(&appends_seen),
+        );
+
+        let writer = EventStoreWriter::spawn(
+            Box::new(backend),
+            get_atomic_clock_static(),
+            halt,
+            WriterConfig {
+                channel_capacity: 4,
+                max_batch_entries: 1,
+                nonblocking_submit: true,
+                ..Default::default()
+            },
+        )
+        .expect("spawn");
+        writer.submit(entry_draft(10)).expect("entry");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while appends_seen.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let blocked = appends_seen.load(Ordering::SeqCst) != 0;
+        let start = Instant::now();
+        let queued = writer.queue_snapshot_anchor("cache://P-1/0", "snapshot-hash");
+        let elapsed = start.elapsed();
+        let before = writer.high_watermark();
+        *gate.0.lock() = true;
+        gate.1.notify_all();
+        assert!(blocked, "backend did not enter the injected disk wait");
+        queued.expect("anchor queued without waiting for disk");
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "anchor queue took {elapsed:?}"
+        );
+        assert_eq!(before, 0, "queue acceptance must not claim durability");
+        writer
+            .close(run_ended_draft())
+            .expect("flush and seal after disk recovers");
+        let anchor = inner
+            .lock()
+            .latest_snapshot_anchor()
+            .expect("read anchor")
+            .expect("anchor present");
+        assert_eq!(anchor.high_watermark, 1);
+        assert_eq!(anchor.blob_ref, "cache://P-1/0");
+        assert!(captured.lock().is_empty());
     }
 
     #[rstest]
@@ -1123,6 +1332,7 @@ mod tests {
             max_batch_entries: 1,
             max_batch_latency: Duration::from_millis(1),
             halt_threshold,
+            nonblocking_submit: false,
         };
 
         let clock = get_atomic_clock_static();
@@ -1143,7 +1353,7 @@ mod tests {
 
         match stalled {
             SubmitError::HaltSignaled { .. } => {}
-            SubmitError::Closed => panic!("expected HaltSignaled, was Closed"),
+            SubmitError::Closed | SubmitError::QueueFull => panic!("expected HaltSignaled"),
         }
         let captured_reasons = captured.lock();
         assert_eq!(
@@ -1163,7 +1373,7 @@ mod tests {
 
         match post_halt {
             SubmitError::Closed => {}
-            SubmitError::HaltSignaled { .. } => {
+            SubmitError::HaltSignaled { .. } | SubmitError::QueueFull => {
                 panic!("expected Closed after halt, was HaltSignaled")
             }
         }
@@ -1201,6 +1411,7 @@ mod tests {
             max_batch_entries: 1,
             max_batch_latency: Duration::from_millis(1),
             halt_threshold,
+            nonblocking_submit: false,
         };
 
         let clock = get_atomic_clock_static();
@@ -1271,6 +1482,7 @@ mod tests {
             max_batch_entries: 1,
             max_batch_latency: Duration::from_millis(1),
             halt_threshold: Duration::from_millis(250),
+            nonblocking_submit: false,
         };
 
         let clock = get_atomic_clock_static();
@@ -1385,6 +1597,7 @@ mod tests {
             max_batch_entries: 1,
             max_batch_latency: Duration::from_millis(1),
             halt_threshold: Duration::from_millis(50),
+            nonblocking_submit: false,
         };
 
         let clock = get_atomic_clock_static();
@@ -1473,6 +1686,7 @@ mod tests {
                 max_batch_entries: 1,
                 max_batch_latency: Duration::from_millis(1),
                 halt_threshold,
+                nonblocking_submit: false,
             },
         )
         .expect("spawn");
@@ -1503,7 +1717,7 @@ mod tests {
 
         match post_halt {
             SubmitError::Closed => {}
-            SubmitError::HaltSignaled { .. } => {
+            SubmitError::HaltSignaled { .. } | SubmitError::QueueFull => {
                 panic!("expected Closed after anchor halt, was HaltSignaled")
             }
         }
@@ -1547,6 +1761,7 @@ mod tests {
                 max_batch_entries: 1,
                 max_batch_latency: Duration::from_secs(30),
                 halt_threshold,
+                nonblocking_submit: false,
             },
         )
         .expect("spawn");
@@ -1587,7 +1802,7 @@ mod tests {
 
         match post_halt {
             SubmitError::Closed => {}
-            SubmitError::HaltSignaled { .. } => {
+            SubmitError::HaltSignaled { .. } | SubmitError::QueueFull => {
                 panic!("expected Closed after anchor halt, was HaltSignaled")
             }
         }
@@ -1617,6 +1832,7 @@ mod tests {
                 max_batch_entries: 1,
                 max_batch_latency: Duration::from_millis(1),
                 halt_threshold: Duration::from_millis(500),
+                nonblocking_submit: false,
             },
         )
         .expect("spawn");
@@ -1679,6 +1895,7 @@ mod tests {
                 max_batch_entries: 100,
                 max_batch_latency: Duration::from_millis(20),
                 halt_threshold: Duration::from_secs(30),
+                nonblocking_submit: false,
             },
         )
         .expect("spawn");

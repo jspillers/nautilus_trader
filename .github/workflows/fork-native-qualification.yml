@@ -57,6 +57,14 @@ jobs:
         run: >-
           cargo test --locked --profile ci-pr -p nautilus-infrastructure
           --features redis --test integration test_cache_redis -- --test-threads=1
+      - name: Test bounded asynchronous cache configuration
+        run: >-
+          cargo test --locked --profile ci-pr -p nautilus-common
+          --lib cache::config::tests -- --test-threads=1
+      - name: Test native journal writer and snapshot durability
+        run: |
+          cargo test --locked --profile ci-pr -p nautilus-event-store --lib
+          cargo test --locked --profile ci-pr -p nautilus-event-store --test integration writer::
       - name: Test native Sandbox order and account lifecycle
         run: >-
           cargo test --locked --profile ci-pr -p nautilus-sandbox
@@ -77,7 +85,8 @@ jobs:
       - name: Lint the affected native crates
         run: >-
           cargo clippy --locked --profile ci-pr -p nautilus-infrastructure
-          -p nautilus-sandbox -p nautilus-persistence -p nautilus-backtest --all-targets -- -D warnings
+          -p nautilus-sandbox -p nautilus-persistence -p nautilus-backtest
+          -p nautilus-event-store -p nautilus-common -p nautilus-system --all-targets -- -D warnings
       - name: Shut down test-only Redis
         if: always()
         run: redis-cli -h 127.0.0.1 -p 6379 shutdown nosave

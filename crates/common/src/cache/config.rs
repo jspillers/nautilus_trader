@@ -50,6 +50,11 @@ pub struct CacheConfig {
     pub timestamps_as_iso8601: bool,
     /// The buffer interval (milliseconds) between pipelined/batched transactions.
     pub buffer_interval_ms: Option<usize>,
+    /// Optional bounds for asynchronous persistence; unsupported backends report no health.
+    pub persistence_limits: Option<super::database::CachePersistenceLimits>,
+    /// Preserves in-memory state after a write enqueue failure; entry policy must consult health.
+    #[builder(default)]
+    pub continue_on_persistence_failure: bool,
     /// The batch size for bulk read operations (e.g., MGET).
     /// If set, bulk reads will be batched into chunks of this size.
     pub bulk_read_batch_size: Option<usize>,
@@ -133,6 +138,8 @@ impl CacheConfig {
             timestamps_as_iso8601,
             buffer_interval_ms,
             bulk_read_batch_size,
+            persistence_limits: None,
+            continue_on_persistence_failure: false,
             use_trader_prefix,
             use_instance_id,
             flush_on_start,
@@ -165,6 +172,22 @@ impl CacheConfig {
             );
         }
 
+        if let Some(limits) = self.persistence_limits {
+            errors.check(
+                limits.validate().is_ok(),
+                ConfigError::range(
+                    "persistence_limits",
+                    "invalid asynchronous persistence bounds",
+                ),
+            );
+        }
+        errors.check(
+            !self.continue_on_persistence_failure || self.persistence_limits.is_some(),
+            ConfigError::range(
+                "continue_on_persistence_failure",
+                "requires persistence_limits and an entry health gate",
+            ),
+        );
         errors.into_result()
     }
 }

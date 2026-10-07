@@ -265,6 +265,7 @@ fn writer_high_watermark_advances_only_after_backend_ack() {
             max_batch_entries: 2,
             max_batch_latency: Duration::from_millis(5),
             halt_threshold: Duration::from_secs(30),
+            nonblocking_submit: false,
         },
     )
     .expect("spawn");
@@ -313,6 +314,7 @@ fn writer_halts_instead_of_dropping_when_backend_blocks_past_channel_capacity() 
             max_batch_entries: 1,
             max_batch_latency: Duration::from_secs(30),
             halt_threshold: Duration::from_millis(30),
+            nonblocking_submit: false,
         },
     )
     .expect("spawn");
@@ -343,7 +345,7 @@ fn writer_halts_instead_of_dropping_when_backend_blocks_past_channel_capacity() 
 
     match stalled {
         SubmitError::HaltSignaled { .. } => {}
-        SubmitError::Closed => panic!("expected HaltSignaled, was Closed"),
+        SubmitError::Closed | SubmitError::QueueFull => panic!("expected HaltSignaled"),
     }
     assert!(matches!(
         captured.lock().first(),
@@ -444,6 +446,7 @@ fn writer_committed_entries_are_scannable_after_close() {
             max_batch_entries: 4,
             max_batch_latency: Duration::from_millis(5),
             halt_threshold: Duration::from_secs(30),
+            nonblocking_submit: false,
         },
     )
     .expect("spawn");
@@ -514,6 +517,7 @@ fn writer_carries_high_watermark_through_batch_size_flushes() {
             max_batch_entries: 3,
             max_batch_latency: Duration::from_millis(5),
             halt_threshold: Duration::from_secs(30),
+            nonblocking_submit: false,
         },
     )
     .expect("spawn");

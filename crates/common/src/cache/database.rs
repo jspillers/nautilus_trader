@@ -55,6 +55,72 @@ pub struct CacheMap {
     pub yield_curves: AHashMap<String, YieldCurveData>,
 }
 
+/// Bounded asynchronous persistence policy. Limits include queued, buffered and in-flight writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CachePersistenceLimits {
+    /// Soft command bound at which strategies stop new entries.
+    pub entry_commands: usize,
+    /// Soft retained-payload byte bound at which strategies stop new entries.
+    pub entry_bytes: usize,
+    /// Hard command bound; the remaining capacity is available to recovery events.
+    pub max_commands: usize,
+    /// Hard retained-payload byte bound.
+    pub max_bytes: usize,
+    /// Maximum oldest pending age for new entries, in milliseconds.
+    pub max_age_ms: u64,
+}
+
+impl CachePersistenceLimits {
+    /// Validates positive soft limits and reserved recovery capacity.
+    ///
+    /// # Errors
+    /// Returns an error for invalid limits.
+    pub fn validate(self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.entry_commands > 0 && self.entry_commands < self.max_commands,
+            "persistence command limits require positive soft limit and recovery reserve"
+        );
+        anyhow::ensure!(
+            self.entry_bytes > 0 && self.entry_bytes < self.max_bytes,
+            "persistence byte limits require positive soft limit and recovery reserve"
+        );
+        anyhow::ensure!(
+            self.max_age_ms > 0,
+            "persistence age limit must be positive"
+        );
+        Ok(())
+    }
+}
+
+/// Numeric local observation of an asynchronous native writer, never a durability receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct CachePersistenceHealth {
+    /// Configured bounds including the recovery reserve.
+    pub limits: CachePersistenceLimits,
+    /// Includes queued, buffered and currently executing writes.
+    pub pending_commands: usize,
+    /// Retained command key and payload bytes; excludes allocator overhead.
+    pub pending_bytes: usize,
+    /// Age of the oldest outstanding command.
+    pub oldest_pending_age_ms: u64,
+    /// Latched write/enqueue/encoding failure; never cleared automatically.
+    pub failed: bool,
+    /// Whether the original native writer task is still available.
+    pub writer_alive: bool,
+}
+impl CachePersistenceHealth {
+    /// Whether new exposure may be admitted from this local health observation.
+    #[must_use]
+    pub fn permits_entry(self) -> bool {
+        self.writer_alive
+            && !self.failed
+            && self.pending_commands < self.limits.entry_commands
+            && self.pending_bytes < self.limits.entry_bytes
+            && self.oldest_pending_age_ms < self.limits.max_age_ms
+    }
+}
+
 /// Factory for constructing cache database adapters at runtime.
 ///
 /// Implementations own the concrete database configuration and return the transport-neutral
@@ -76,6 +142,12 @@ pub trait CacheDatabaseFactory: Debug + Send + Sync {
 
 #[async_trait::async_trait]
 pub trait CacheDatabaseAdapter {
+    /// Returns local bounded writer health when the backing supports it.
+    /// No I/O is performed; this is not evidence that a particular write is durable.
+    fn persistence_health(&self) -> Option<CachePersistenceHealth> {
+        None
+    }
+
     /// Closes the cache database connection.
     ///
     /// # Errors

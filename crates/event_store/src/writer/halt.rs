@@ -31,6 +31,8 @@ use crate::error::EventStoreError;
 /// Reason a writer requested kernel halt.
 #[derive(Clone, Debug)]
 pub enum HaltReason {
+    /// Nonblocking capture found the bounded writer queue full.
+    QueueFull,
     /// A submit blocked longer than the configured halt threshold while waiting for the
     /// writer thread to drain the channel.
     BackpressureStall {

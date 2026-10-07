@@ -434,6 +434,14 @@ impl Cache {
         self.external_clients.insert(client_id);
     }
 
+    /// Observes the native backing writer without disk or network I/O.
+    #[must_use]
+    pub fn persistence_health(&self) -> Option<database::CachePersistenceHealth> {
+        self.database
+            .as_ref()
+            .and_then(|db| db.persistence_health())
+    }
+
     /// Sets the cache database adapter for persistence.
     ///
     /// This allows setting or replacing the database adapter after cache construction.

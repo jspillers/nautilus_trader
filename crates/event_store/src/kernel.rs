@@ -353,10 +353,14 @@ impl EventStoreSession {
 
         Some(Rc::new(move |snapshot_ref: CacheSnapshotRef| {
             let content_hash = compute_snapshot_content_hash(snapshot_ref.blob.as_ref());
-            writer
-                .record_snapshot_anchor(snapshot_ref.blob_ref, content_hash)
-                .map(|_| ())
-                .map_err(|e| anyhow::anyhow!("record snapshot anchor: {e}"))
+            let result = if writer.nonblocking_submit() {
+                writer.queue_snapshot_anchor(snapshot_ref.blob_ref, content_hash)
+            } else {
+                writer
+                    .record_snapshot_anchor(snapshot_ref.blob_ref, content_hash)
+                    .map(|_| ())
+            };
+            result.map_err(|e| anyhow::anyhow!("record snapshot anchor: {e}"))
         }))
     }
 
@@ -1142,6 +1146,7 @@ fn writer_config_from(config: &EventStoreConfig) -> WriterConfig {
         max_batch_entries: config.max_batch_entries,
         max_batch_latency: config.max_batch_latency,
         halt_threshold: config.halt_threshold,
+        nonblocking_submit: config.nonblocking_submit,
     }
 }
 
@@ -1443,6 +1448,7 @@ mod tests {
             max_batch_entries: 1,
             max_batch_latency: Duration::from_millis(2),
             halt_threshold: Duration::from_secs(2),
+            nonblocking_submit: false,
             run_started_timeout: Duration::from_secs(2),
         }
     }
