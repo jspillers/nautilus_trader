@@ -49,7 +49,7 @@ use nautilus_execution::{
 use nautilus_model::{
     accounts::AccountAny,
     data::{Bar, InstrumentClose, InstrumentStatus, OrderBookDeltas, QuoteTick, TradeTick},
-    enums::OmsType,
+    enums::{OmsType, PositionSide},
     events::{
         OrderCancelRejected, OrderEventAny, OrderModifyRejected, OrderRejected, PositionEvent,
     },
@@ -59,8 +59,9 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, MarginBalance, Money},
+    types::{AccountBalance, MarginBalance, Money, Quantity},
 };
+use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use crate::config::SandboxExecutionClientConfig;
@@ -447,6 +448,84 @@ impl SandboxExecutionClient {
         }
 
         self.get_account_balances()
+    }
+
+    fn get_current_position_reports(
+        &self,
+        instrument_id: Option<&InstrumentId>,
+    ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        let account_id = self.core.borrow().account_id;
+        let ts_init = self.clock.borrow().timestamp_ns();
+        let cache = self.cache.borrow();
+
+        // The cache owns the sandbox's simulated positions, as it owns its account balances.
+        // An empty report for a nonflat simulated account would incorrectly tell reconciliation
+        // that the venue is flat, causing synthetic closing fills.
+        let positions = cache.positions_open_refs(
+            Some(&self.config.venue),
+            instrument_id,
+            None,
+            Some(&account_id),
+            None,
+        );
+
+        if self.config.oms_type == OmsType::Hedging {
+            return Ok(positions
+                .into_iter()
+                .map(|position| {
+                    PositionStatusReport::new(
+                        account_id,
+                        position.instrument_id,
+                        position.side,
+                        position.quantity,
+                        position.ts_last,
+                        ts_init,
+                        None,
+                        Some(position.id),
+                        None,
+                    )
+                })
+                .collect());
+        }
+
+        // Netting reports describe the account's aggregate, not individual strategy positions.
+        // Mass-status reconciliation compares each report with the complete instrument position.
+        let mut net = AHashMap::<InstrumentId, (Decimal, u8, UnixNanos)>::new();
+        for position in positions {
+            let entry = net.entry(position.instrument_id).or_insert((
+                Decimal::ZERO,
+                0,
+                UnixNanos::default(),
+            ));
+            entry.0 = entry
+                .0
+                .checked_add(position.signed_decimal_qty())
+                .ok_or_else(|| anyhow::anyhow!("Sandbox net position quantity overflow"))?;
+            entry.1 = entry.1.max(position.quantity.precision);
+            entry.2 = entry.2.max(position.ts_last);
+        }
+        net.into_iter()
+            .map(|(instrument_id, (signed_qty, precision, ts_last))| {
+                let side = if signed_qty > Decimal::ZERO {
+                    PositionSide::Long
+                } else if signed_qty < Decimal::ZERO {
+                    PositionSide::Short
+                } else {
+                    PositionSide::Flat
+                };
+                Ok(PositionStatusReport::new(
+                    account_id,
+                    instrument_id,
+                    side,
+                    Quantity::from_decimal_dp(signed_qty.abs(), precision)?,
+                    ts_last,
+                    ts_init,
+                    None,
+                    None,
+                    None,
+                ))
+            })
+            .collect()
     }
 
     fn sync_cached_account_config(&self) -> anyhow::Result<()> {
@@ -892,10 +971,9 @@ impl ExecutionClient for SandboxExecutionClient {
 
     async fn generate_position_status_reports(
         &self,
-        _cmd: &GeneratePositionStatusReports,
+        cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        // Sandbox positions are tracked internally
-        Ok(Vec::new())
+        self.get_current_position_reports(cmd.instrument_id.as_ref())
     }
 
     async fn generate_mass_status(
@@ -904,13 +982,10 @@ impl ExecutionClient for SandboxExecutionClient {
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
         let core = self.core.borrow();
         let ts_init = self.clock.borrow().timestamp_ns();
-        Ok(Some(ExecutionMassStatus::new(
-            core.client_id,
-            core.account_id,
-            core.venue,
-            ts_init,
-            None,
-        )))
+        let mut status =
+            ExecutionMassStatus::new(core.client_id, core.account_id, core.venue, ts_init, None);
+        status.add_position_reports(self.get_current_position_reports(None)?);
+        Ok(Some(status))
     }
 }
 
