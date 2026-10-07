@@ -105,6 +105,7 @@ fn config_with(base_dir: PathBuf) -> EventStoreConfig {
         replay_from_run_id: None,
         data_markers: None,
         channel_capacity: 64,
+        nonblocking_submit: false,
         max_batch_entries: 1,
         max_batch_latency: Duration::from_millis(2),
         halt_threshold: Duration::from_secs(2),

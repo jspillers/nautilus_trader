@@ -1593,6 +1593,8 @@ impl CacheConfig {
             encoding: encoding.unwrap_or_default(),
             timestamps_as_iso8601: timestamps_as_iso8601.unwrap_or(false),
             buffer_interval_ms,
+            persistence_limits: None,
+            continue_on_persistence_failure: false,
             bulk_read_batch_size,
             use_trader_prefix: use_trader_prefix.unwrap_or(true),
             use_instance_id: use_instance_id.unwrap_or(false),

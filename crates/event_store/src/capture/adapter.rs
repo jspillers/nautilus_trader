@@ -299,6 +299,7 @@ fn halt_reason_from_submit(err: &SubmitError) -> HaltReason {
             stalled_for: *stalled_for,
             threshold: *threshold,
         },
+        SubmitError::QueueFull => HaltReason::QueueFull,
         SubmitError::Closed => HaltReason::BackendError("event store writer closed".to_string()),
     }
 }

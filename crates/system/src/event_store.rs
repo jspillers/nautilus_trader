@@ -271,6 +271,9 @@ pub struct EventStoreConfig {
     pub max_batch_latency: Duration,
     /// Submit-side stall ceiling that triggers writer fail-stop.
     pub halt_threshold: Duration,
+    /// Queues captures and snapshot anchors without waiting for disk or queue capacity.
+    #[serde(default)]
+    pub nonblocking_submit: bool,
     /// Maximum time to wait for the `RunStarted` entry to durably commit before the
     /// kernel surfaces an event-store boot error.
     pub run_started_timeout: Duration,
@@ -288,6 +291,7 @@ impl Default for EventStoreConfig {
             max_batch_entries: 100,
             max_batch_latency: Duration::from_millis(5),
             halt_threshold: Duration::from_millis(250),
+            nonblocking_submit: false,
             run_started_timeout: Duration::from_secs(5),
         }
     }
@@ -309,6 +313,7 @@ mod tests {
         assert_eq!(restored.max_batch_entries, config.max_batch_entries);
         assert_eq!(restored.max_batch_latency, config.max_batch_latency);
         assert_eq!(restored.halt_threshold, config.halt_threshold);
+        assert_eq!(restored.nonblocking_submit, config.nonblocking_submit);
         assert_eq!(restored.run_started_timeout, config.run_started_timeout);
         assert_eq!(restored.base_dir, config.base_dir);
         assert_eq!(restored.retention, config.retention);
