@@ -44,6 +44,9 @@ env:
 
 jobs:
   plan:
+    # The maintained native-only fork uses fork-native-qualification.yml; upstream
+    # package/release jobs require upstream self-hosted runners and credentials.
+    if: github.repository != 'jspillers/nautilus_trader'
     name: plan
     runs-on: ubuntu-latest
     outputs:
