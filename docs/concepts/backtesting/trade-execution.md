@@ -222,6 +222,13 @@ displayed-size evidence:
 - Historical data cannot reveal hidden orders or every venue-specific priority rule.
 
 :::warning[Unknown aggressor side]
-`NO_AGGRESSOR` trades reduce queues on both sides. This can clear a queue and fill an order
-earlier than reality, so it is optimistic from the strategy's execution perspective.
+With queue tracking enabled, `NO_AGGRESSOR` trades do not advance either queue or
+credit a resting maker fill. The passive side is unknown, so treating either side
+as executed would be optimistic. Without queue tracking, the existing trade
+matching behavior remains unchanged.
 :::
+
+With queue tracking enabled, resting maker fills require a directional trade on
+the opposite side. Removing displayed quantity ahead or touching/crossing a quote
+does not itself credit a maker fill. Trades with unknown aggressor side do not
+credit queue-aware maker fills. Taker commands still match available book liquidity.

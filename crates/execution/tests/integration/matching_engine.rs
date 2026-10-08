@@ -13336,6 +13336,55 @@ fn process_l2_ask_level_delta(
 }
 
 #[rstest]
+#[case(AggressorSide::Buy, true)]
+#[case(AggressorSide::Sell, false)]
+#[case(AggressorSide::NoAggressor, false)]
+fn test_l2_queue_maker_book_touch_requires_directional_trade(
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+    #[case] aggressor: AggressorSide,
+    #[case] fills: bool,
+) {
+    let (mut engine, _cache, handler) = get_l2_queue_position_engine(instrument_eth_usdt.clone());
+    let instrument_id = instrument_eth_usdt.id();
+    process_l2_ask_level_delta(&mut engine, instrument_id, BookAction::Add, "10.000", 1);
+    rest_sell_limit_at_100(&mut engine, instrument_id, account_id, "5.000");
+    clear_order_event_handler_messages(&handler);
+    process_l2_ask_level_delta(&mut engine, instrument_id, BookAction::Delete, "10.000", 2);
+    let bid = OrderBookDeltaTestBuilder::new(instrument_id)
+        .book_action(BookAction::Add)
+        .book_order(BookOrder::new(
+            OrderSide::Buy,
+            Price::from("100.00"),
+            Quantity::from("10.000"),
+            0,
+        ))
+        .sequence(3)
+        .ts_event(UnixNanos::from(3))
+        .ts_init(UnixNanos::from(3))
+        .build();
+    engine.process_order_book_delta(&bid).unwrap();
+    assert!(get_fill_quantities(&handler).is_empty());
+    engine.process_trade_tick(&TradeTick::new(
+        instrument_id,
+        Price::from("100.00"),
+        Quantity::from("2.000"),
+        aggressor,
+        TradeId::new("TOUCH-TRADE"),
+        UnixNanos::from(4),
+        UnixNanos::from(4),
+    ));
+    assert_eq!(
+        get_fill_quantities(&handler),
+        if fills {
+            vec![Quantity::from("2.000")]
+        } else {
+            vec![]
+        }
+    );
+}
+
+#[rstest]
 fn test_l2_queue_position_level_delete_clears_queue(
     account_id: AccountId,
     instrument_eth_usdt: InstrumentAny,
