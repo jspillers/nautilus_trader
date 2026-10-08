@@ -133,6 +133,7 @@ pub struct OrderMatchingEngine {
     canceled_oto_order_ids: IndexSet<ClientOrderId>,
     ids_generator: IdsGenerator,
     last_trade_size: Option<Quantity>,
+    last_trade_aggressor: Option<AggressorSide>,
     trade_consumption: QuantityRaw,
     bid_consumption: IndexMap<PriceRaw, (QuantityRaw, QuantityRaw)>,
     ask_consumption: IndexMap<PriceRaw, (QuantityRaw, QuantityRaw)>,
@@ -232,6 +233,7 @@ impl OrderMatchingEngine {
             canceled_oto_order_ids: IndexSet::new(),
             ids_generator,
             last_trade_size: None,
+            last_trade_aggressor: None,
             trade_consumption: 0,
             bid_consumption: IndexMap::new(),
             ask_consumption: IndexMap::new(),
@@ -307,6 +309,7 @@ impl OrderMatchingEngine {
         self.target_ask = None;
         self.target_last = None;
         self.last_trade_size = None;
+        self.last_trade_aggressor = None;
         self.trade_consumption = 0;
         self.bid_consumption.clear();
         self.ask_consumption.clear();
@@ -806,6 +809,21 @@ impl OrderMatchingEngine {
     fn determine_trade_fill_qty(&self, order: &OrderAny) -> Option<QuantityRaw> {
         if !self.config.queue_position {
             return Some(order.leaves_qty().raw());
+        }
+
+        // Queue-aware maker fills require a directional trade, not just a book
+        // touch or deleted quantity ahead. Taker submissions retain book matching.
+        if order.liquidity_side() == Some(LiquiditySide::Maker) {
+            self.last_trade_size?;
+            let correct_side = matches!(
+                (order.order_side(), self.last_trade_aggressor),
+                (OrderSide::Buy, Some(AggressorSide::Sell))
+                    | (OrderSide::Sell, Some(AggressorSide::Buy))
+            );
+
+            if !correct_side {
+                return None;
+            }
         }
 
         let client_order_id = order.client_order_id();
@@ -2442,6 +2460,7 @@ impl OrderMatchingEngine {
         }
 
         self.last_trade_size = Some(trade.size);
+        self.last_trade_aggressor = Some(aggressor_side);
         self.trade_consumption = 0;
 
         if self.config.liquidity_consumption && self.book_type != BookType::L1_MBP {
@@ -2453,12 +2472,15 @@ impl OrderMatchingEngine {
             );
         }
 
-        self.resolve_pending_on_trade(price_raw);
-        self.decrement_queue_on_trade(price_raw, trade.size.raw(), aggressor_side);
+        if aggressor_side != AggressorSide::NoAggressor || !self.config.queue_position {
+            self.resolve_pending_on_trade(price_raw);
+            self.decrement_queue_on_trade(price_raw, trade.size.raw(), aggressor_side);
+        }
 
         self.iterate(trade.ts_init, aggressor_side);
 
         self.last_trade_size = None;
+        self.last_trade_aggressor = None;
         self.trade_consumption = 0;
 
         // Restore the non-aggressor side after temporary trade price override.
@@ -11997,6 +12019,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[rstest]
+    #[case(AggressorSide::Sell, true)]
+    #[case(AggressorSide::Buy, false)]
+    #[case(AggressorSide::NoAggressor, false)]
+    fn test_queue_maker_requires_trade_evidence(
+        #[case] aggressor: AggressorSide,
+        #[case] allowed: bool,
+    ) {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let (mut engine, _cache) = get_queue_engine(instrument.clone(), BookType::L2_MBP);
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("10.000"))
+            .price(Price::from("100.00"))
+            .build();
+        order.set_liquidity_side(LiquiditySide::Maker);
+        assert_eq!(engine.determine_trade_fill_qty(&order), None);
+        engine.last_trade_size = Some(Quantity::from("4.000"));
+        engine.last_trade_aggressor = Some(aggressor);
+        assert_eq!(
+            engine.determine_trade_fill_qty(&order),
+            allowed.then_some(Quantity::from("4.000").raw())
+        );
+        order.set_liquidity_side(LiquiditySide::Taker);
+        engine.last_trade_size = None;
+        engine.last_trade_aggressor = None;
+        assert_eq!(
+            engine.determine_trade_fill_qty(&order),
+            Some(order.leaves_qty().raw())
+        );
+        order.set_liquidity_side(LiquiditySide::Maker);
+        engine.config.queue_position = false;
+        assert_eq!(
+            engine.determine_trade_fill_qty(&order),
+            Some(order.leaves_qty().raw())
+        );
     }
 
     #[rstest]
