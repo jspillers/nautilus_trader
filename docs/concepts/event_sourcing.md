@@ -371,6 +371,14 @@ The loader **does not**:
 Fired `TimeEvent`s and raw venue reports are inspection records on this path; replay applies the
 synthesized order, position, and account events captured later in the run.
 
+Capture precedes live order-event application. A late `OrderCancelRejected` can therefore appear
+after a fill or cancellation has already closed its order. Replay first uses the same native
+order update and identity validation. If that update reports an invalid state transition on the
+already-closed order, replay leaves the order, fills, position and account unchanged, matching
+the live execution engine. The entry stays in the journal and increments `ignored_entries` rather
+than `applied_entries`. Missing orders, identity mismatches, decoding failures and invalid
+transitions on open orders still fail replay; this rule does not discard fills or other event types.
+
 ## Data marker sidecar
 
 :::note
