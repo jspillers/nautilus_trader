@@ -43,7 +43,7 @@ use nautilus_model::{
         PositionAdjusted, PositionChanged, PositionClosed, PositionOpened,
     },
     identifiers::PositionId,
-    orders::{Order, OrderAny},
+    orders::{Order, OrderAny, OrderError},
     position::{Position, PositionReplayEvent},
     types::{Money, Quantity},
 };
@@ -103,7 +103,7 @@ pub struct CacheReplayReport {
     pub plan: SnapshotReplayPlan,
     /// Number of entries applied to cache state.
     pub applied_entries: usize,
-    /// Number of event-store entries that do not have a cache replay rule yet.
+    /// Number of entries outside the replay surface or ignored by a named replay rule.
     pub ignored_entries: usize,
 }
 
@@ -1236,6 +1236,8 @@ pub fn restore_cache_snapshot_blob(
 /// fill's instrument is missing so the position cannot open). The latter paths log a
 /// warning so the report's ignored count surfaces the divergence instead of claiming
 /// a full apply.
+/// A cancel rejection with an invalid transition on an already-closed order is also
+/// ignored, matching the live execution engine's unchanged order disposition.
 ///
 /// # Errors
 ///
@@ -1310,9 +1312,7 @@ fn apply_cache_replay_entry_with_context(
         PAYLOAD_TYPE_ORDER_MODIFY_REJECTED => {
             apply_order_event(cache, entry, OrderEventAny::ModifyRejected)?;
         }
-        PAYLOAD_TYPE_ORDER_CANCEL_REJECTED => {
-            apply_order_event(cache, entry, OrderEventAny::CancelRejected)?;
-        }
+        PAYLOAD_TYPE_ORDER_CANCEL_REJECTED => return apply_order_cancel_rejected(cache, entry),
         PAYLOAD_TYPE_ORDER_UPDATED => {
             apply_order_event(cache, entry, OrderEventAny::Updated)?;
         }
@@ -1395,6 +1395,34 @@ fn apply_complete_cache_payload_entry(
     }
 
     Ok(true)
+}
+
+fn apply_order_cancel_rejected(
+    cache: &mut Cache,
+    entry: &EventStoreEntry,
+) -> Result<bool, CacheReplayError> {
+    let event = decode_order_event(entry, OrderEventAny::CancelRejected)?;
+    match cache.update_order(&event) {
+        Ok(_) => Ok(true),
+        Err(e)
+            if matches!(
+                e.downcast_ref::<OrderError>(),
+                Some(OrderError::InvalidStateTransition)
+            ) && cache
+                .order(&event.client_order_id())
+                .is_some_and(|order| order.is_closed()) =>
+        {
+            // Capture precedes live application. A cancel reply can lose a race with a fill or
+            // cancellation; the live ExecutionEngine drops this input without changing the order.
+            // Cache::update_order validates identity and applies on a snapshot before this check.
+            log::debug!(
+                "Ignored late closed-order cancel rejection at replay seq {}",
+                entry.seq
+            );
+            Ok(false)
+        }
+        Err(e) => Err(apply_error(entry, e)),
+    }
 }
 
 fn apply_order_event<T>(
@@ -2010,13 +2038,21 @@ fn reject_quarantined_replay_source(
 
 #[cfg(test)]
 mod tests {
-    use std::{any::Any, cell::Cell, rc::Rc};
+    use std::{
+        any::Any,
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
 
     use ahash::AHashSet;
     use bytes::Bytes;
     use indexmap::IndexMap;
-    use nautilus_common::msgbus::{self, BusTap, Endpoint, MStr, Topic as BusTopic};
+    use nautilus_common::{
+        clock::VirtualClock,
+        msgbus::{self, BusTap, Endpoint, MStr, Topic as BusTopic},
+    };
     use nautilus_core::{UUID4, UnixNanos};
+    use nautilus_execution::engine::ExecutionEngine;
     use nautilus_model::{
         accounts::AccountAny,
         data::{
@@ -2031,19 +2067,19 @@ mod tests {
             PositionEvent,
             account::stubs::{cash_account_state, cash_account_state_million_usd},
             order::spec::{
-                OrderAcceptedSpec, OrderFillVoidedSpec, OrderFilledSpec, OrderInitializedSpec,
-                OrderSubmittedSpec,
+                OrderAcceptedSpec, OrderCancelRejectedSpec, OrderCanceledSpec, OrderFillVoidedSpec,
+                OrderFilledSpec, OrderInitializedSpec, OrderPendingCancelSpec, OrderSubmittedSpec,
             },
         },
         identifiers::{
-            AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, PositionId, TradeId,
-            VenueOrderId,
+            AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, PositionId, StrategyId,
+            TradeId, VenueOrderId,
         },
         instruments::{
             Instrument, InstrumentAny,
             stubs::{audusd_sim, binary_option},
         },
-        orders::{Order, OrderList},
+        orders::{Order, OrderError, OrderList},
         types::{Currency, Money, Price, Quantity},
     };
     use rstest::rstest;
@@ -3826,6 +3862,208 @@ mod tests {
         assert_eq!(position.last_event(), Some(filled.clone()));
         assert_eq!(position.trade_ids(), vec![filled.trade_id]);
         assert_eq!(position.commissions(), vec![Money::from("1 USD")]);
+    }
+
+    fn cancel_race_events(terminal: OrderStatus) -> Vec<OrderEventAny> {
+        let instrument_id = audusd_sim().id();
+        let initialized = OrderInitializedSpec::builder()
+            .instrument_id(instrument_id)
+            .build();
+        let submitted = OrderSubmittedSpec::builder()
+            .instrument_id(instrument_id)
+            .client_order_id(initialized.client_order_id)
+            .build();
+        let accepted = OrderAcceptedSpec::builder()
+            .instrument_id(instrument_id)
+            .client_order_id(initialized.client_order_id)
+            .account_id(submitted.account_id)
+            .build();
+        let pending = OrderPendingCancelSpec::builder()
+            .instrument_id(instrument_id)
+            .client_order_id(initialized.client_order_id)
+            .venue_order_id(accepted.venue_order_id)
+            .account_id(submitted.account_id)
+            .build();
+        let closed = match terminal {
+            OrderStatus::Filled => OrderEventAny::Filled(
+                OrderFilledSpec::builder()
+                    .instrument_id(instrument_id)
+                    .client_order_id(initialized.client_order_id)
+                    .venue_order_id(accepted.venue_order_id)
+                    .account_id(submitted.account_id)
+                    .position_id(PositionId::from("P-CANCEL-RACE"))
+                    .commission(Money::from("1 USD"))
+                    .build(),
+            ),
+            OrderStatus::Canceled => OrderEventAny::Canceled(
+                OrderCanceledSpec::builder()
+                    .instrument_id(instrument_id)
+                    .client_order_id(initialized.client_order_id)
+                    .venue_order_id(accepted.venue_order_id)
+                    .account_id(submitted.account_id)
+                    .build(),
+            ),
+            _ => panic!("Expected a filled or canceled order"),
+        };
+        let rejected = OrderCancelRejectedSpec::builder()
+            .instrument_id(instrument_id)
+            .client_order_id(initialized.client_order_id)
+            .venue_order_id(accepted.venue_order_id)
+            .account_id(submitted.account_id)
+            .reason(Ustr::from("order not found"))
+            .build();
+        vec![
+            OrderEventAny::Initialized(initialized),
+            OrderEventAny::Submitted(submitted),
+            OrderEventAny::Accepted(accepted),
+            OrderEventAny::PendingCancel(pending),
+            closed,
+            OrderEventAny::CancelRejected(rejected),
+        ]
+    }
+
+    #[rstest]
+    #[case::filled(OrderStatus::Filled)]
+    #[case::canceled(OrderStatus::Canceled)]
+    fn late_cancel_rejection_matches_live_closed_order_disposition(#[case] terminal: OrderStatus) {
+        let events = cancel_race_events(terminal);
+        let client_order_id = events[0].client_order_id();
+        let position_id = PositionId::from("P-CANCEL-RACE");
+        let state = cash_account_state_million_usd("100 USD", "0 USD", "100 USD");
+        let account_id = state.account_id;
+        let mut entries = vec![append_account_state(1, &state)];
+        entries.extend(
+            events[..5]
+                .iter()
+                .enumerate()
+                .map(|(i, event)| append_order_event(i as u64 + 2, event)),
+        );
+        let mut cache = Cache::default();
+        cache
+            .add_instrument(InstrumentAny::CurrencyPair(audusd_sim()))
+            .expect("instrument");
+        let prefix = reader_with_entries("run-cancel-prefix", &entries);
+        replay_cache_snapshot_tail(&mut cache, &prefix).expect("prefix replay");
+        let before_order = cache.order_owned(&client_order_id).expect("closed order");
+        let before_position = cache.position_owned(&position_id);
+        let before_account = cache.account_owned(&account_id).expect("account");
+        assert_eq!(before_order.status(), terminal);
+        assert!(matches!(
+            cache
+                .update_order(&events[5])
+                .unwrap_err()
+                .downcast_ref::<OrderError>(),
+            Some(OrderError::InvalidStateTransition)
+        ));
+
+        let live_cache = Rc::new(RefCell::new(cache));
+        let mut engine = ExecutionEngine::new(
+            Rc::new(RefCell::new(VirtualClock::new())),
+            Rc::clone(&live_cache),
+            None,
+        );
+        engine.process(&events[5]);
+        assert_eq!(
+            live_cache.borrow().order_owned(&client_order_id),
+            Some(before_order.clone())
+        );
+
+        entries.push(append_order_event(7, &events[5]));
+        let reader = reader_with_entries("run-cancel-race", &entries);
+        let mut replayed = Cache::default();
+        replayed
+            .add_instrument(InstrumentAny::CurrencyPair(audusd_sim()))
+            .expect("instrument");
+        let report =
+            replay_cache_snapshot_tail(&mut replayed, &reader).expect("replay late rejection");
+        assert_eq!(report.applied_entries, 6);
+        assert_eq!(report.ignored_entries, 1);
+        assert_eq!(replayed.order_owned(&client_order_id), Some(before_order));
+        assert_eq!(replayed.position_owned(&position_id), before_position);
+        assert_eq!(replayed.account_owned(&account_id), Some(before_account));
+        assert_eq!(
+            replayed.order_owned(&client_order_id),
+            live_cache.borrow().order_owned(&client_order_id)
+        );
+        assert_eq!(
+            replayed.position_owned(&position_id),
+            live_cache.borrow().position_owned(&position_id)
+        );
+        assert!(replayed.check_integrity());
+    }
+
+    #[rstest]
+    fn cancel_rejection_for_pending_order_still_applies() {
+        let events = cancel_race_events(OrderStatus::Filled);
+        let client_order_id = events[0].client_order_id();
+        let mut entries: Vec<_> = events[..4]
+            .iter()
+            .enumerate()
+            .map(|(i, event)| append_order_event(i as u64 + 1, event))
+            .collect();
+        entries.push(append_order_event(5, &events[5]));
+        let mut cache = Cache::default();
+        let reader = reader_with_entries("run-valid-cancel-rejection", &entries);
+        let report = replay_cache_snapshot_tail(&mut cache, &reader).expect("valid rejection");
+        let order = cache.order_owned(&client_order_id).expect("order");
+        assert_eq!(report.applied_entries, 5);
+        assert_eq!(report.ignored_entries, 0);
+        assert_eq!(order.status(), OrderStatus::Accepted);
+        assert_eq!(order.last_event(), &events[5]);
+    }
+
+    #[rstest]
+    #[case::wrong_strategy(true, false)]
+    #[case::wrong_client(false, false)]
+    #[case::unknown_order(false, true)]
+    fn late_cancel_rejection_keeps_identity_errors(
+        #[case] wrong_strategy: bool,
+        #[case] unknown: bool,
+    ) {
+        let mut events = cancel_race_events(OrderStatus::Filled);
+        let client_order_id = events[0].client_order_id();
+        let mut cache = Cache::default();
+        cache
+            .add_instrument(InstrumentAny::CurrencyPair(audusd_sim()))
+            .expect("instrument");
+
+        for (i, event) in events[..5].iter().enumerate() {
+            apply_cache_replay_entry(&mut cache, &append_order_event(i as u64 + 1, event).entry)
+                .expect("prefix event");
+        }
+        let before = cache.order_owned(&client_order_id);
+        let OrderEventAny::CancelRejected(mut rejected) = events.pop().expect("rejection") else {
+            unreachable!()
+        };
+
+        if wrong_strategy {
+            rejected.strategy_id = StrategyId::from("OTHER-001");
+        } else {
+            rejected.client_order_id = ClientOrderId::from("O-UNKNOWN");
+            if unknown {
+                rejected.venue_order_id = None;
+            }
+        }
+        let entry = append_order_event(6, &OrderEventAny::CancelRejected(rejected)).entry;
+        let error =
+            apply_cache_replay_entry(&mut cache, &entry).expect_err("identity remains invalid");
+        assert!(matches!(error, CacheReplayError::Apply { seq: 6, .. }));
+        assert_eq!(cache.order_owned(&client_order_id), before);
+    }
+
+    #[rstest]
+    fn cancel_rejection_for_invalid_open_order_still_fails() {
+        let events = cancel_race_events(OrderStatus::Filled);
+        let client_order_id = events[0].client_order_id();
+        let mut cache = Cache::default();
+        apply_cache_replay_entry(&mut cache, &append_order_event(1, &events[0]).entry)
+            .expect("init");
+        let before = cache.order_owned(&client_order_id);
+        let entry = append_order_event(2, &events[5]).entry;
+        let error =
+            apply_cache_replay_entry(&mut cache, &entry).expect_err("open invalid transition");
+        assert!(matches!(error, CacheReplayError::Apply { seq: 2, .. }));
+        assert_eq!(cache.order_owned(&client_order_id), before);
     }
 
     #[rstest]
