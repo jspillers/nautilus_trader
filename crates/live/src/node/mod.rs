@@ -1590,6 +1590,29 @@ impl LiveNode {
                 }
             };
 
+            // Observe all native queues at every runner boundary, including after
+            // the final dispatch. Recovery needs no later input or timer.
+
+            if let Some(monitor) = queue_monitor.as_mut() {
+                let depths = RunnerChannelQueueDepths::from_receivers(
+                    &time_evt_rx,
+                    &exec_evt_rx,
+                    &exec_cmd_rx,
+                    &data_evt_rx,
+                    &data_cmd_rx,
+                );
+
+                for (channel, depth) in [
+                    (SystemChannel::TimeEvents, depths.time_events),
+                    (SystemChannel::ExecEvents, depths.exec_events),
+                    (SystemChannel::ExecCommands, depths.exec_commands),
+                    (SystemChannel::DataEvents, depths.data_events),
+                    (SystemChannel::DataCommands, depths.data_commands),
+                ] {
+                    self.observe_runner_queue_depth(monitor, channel, depth, &metrics);
+                }
+            }
+
             let shutdown_deadline = self.shutdown_deadline;
             let is_shutting_down = self.state() == NodeState::ShuttingDown;
             let is_running = self.state() == NodeState::Running;
@@ -1834,6 +1857,11 @@ impl LiveNode {
                 // submit, etc.) is not delayed behind a market data backlog
                 // when the biased select polls receivers each iteration.
                 Some(handler) = time_evt_rx.recv() => {
+                    // Include the message just dequeued when waking on a burst.
+
+                    if let Some(monitor) = queue_monitor.as_mut() {
+                        self.observe_runner_queue_depth(monitor, SystemChannel::TimeEvents, time_evt_rx.len().saturating_add(1), &metrics);
+                    }
                     let dispatch_start = dst::time::Instant::now();
                     let dispatched = AsyncRunner::handle_time_event(handler);
 
@@ -1866,6 +1894,11 @@ impl LiveNode {
                     command.dispatch(|command| self.process_system_command(command));
                 }
                 Some(evt) = exec_evt_rx.recv() => {
+                    // Include the message just dequeued when waking on a burst.
+
+                    if let Some(monitor) = queue_monitor.as_mut() {
+                        self.observe_runner_queue_depth(monitor, SystemChannel::ExecEvents, exec_evt_rx.len().saturating_add(1), &metrics);
+                    }
                     let dispatch_start = dst::time::Instant::now();
 
                     if is_shutting_down {
@@ -1882,6 +1915,11 @@ impl LiveNode {
                     );
                 }
                 Some(cmd) = exec_cmd_rx.recv() => {
+                    // Include the message just dequeued when waking on a burst.
+
+                    if let Some(monitor) = queue_monitor.as_mut() {
+                        self.observe_runner_queue_depth(monitor, SystemChannel::ExecCommands, exec_cmd_rx.len().saturating_add(1), &metrics);
+                    }
                     let dispatch_start = dst::time::Instant::now();
 
                     if is_shutting_down {
@@ -1922,6 +1960,11 @@ impl LiveNode {
                     );
                 }
                 Some(evt) = data_evt_rx.recv() => {
+                    // Include the message just dequeued when waking on a burst.
+
+                    if let Some(monitor) = queue_monitor.as_mut() {
+                        self.observe_runner_queue_depth(monitor, SystemChannel::DataEvents, data_evt_rx.len().saturating_add(1), &metrics);
+                    }
                     let dispatch_start = dst::time::Instant::now();
 
                     if is_shutting_down {
@@ -1937,6 +1980,11 @@ impl LiveNode {
                     );
                 }
                 Some(cmd) = data_cmd_rx.recv() => {
+                    // Include the message just dequeued when waking on a burst.
+
+                    if let Some(monitor) = queue_monitor.as_mut() {
+                        self.observe_runner_queue_depth(monitor, SystemChannel::DataCommands, data_cmd_rx.len().saturating_add(1), &metrics);
+                    }
                     let dispatch_start = dst::time::Instant::now();
 
                     if is_shutting_down {
@@ -1999,6 +2047,19 @@ impl LiveNode {
         log::info!("Event loop stopped");
 
         stop_result
+    }
+
+    fn observe_runner_queue_depth(
+        &self,
+        monitor: &mut QueueMonitor,
+        channel: SystemChannel,
+        depth: usize,
+        metrics: &RunnerMetrics,
+    ) {
+        if let Some(transition) = monitor.observe_queue_depth(channel, depth, || metrics.snapshot())
+        {
+            self.publish_queue_state_transitions(std::slice::from_ref(&transition));
+        }
     }
 
     fn publish_queue_state_transitions(&self, transitions: &[QueueStateTransition]) {
@@ -4288,6 +4349,188 @@ mod tests {
         }
 
         node.stop().await.unwrap();
+        node.dispose();
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_run_queue_pressure_burst_overhead_and_tail_latency() {
+        use std::time::Instant;
+        let mut results = Vec::new();
+
+        for enabled in [false, true] {
+            let config = LiveNodeConfig {
+                trader_id: TraderId::from("QUEUE-BURST-001"),
+                queue_monitor: enabled.then_some(crate::config::QueueMonitorConfig {
+                    queue_depth_trigger: 100,
+                    queue_depth_clear: 10,
+                    mean_dispatch_ns_trigger: u64::MAX,
+                    mean_dispatch_ns_clear: 0,
+                }),
+                exec_engine: crate::config::LiveExecutionEngineConfig {
+                    reconciliation: false,
+                    ..Default::default()
+                },
+                delay_post_stop: Duration::ZERO,
+                ..Default::default()
+            };
+            let mut node = LiveNode::build("QueueBurstNode".to_string(), Some(config)).unwrap();
+            let handle = node.handle();
+            let edges = Rc::new(RefCell::new(Vec::new()));
+            let handler = ShareableMessageHandler::from_typed({
+                let edges = edges.clone();
+                move |event: &QueueStateChanged| {
+                    if event.channel == SystemChannel::DataEvents
+                        && event.condition == QueueCondition::Backlogged
+                    {
+                        let observed_ns = nautilus_core::time::get_atomic_clock_realtime()
+                            .get_time_ns()
+                            .as_u64();
+                        assert!(observed_ns >= event.ts_init.as_u64());
+                        edges.borrow_mut().push((
+                            event.state,
+                            Instant::now(),
+                            observed_ns - event.ts_init.as_u64(),
+                        ));
+                    }
+                }
+            });
+            msgbus::subscribe_any(
+                MessagingSwitchboard::queue_state_changed_pattern(None),
+                handler,
+                None,
+            );
+            let mut burst_ns = Vec::new();
+            let mut activation_ns = Vec::new();
+            let mut recovery_ns = Vec::new();
+            let mut publication_delivery_ns = Vec::new();
+            let start = tokio::time::Instant::now();
+            let drive = async {
+                wait_until_async(|| async { handle.is_running() }, Duration::from_secs(2)).await;
+
+                for batch in 0..200u64 {
+                    let edge_start = edges.borrow().len();
+                    let inputs = (0..128).map(|_| stub_data_event()).collect::<Vec<_>>();
+                    let began = Instant::now();
+
+                    for input in inputs {
+                        get_data_event_sender().send(input).unwrap();
+                    }
+                    // This is a workload completion barrier for the benchmark;
+                    // no polling participates in native readiness or publication.
+                    while handle.metrics_snapshot().data_events.dispatched < (batch + 1) * 128 {
+                        tokio::task::yield_now().await;
+                    }
+                    burst_ns.push(u64::try_from(began.elapsed().as_nanos()).unwrap());
+
+                    if enabled {
+                        let observations = edges.borrow();
+                        let current = &observations[edge_start..];
+                        assert_eq!(current.len(), 2);
+                        publication_delivery_ns.extend(current.iter().map(|event| event.2));
+                        assert_eq!(current[0].0, QueueState::Triggered);
+                        assert_eq!(current[1].0, QueueState::Cleared);
+                        activation_ns.push(
+                            u64::try_from(current[0].1.duration_since(began).as_nanos()).unwrap(),
+                        );
+                        recovery_ns.push(
+                            u64::try_from(current[1].1.duration_since(began).as_nanos()).unwrap(),
+                        );
+                    }
+                }
+                assert!(start.elapsed() < Duration::from_millis(100));
+                handle.stop();
+            };
+            let (result, ()) = tokio::join!(node.run(), drive);
+            result.unwrap();
+            let distribution = |mut samples: Vec<u64>| {
+                samples.sort_unstable();
+
+                if samples.is_empty() {
+                    return serde_json::Value::Null;
+                }
+                let n = samples.len();
+                serde_json::json!({"n":n,"median_ns":samples[n/2],"p95_ns":samples[(n-1)*95/100],"p99_ns":samples[(n-1)*99/100],"max_ns":samples[n-1]})
+            };
+            results.push(serde_json::json!({"monitor":enabled,"batch_size":128,"burst":distribution(burst_ns),"enqueue_to_native_activation_callback":distribution(activation_ns),"enqueue_to_native_recovery_callback":distribution(recovery_ns),"native_transition_publication_to_typed_callback":distribution(publication_delivery_ns)}));
+            node.dispose();
+        }
+        println!(
+            "NATIVE_QUEUE_BURST_MEASUREMENTS {}",
+            serde_json::json!({"scope":"200 native instrument bursts per arm; local debug wall clock, no physical WAN claim", "results":results})
+        );
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_run_backlog_trigger_and_recovery_need_no_maintenance_or_later_input() {
+        let config = LiveNodeConfig {
+            trader_id: TraderId::from("QUEUE-EDGE-001"),
+            queue_monitor: Some(crate::config::QueueMonitorConfig {
+                queue_depth_trigger: 100,
+                queue_depth_clear: 10,
+                mean_dispatch_ns_trigger: u64::MAX,
+                mean_dispatch_ns_clear: 0,
+            }),
+            exec_engine: crate::config::LiveExecutionEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            },
+            delay_post_stop: Duration::ZERO,
+            ..Default::default()
+        };
+        let mut node = LiveNode::build("QueueEdgeNode".to_string(), Some(config)).unwrap();
+        let handle = node.handle();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let start = tokio::time::Instant::now();
+        let handler = ShareableMessageHandler::from_typed({
+            let received = received.clone();
+            move |event: &QueueStateChanged| {
+                if event.channel == SystemChannel::DataEvents
+                    && event.condition == QueueCondition::Backlogged
+                {
+                    received.borrow_mut().push((event.clone(), start.elapsed()));
+                    tx.send(event.clone()).unwrap();
+                }
+            }
+        });
+        msgbus::subscribe_any(
+            MessagingSwitchboard::queue_state_changed_pattern(None),
+            handler,
+            None,
+        );
+        let drive = async move {
+            wait_until_async(|| async { handle.is_running() }, Duration::from_secs(2)).await;
+            // Wake an idle select with exactly the trigger depth. The dequeued
+            // message must not hide this crossing; no new message follows drain.
+
+            for _ in 0..100 {
+                get_data_event_sender().send(stub_data_event()).unwrap();
+            }
+            let triggered = rx.recv().await.unwrap();
+            let cleared = rx.recv().await.unwrap();
+            assert_eq!(triggered.state, QueueState::Triggered);
+            assert_eq!(triggered.queue_depth, 100);
+            assert_eq!(cleared.state, QueueState::Cleared);
+            assert_eq!(cleared.queue_depth, 10);
+            assert!(start.elapsed() < Duration::from_millis(100));
+            handle.stop();
+        };
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            let (result, ()) = tokio::join!(node.run(), drive);
+            result
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+        assert_eq!(received.borrow().len(), 2);
+        assert!(
+            received
+                .borrow()
+                .iter()
+                .all(|(_, at)| *at < Duration::from_millis(100))
+        );
         node.dispose();
     }
 

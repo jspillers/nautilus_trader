@@ -122,6 +122,32 @@ impl QueueMonitor {
         }
     }
 
+    /// Observe backlog at the native runner boundary, independently of maintenance.
+    /// The metrics snapshot is read only on a hysteresis edge; normal dispatches
+    /// do not allocate or scan metrics. Slow dispatch remains periodic reporting.
+    pub(crate) fn observe_queue_depth(
+        &mut self,
+        channel: SystemChannel,
+        queue_depth: usize,
+        snapshot: impl FnOnce() -> RunnerMetricsSnapshot,
+    ) -> Option<QueueStateTransition> {
+        let state = &mut self.states[system_channel_index(channel)];
+        let transition = condition_transition(
+            &mut state.backlogged,
+            &queue_depth,
+            &self.config.queue_depth_trigger,
+            &self.config.queue_depth_clear,
+        )?;
+        let delta = RunnerMetricsDelta::from_snapshots(self.previous_snapshot, snapshot());
+        Some(QueueStateTransition {
+            channel,
+            condition: QueueCondition::Backlogged,
+            state: transition,
+            queue_depth,
+            mean_dispatch_ns: delta.channel_mean_dispatch_ns(channel),
+        })
+    }
+
     pub(crate) fn evaluate(
         &mut self,
         snapshot: RunnerMetricsSnapshot,
@@ -135,21 +161,6 @@ impl QueueMonitor {
             let mean_dispatch_ns = delta.channel_mean_dispatch_ns(channel);
             let dispatched = channel_dispatched(delta, channel);
             let state = &mut self.states[system_channel_index(channel)];
-
-            if let Some(queue_state) = condition_transition(
-                &mut state.backlogged,
-                &queue_depth,
-                &self.config.queue_depth_trigger,
-                &self.config.queue_depth_clear,
-            ) {
-                transitions.push(QueueStateTransition {
-                    channel,
-                    condition: QueueCondition::Backlogged,
-                    state: queue_state,
-                    queue_depth,
-                    mean_dispatch_ns,
-                });
-            }
 
             // A window without dispatches has no mean sample, so retain the previous slow state.
             if dispatched > 0
