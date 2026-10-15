@@ -1740,6 +1740,13 @@ impl Portfolio {
                     }
                 };
 
+                // Reported cash already includes venue reservations, matching
+                // ordinary order updates. Keep native startup margin and wallet
+                // reservation calculations unchanged.
+                if matches!(&account, AccountAny::Cash(cash) if !cash.calculated_account_state()) {
+                    continue;
+                }
+
                 let result = self.inner.borrow_mut().accounts.update_orders(
                     &account,
                     instrument,

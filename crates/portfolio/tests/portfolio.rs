@@ -3247,6 +3247,84 @@ fn test_margin_partial_fill_updates_margin_init_from_leaves_qty(
 }
 
 #[rstest]
+#[case::reported_unlocked(AccountType::Cash, false, "0.00")]
+#[case::reported_locked(AccountType::Cash, false, "7.00")]
+#[case::calculated(AccountType::Cash, true, "0.00")]
+#[case::wallet(AccountType::Wallet, false, "0.00")]
+fn test_initialize_orders_respects_reported_cash(
+    #[case] account_type: AccountType,
+    #[case] calculate_account_state: bool,
+    #[case] reported_locked: &str,
+) {
+    let instrument = InstrumentAny::CurrencyPair(default_fx_ccy(
+        Symbol::from("AUD/USD"),
+        Some(Venue::from("SIM")),
+    ));
+    let mut cache = Cache::new(None, None);
+    cache.add_instrument(instrument.clone()).unwrap();
+    let cache = Rc::new(RefCell::new(cache));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut portfolio = Portfolio::new(clock, Rc::clone(&cache), None);
+    let account_id = AccountId::from("SIM-001");
+    let total = Money::from("1000.00 USD");
+    let locked = Money::from(format!("{reported_locked} USD").as_str());
+    let balance = AccountBalance::from_total_and_locked(
+        total.as_decimal(),
+        locked.as_decimal(),
+        Currency::USD(),
+    )
+    .unwrap();
+    portfolio.update_account(&AccountState::new(
+        account_id,
+        account_type,
+        vec![balance],
+        vec![],
+        true,
+        UUID4::new(),
+        0.into(),
+        0.into(),
+        (account_type != AccountType::Wallet).then_some(Currency::USD()),
+    ));
+    cache
+        .borrow_mut()
+        .account_mut(&account_id)
+        .unwrap()
+        .set_calculate_account_state(calculate_account_state);
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("6"))
+        .price(Price::from("0.35"))
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, true)
+        .unwrap();
+    order = cache
+        .borrow_mut()
+        .update_order(&OrderEventAny::Submitted(submit_order(&order)))
+        .unwrap();
+    cache
+        .borrow_mut()
+        .update_order(&OrderEventAny::Accepted(accept_order(&order)))
+        .unwrap();
+
+    // No venue refresh can mask a startup-only double reservation.
+    for _ in 0..2 {
+        portfolio.initialize_orders();
+        assert!(portfolio.is_initialized());
+        let account = cache.borrow().account_owned(&account_id).unwrap();
+        assert_eq!(account.calculated_account_state(), calculate_account_state);
+        let expected = if calculate_account_state || account_type == AccountType::Wallet {
+            AccountBalance::from_total_and_locked(dec!(1000), dec!(2.10), Currency::USD()).unwrap()
+        } else {
+            balance
+        };
+        assert_eq!(account.balance(Some(Currency::USD())), Some(&expected));
+    }
+}
+
+#[rstest]
 fn test_initialize_orders_cash_account_with_base_currency() {
     let instrument = InstrumentAny::CurrencyPair(default_fx_ccy(
         Symbol::from("AUD/USD"),
