@@ -19,6 +19,7 @@ use std::{
 };
 
 use nautilus_core::DurationNanos;
+use nautilus_model::events::OrderInitialized;
 
 /// Trait for latency models used in backtesting.
 ///
@@ -27,6 +28,13 @@ use nautilus_core::DurationNanos;
 pub trait LatencyModel: Debug {
     /// Returns the latency for order insertion operations.
     fn get_insert_latency(&self) -> DurationNanos;
+
+    /// Returns insertion latency for the immutable submitted order.
+    ///
+    /// Models which do not distinguish order attributes retain their existing latency.
+    fn get_insert_latency_for_order(&self, _order: &OrderInitialized) -> DurationNanos {
+        self.get_insert_latency()
+    }
 
     /// Returns the latency for order update/modify operations.
     fn get_update_latency(&self) -> DurationNanos;
@@ -68,6 +76,10 @@ impl Debug for LatencyModelHandle {
 }
 
 impl LatencyModel for LatencyModelHandle {
+    fn get_insert_latency_for_order(&self, order: &OrderInitialized) -> DurationNanos {
+        self.0.get_insert_latency_for_order(order)
+    }
+
     fn get_insert_latency(&self) -> DurationNanos {
         self.0.get_insert_latency()
     }
@@ -91,6 +103,12 @@ pub enum LatencyModelAny {
 }
 
 impl LatencyModel for LatencyModelAny {
+    fn get_insert_latency_for_order(&self, order: &OrderInitialized) -> DurationNanos {
+        match self {
+            Self::Static(model) => model.get_insert_latency_for_order(order),
+        }
+    }
+
     fn get_insert_latency(&self) -> DurationNanos {
         match self {
             Self::Static(model) => model.get_insert_latency(),
@@ -146,6 +164,7 @@ impl From<LatencyModelAny> for LatencyModelHandle {
 pub struct StaticLatencyModel {
     base_latency_nanos: DurationNanos,
     insert_latency_nanos: DurationNanos,
+    post_only_insert_latency_nanos: Option<DurationNanos>,
     update_latency_nanos: DurationNanos,
     delete_latency_nanos: DurationNanos,
 }
@@ -171,13 +190,32 @@ impl StaticLatencyModel {
         Self {
             base_latency_nanos,
             insert_latency_nanos: base_latency_nanos + insert_latency_nanos,
+            post_only_insert_latency_nanos: None,
             update_latency_nanos: base_latency_nanos + update_latency_nanos,
             delete_latency_nanos: base_latency_nanos + delete_latency_nanos,
         }
     }
+    /// Sets the insertion-operation latency for post-only orders.
+    ///
+    /// The model adds its base latency once, as with the default insertion latency.
+    /// Other orders, updates and cancellations retain their configured latencies.
+    #[must_use]
+    pub fn with_post_only_insert_latency(mut self, latency: DurationNanos) -> Self {
+        self.post_only_insert_latency_nanos = Some(self.base_latency_nanos + latency);
+        self
+    }
 }
 
 impl LatencyModel for StaticLatencyModel {
+    fn get_insert_latency_for_order(&self, order: &OrderInitialized) -> DurationNanos {
+        if order.post_only {
+            self.post_only_insert_latency_nanos
+                .unwrap_or(self.insert_latency_nanos)
+        } else {
+            self.insert_latency_nanos
+        }
+    }
+
     fn get_insert_latency(&self) -> DurationNanos {
         self.insert_latency_nanos
     }
@@ -226,6 +264,53 @@ mod tests {
         fn get_base_latency(&self) -> DurationNanos {
             DurationNanos::new(44)
         }
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_post_only_insertion_preserves_default_and_handle_dispatch(#[case] post_only: bool) {
+        use nautilus_model::{
+            enums::{OrderSide, OrderType},
+            orders::OrderTestBuilder,
+        };
+
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id("AUD/USD.SIM".into())
+            .side(OrderSide::Buy)
+            .quantity("1".into())
+            .price("1.00000".into())
+            .post_only(post_only)
+            .build();
+        let static_model = StaticLatencyModel::new(
+            DurationNanos::from_millis(40),
+            DurationNanos::from_millis(250),
+            DurationNanos::ZERO,
+            DurationNanos::from_millis(60),
+        );
+        assert_eq!(
+            static_model.get_insert_latency_for_order(order.init_event()),
+            DurationNanos::from_millis(290)
+        );
+        let model = static_model.with_post_only_insert_latency(DurationNanos::ZERO);
+        let expected = DurationNanos::from_millis(if post_only { 40 } else { 290 });
+        assert_eq!(
+            model.get_insert_latency_for_order(order.init_event()),
+            expected
+        );
+        assert_eq!(model.get_insert_latency(), DurationNanos::from_millis(290));
+        assert_eq!(model.get_update_latency(), DurationNanos::from_millis(40));
+        assert_eq!(model.get_delete_latency(), DurationNanos::from_millis(100));
+        let handle: LatencyModelHandle = LatencyModelAny::Static(model).into();
+        assert_eq!(
+            handle.get_insert_latency_for_order(order.init_event()),
+            expected
+        );
+        let legacy = LatencyModelHandle::new(CustomLatencyModel);
+        assert_eq!(
+            legacy.get_insert_latency_for_order(order.init_event()),
+            DurationNanos::new(11)
+        );
     }
 
     #[rstest]

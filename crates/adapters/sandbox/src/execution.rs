@@ -1745,9 +1745,15 @@ impl SandboxInner {
         };
 
         match command {
-            TradingCommand::SubmitOrder(_) | TradingCommand::SubmitOrderList(_) => {
-                latency_model.get_insert_latency()
+            TradingCommand::SubmitOrder(cmd) => {
+                latency_model.get_insert_latency_for_order(&cmd.order_init)
             }
+            TradingCommand::SubmitOrderList(cmd) => cmd
+                .order_inits
+                .iter()
+                .map(|order| latency_model.get_insert_latency_for_order(order))
+                .max()
+                .unwrap_or_else(|| latency_model.get_insert_latency()),
             TradingCommand::ModifyOrder(_) | TradingCommand::ModifyOrders(_) => {
                 latency_model.get_update_latency()
             }
