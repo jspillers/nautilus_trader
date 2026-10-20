@@ -475,6 +475,16 @@ impl Order for LimitIfTouchedOrder {
         &self.commissions
     }
 
+    fn event_count(&self) -> usize {
+        self.events.len()
+    }
+
+    fn last_event(&self) -> &OrderEventAny {
+        self.events
+            .last()
+            .expect("Order invariant violated: no events")
+    }
+
     fn events(&self) -> Vec<&OrderEventAny> {
         self.events.iter().collect()
     }
