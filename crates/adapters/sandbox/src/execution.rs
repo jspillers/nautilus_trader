@@ -554,14 +554,26 @@ impl SandboxExecutionClient {
         SandboxInner::drain_inbound(&self.inner);
 
         let instrument_id = quote.instrument_id;
-        let instrument = self.cache.borrow().try_instrument(&instrument_id)?.clone();
+        let instrument = {
+            let cache = self.cache.borrow();
+            let instrument = cache.try_instrument(&instrument_id)?;
 
-        if !check_quote_or_drop("quote tick", quote, &instrument) {
-            return Ok(());
-        }
+            if !check_quote_or_drop("quote tick", quote, instrument) {
+                return Ok(());
+            }
+            (!self
+                .inner
+                .borrow()
+                .matching_engines
+                .contains_key(&instrument_id))
+            .then(|| instrument.clone())
+        };
 
         let mut inner = self.inner.borrow_mut();
-        inner.ensure_matching_engine(&instrument);
+        if let Some(instrument) = instrument {
+            inner.ensure_matching_engine(&instrument);
+        }
+
         if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
             engine.process_quote_tick(quote);
         }
@@ -581,14 +593,26 @@ impl SandboxExecutionClient {
         }
 
         let instrument_id = trade.instrument_id;
-        let instrument = self.cache.borrow().try_instrument(&instrument_id)?.clone();
+        let instrument = {
+            let cache = self.cache.borrow();
+            let instrument = cache.try_instrument(&instrument_id)?;
 
-        if !check_trade_or_drop("trade tick", trade, &instrument) {
-            return Ok(());
-        }
+            if !check_trade_or_drop("trade tick", trade, instrument) {
+                return Ok(());
+            }
+            (!self
+                .inner
+                .borrow()
+                .matching_engines
+                .contains_key(&instrument_id))
+            .then(|| instrument.clone())
+        };
 
         let mut inner = self.inner.borrow_mut();
-        inner.ensure_matching_engine(&instrument);
+        if let Some(instrument) = instrument {
+            inner.ensure_matching_engine(&instrument);
+        }
+
         if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
             engine.process_trade_tick(trade);
         }
@@ -608,14 +632,26 @@ impl SandboxExecutionClient {
         }
 
         let instrument_id = bar.bar_type.instrument_id();
-        let instrument = self.cache.borrow().try_instrument(&instrument_id)?.clone();
+        let instrument = {
+            let cache = self.cache.borrow();
+            let instrument = cache.try_instrument(&instrument_id)?;
 
-        if !check_bar_or_drop("bar", bar, &instrument) {
-            return Ok(());
-        }
+            if !check_bar_or_drop("bar", bar, instrument) {
+                return Ok(());
+            }
+            (!self
+                .inner
+                .borrow()
+                .matching_engines
+                .contains_key(&instrument_id))
+            .then(|| instrument.clone())
+        };
 
         let mut inner = self.inner.borrow_mut();
-        inner.ensure_matching_engine(&instrument);
+        if let Some(instrument) = instrument {
+            inner.ensure_matching_engine(&instrument);
+        }
+
         if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
             engine.process_bar(bar);
         }
@@ -631,10 +667,22 @@ impl SandboxExecutionClient {
         SandboxInner::drain_inbound(&self.inner);
 
         let instrument_id = deltas.instrument_id;
-        let instrument = self.cache.borrow().try_instrument(&instrument_id)?.clone();
+        let instrument = {
+            let cache = self.cache.borrow();
+            let instrument = cache.try_instrument(&instrument_id)?;
+            (!self
+                .inner
+                .borrow()
+                .matching_engines
+                .contains_key(&instrument_id))
+            .then(|| instrument.clone())
+        };
 
         let mut inner = self.inner.borrow_mut();
-        inner.ensure_matching_engine(&instrument);
+        if let Some(instrument) = instrument {
+            inner.ensure_matching_engine(&instrument);
+        }
+
         if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
             engine.process_order_book_deltas(deltas)?;
         }
@@ -1125,17 +1173,24 @@ impl SandboxInner {
     fn process_quote_tick(&mut self, quote: &QuoteTick) {
         let instrument_id = quote.instrument_id;
 
-        let instrument = self.cache.borrow().instrument(&instrument_id).cloned();
-        if let Some(instrument) = instrument {
-            if !check_quote_or_drop("quote tick", quote, &instrument) {
+        let instrument = {
+            let cache = self.cache.borrow();
+            let Some(instrument) = cache.instrument(&instrument_id) else {
+                return;
+            };
+
+            if !check_quote_or_drop("quote tick", quote, instrument) {
                 return;
             }
+            (!self.matching_engines.contains_key(&instrument_id)).then(|| instrument.clone())
+        };
 
+        if let Some(instrument) = instrument {
             self.ensure_matching_engine(&instrument);
+        }
 
-            if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
-                engine.process_quote_tick(quote);
-            }
+        if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+            engine.process_quote_tick(quote);
         }
     }
 
@@ -1146,17 +1201,24 @@ impl SandboxInner {
 
         let instrument_id = trade.instrument_id;
 
-        let instrument = self.cache.borrow().instrument(&instrument_id).cloned();
-        if let Some(instrument) = instrument {
-            if !check_trade_or_drop("trade tick", trade, &instrument) {
+        let instrument = {
+            let cache = self.cache.borrow();
+            let Some(instrument) = cache.instrument(&instrument_id) else {
+                return;
+            };
+
+            if !check_trade_or_drop("trade tick", trade, instrument) {
                 return;
             }
+            (!self.matching_engines.contains_key(&instrument_id)).then(|| instrument.clone())
+        };
 
+        if let Some(instrument) = instrument {
             self.ensure_matching_engine(&instrument);
+        }
 
-            if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
-                engine.process_trade_tick(trade);
-            }
+        if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+            engine.process_trade_tick(trade);
         }
     }
 
@@ -1167,32 +1229,46 @@ impl SandboxInner {
 
         let instrument_id = bar.bar_type.instrument_id();
 
-        let instrument = self.cache.borrow().instrument(&instrument_id).cloned();
-        if let Some(instrument) = instrument {
-            if !check_bar_or_drop("bar", bar, &instrument) {
+        let instrument = {
+            let cache = self.cache.borrow();
+            let Some(instrument) = cache.instrument(&instrument_id) else {
+                return;
+            };
+
+            if !check_bar_or_drop("bar", bar, instrument) {
                 return;
             }
+            (!self.matching_engines.contains_key(&instrument_id)).then(|| instrument.clone())
+        };
 
+        if let Some(instrument) = instrument {
             self.ensure_matching_engine(&instrument);
+        }
 
-            if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
-                engine.process_bar(bar);
-            }
+        if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+            engine.process_bar(bar);
         }
     }
 
     fn process_order_book_deltas(&mut self, deltas: &OrderBookDeltas) {
         let instrument_id = deltas.instrument_id;
 
-        let instrument = self.cache.borrow().instrument(&instrument_id).cloned();
+        let instrument = {
+            let cache = self.cache.borrow();
+            let Some(instrument) = cache.instrument(&instrument_id) else {
+                return;
+            };
+            (!self.matching_engines.contains_key(&instrument_id)).then(|| instrument.clone())
+        };
+
         if let Some(instrument) = instrument {
             self.ensure_matching_engine(&instrument);
+        }
 
-            if let Some(engine) = self.matching_engines.get_mut(&instrument_id)
-                && let Err(e) = engine.process_order_book_deltas(deltas)
-            {
-                log::error!("Error processing order book deltas: {e}");
-            }
+        if let Some(engine) = self.matching_engines.get_mut(&instrument_id)
+            && let Err(e) = engine.process_order_book_deltas(deltas)
+        {
+            log::error!("Error processing order book deltas: {e}");
         }
     }
 
