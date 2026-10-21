@@ -15,12 +15,57 @@
 
 //! Callback context propagation for live command and event dispatch.
 
-use std::thread::{self, ThreadId};
+use std::{
+    cell::Cell,
+    thread::{self, ThreadId},
+};
 
 use crate::{
     actor::{ChainContext, SendChainContext, collect_command_contexts},
     runner::{TradingCommandMessage, dispatch_scoped_trading_command},
 };
+
+/// Optional diagnostic at the actual native sender-call boundary.
+///
+/// The timestamp precedes the original unbounded-channel send. It is not a
+/// socket receipt or a claim that receiver admission has already completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchSendTiming {
+    /// Monotonic ordinal within this sender's shared diagnostic state.
+    pub ordinal: u64,
+    /// Native UTC timestamp immediately before the channel send call.
+    pub send_called_ns: u64,
+    /// Native UTC time at dispatch entry; zero until the envelope is dispatched.
+    pub dispatch_started_ns: u64,
+}
+
+thread_local! {
+    static SEND_TIMING: Cell<Option<DispatchSendTiming>> = const { Cell::new(None) };
+}
+
+/// Returns the optional diagnostic for the currently dispatched envelope.
+///
+/// Nested dispatch restores its predecessor on return and unwind. This does not
+/// change callback ancestry, scheduling, clocks or message contents.
+#[must_use]
+pub fn current_dispatch_send_timing() -> Option<DispatchSendTiming> {
+    SEND_TIMING.with(Cell::get)
+}
+
+struct SendTimingScope(Option<DispatchSendTiming>);
+impl SendTimingScope {
+    fn enter(mut value: Option<DispatchSendTiming>) -> Self {
+        if let Some(timing) = &mut value {
+            timing.dispatch_started_ns = nautilus_core::time::nanos_since_unix_epoch();
+        }
+        Self(SEND_TIMING.with(|slot| slot.replace(value)))
+    }
+}
+impl Drop for SendTimingScope {
+    fn drop(&mut self) {
+        SEND_TIMING.with(|slot| slot.set(self.0));
+    }
+}
 
 /// A live message carrying an owner-thread callback context through a send-safe channel.
 ///
@@ -33,6 +78,7 @@ use crate::{
 pub struct DispatchMessage<T> {
     message: Option<T>,
     context: Option<SendChainContext>,
+    send_timing: Option<DispatchSendTiming>,
 }
 
 impl<T> DispatchMessage<T> {
@@ -52,6 +98,7 @@ impl<T> DispatchMessage<T> {
         Self {
             message: Some(message),
             context,
+            send_timing: None,
         }
     }
 
@@ -61,6 +108,7 @@ impl<T> DispatchMessage<T> {
     ///
     /// Panics if a rooted message is processed outside its owner's thread.
     pub fn dispatch<R>(mut self, run: impl FnOnce(T) -> R) -> R {
+        let _timing = SendTimingScope::enter(self.send_timing);
         let context = self.take_context();
         context.with_chain(|| run(self.message.take().expect("message is present")))
     }
@@ -69,6 +117,10 @@ impl<T> DispatchMessage<T> {
     #[must_use]
     pub fn is_rooted(&self) -> bool {
         self.context.is_some()
+    }
+
+    pub(super) fn mark_send(&mut self, timing: DispatchSendTiming) {
+        self.send_timing = Some(timing);
     }
 
     fn take_context(&self) -> ChainContext {
@@ -92,6 +144,7 @@ impl DispatchMessage<TradingCommandMessage> {
     /// - A rooted message is processed outside its owner thread.
     /// - The observer or a command handler panics.
     pub fn dispatch_trading(mut self, before: impl FnMut(&TradingCommandMessage)) {
+        let _timing = SendTimingScope::enter(self.send_timing);
         let context = self.take_context();
         dispatch_scoped_trading_command(
             self.message.take().expect("message is present"),
@@ -112,6 +165,7 @@ impl<T> From<T> for DispatchMessage<T> {
         Self {
             message: Some(message),
             context: None,
+            send_timing: None,
         }
     }
 }
