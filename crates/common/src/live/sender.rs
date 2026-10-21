@@ -121,6 +121,19 @@ impl<T> DispatchSender<T> {
         )
     }
 
+    /// Returns this sender bound to the calling thread, preserving channel diagnostics.
+    ///
+    /// Runtime rebinding changes callback ancestry ownership, not the underlying
+    /// queue or the timing state shared with already-created adapter senders.
+    #[must_use]
+    pub fn with_current_thread_owner(&self) -> Self {
+        let mut rebound = self.clone();
+        if let DispatchChannel::Dispatch { owner, .. } = &mut rebound.channel {
+            *owner = thread::current().id();
+        }
+        rebound
+    }
+
     /// Returns whether the receiver has closed.
     #[must_use]
     pub fn is_closed(&self) -> bool {
@@ -214,6 +227,31 @@ mod tests {
         drop(rx);
         assert!(old_clone.send(9).is_err());
         assert_eq!(sender.send_timing_counts(), (2, 1));
+    }
+
+    #[rstest]
+    fn rebinding_updates_owner_without_resetting_shared_timing() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DispatchMessage<u64>>();
+        let sender = DispatchSender::new(tx);
+        sender.enable_send_timing();
+        std::thread::spawn(move || {
+            let rebound = sender.with_current_thread_owner();
+            assert!(sender.same_channel(&rebound));
+            assert!(Arc::ptr_eq(&sender.timing, &rebound.timing));
+            let DispatchChannel::Dispatch { owner, .. } = rebound.channel else {
+                panic!("dispatch channel");
+            };
+            assert_eq!(owner, thread::current().id());
+            let DispatchChannel::Dispatch {
+                owner: previous, ..
+            } = sender.channel
+            else {
+                panic!("dispatch channel");
+            };
+            assert_ne!(owner, previous);
+        })
+        .join()
+        .unwrap();
     }
 
     #[rstest]

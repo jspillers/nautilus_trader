@@ -232,7 +232,7 @@ pub struct AsyncRunner {
     signal_tx: tokio::sync::mpsc::UnboundedSender<()>,
     exec_evt_tx: tokio::sync::mpsc::UnboundedSender<DispatchMessage<ExecutionEvent>>,
     exec_cmd_tx: tokio::sync::mpsc::UnboundedSender<DispatchMessage<TradingCommandMessage>>,
-    data_evt_tx: tokio::sync::mpsc::UnboundedSender<DispatchMessage<DataEvent>>,
+    data_evt_tx: EventSender<DataEvent>,
     data_cmd_tx: tokio::sync::mpsc::UnboundedSender<DispatchMessage<DataCommand>>,
 }
 
@@ -300,7 +300,7 @@ impl AsyncRunner {
             signal_tx,
             exec_evt_tx,
             exec_cmd_tx,
-            data_evt_tx,
+            data_evt_tx: EventSender::new(data_evt_tx),
             data_cmd_tx,
         }
     }
@@ -330,7 +330,7 @@ impl AsyncRunner {
         replace_system_command_sender(DispatchSender::new(self.system_cmd_tx.clone()));
         replace_exec_event_sender(EventSender::new(self.exec_evt_tx.clone()));
         replace_exec_cmd_sender(Arc::new(AsyncTradingCommandSender::new(self.exec_cmd_tx.clone())));
-        replace_data_event_sender(EventSender::new(self.data_evt_tx.clone()));
+        replace_data_event_sender(self.data_evt_tx.with_current_thread_owner());
         replace_data_cmd_sender(Arc::new(sender));
     }
 
@@ -993,7 +993,7 @@ mod tests {
             system_cmd_tx,
             exec_evt_tx,
             exec_cmd_tx,
-            data_evt_tx,
+            data_evt_tx: EventSender::new(data_evt_tx),
             data_cmd_tx,
             signal_rx,
             signal_tx,
