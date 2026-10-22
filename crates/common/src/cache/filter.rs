@@ -16,6 +16,10 @@
 //! Intersection of index bucket sets for filtered cache queries.
 
 use ahash::AHashSet;
+use smallvec::SmallVec;
+
+// At most four index filters plus the lifecycle bucket
+pub(super) type FilterSets<'a, K> = SmallVec<[&'a AHashSet<K>; 5]>;
 
 // Filter sources resolved from an order or position query.
 //
@@ -26,12 +30,12 @@ use ahash::AHashSet;
 pub(super) enum FilterSources<'a, K> {
     Unfiltered,
     Empty,
-    Sets(Vec<&'a AHashSet<K>>),
+    Sets(FilterSets<'a, K>),
 }
 
 // Intersects a non-empty collection of filter sources by sorting them ascending by length and
 // driving the loop from the smallest set, collecting one `AHashSet` of matching keys.
-fn intersect_filter_sources<K>(mut sources: Vec<&AHashSet<K>>) -> AHashSet<K>
+fn intersect_filter_sources<K>(mut sources: FilterSets<'_, K>) -> AHashSet<K>
 where
     K: Copy + Eq + std::hash::Hash,
 {
@@ -56,7 +60,7 @@ where
 // more filters the size-ordered driver is reinstated and the bucket joins the source list.
 pub(super) fn intersect_pair_or_many<'a, K>(
     bucket: &'a AHashSet<K>,
-    mut sources: Vec<&'a AHashSet<K>>,
+    mut sources: FilterSets<'a, K>,
 ) -> AHashSet<K>
 where
     K: Copy + Eq + std::hash::Hash,
@@ -77,4 +81,36 @@ where
 
     sources.push(bucket);
     intersect_filter_sources(sources)
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn five_filter_sources_remain_inline_and_intersect_exactly() {
+        let sets = [
+            AHashSet::from_iter([1, 2, 3]),
+            AHashSet::from_iter([2, 3]),
+            AHashSet::from_iter([0, 2]),
+            AHashSet::from_iter([2]),
+            AHashSet::from_iter([2, 4, 6]),
+        ];
+
+        for count in 1..=4 {
+            let filters: FilterSets<'_, u64> = sets[..count].iter().collect();
+            assert!(!filters.spilled());
+            let expected: AHashSet<_> = sets[4]
+                .iter()
+                .copied()
+                .filter(|id| sets[..count].iter().all(|s| s.contains(id)))
+                .collect();
+            assert_eq!(intersect_pair_or_many(&sets[4], filters), expected);
+        }
+        let filters: FilterSets<'_, u64> = sets.iter().collect();
+        assert!(!filters.spilled());
+        assert_eq!(intersect_filter_sources(filters), AHashSet::from_iter([2]));
+    }
 }

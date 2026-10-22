@@ -56,7 +56,7 @@ pub use error::{
     OrderLookupError, OwnOrderBookLookupError, POSITION_NOT_FOUND, PositionLookupError,
     SYNTHETIC_INSTRUMENT_NOT_FOUND, SyntheticInstrumentLookupError, VenueOrderIdOwnershipError,
 };
-use filter::{FilterSources, intersect_pair_or_many};
+use filter::{FilterSets, FilterSources, intersect_pair_or_many};
 use index::CacheIndex;
 use indexmap::IndexMap;
 use nautilus_core::{
@@ -98,6 +98,7 @@ pub use position::CacheSnapshotRef;
 use position::PositionSnapshotFrame;
 pub use refs::{AccountRef, AccountRefMut, OrderRef, OrderRefMut, PositionRef, PositionRefMut};
 use rust_decimal::Decimal;
+use smallvec::SmallVec;
 use ustr::Ustr;
 pub use view::CacheView; // Re-export
 
@@ -3724,7 +3725,7 @@ impl Cache {
         strategy_id: Option<&StrategyId>,
         account_id: Option<&AccountId>,
     ) -> FilterSources<'a, ClientOrderId> {
-        let mut sources: Vec<&AHashSet<ClientOrderId>> = Vec::with_capacity(4);
+        let mut sources: FilterSets<'_, ClientOrderId> = SmallVec::new();
 
         if let Some(venue) = venue {
             match self.index.venue_orders.get(venue) {
@@ -3768,7 +3769,7 @@ impl Cache {
         strategy_id: Option<&StrategyId>,
         account_id: Option<&AccountId>,
     ) -> FilterSources<'a, PositionId> {
-        let mut sources: Vec<&AHashSet<PositionId>> = Vec::with_capacity(4);
+        let mut sources: FilterSets<'_, PositionId> = SmallVec::new();
 
         if let Some(venue) = venue {
             match self.index.venue_positions.get(venue) {
@@ -3890,8 +3891,8 @@ impl Cache {
             FilterSources::Sets(mut sources) => {
                 sources.push(bucket);
                 sources.sort_unstable_by_key(|s| s.len());
-                let driver = sources[0];
-                let rest: Vec<&'a AHashSet<ClientOrderId>> = sources[1..].to_vec();
+                let driver = sources.remove(0);
+                let rest = sources;
                 Box::new(
                     driver
                         .iter()
@@ -3916,8 +3917,8 @@ impl Cache {
             FilterSources::Sets(mut sources) => {
                 sources.push(bucket);
                 sources.sort_unstable_by_key(|s| s.len());
-                let driver = sources[0];
-                let rest: Vec<&'a AHashSet<PositionId>> = sources[1..].to_vec();
+                let driver = sources.remove(0);
+                let rest = sources;
                 Box::new(
                     driver
                         .iter()
