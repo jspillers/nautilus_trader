@@ -294,6 +294,21 @@ pub trait CustomDataTrait: HasTsInit + Send + Sync + Debug {
     /// Returns an error if JSON serialization fails.
     fn to_json(&self) -> anyhow::Result<String>;
 
+    /// Serializes the custom data to a JSON value for its native envelope.
+    ///
+    /// The default preserves the JSON-string conversion for existing implementations.
+    /// Types with a direct serde representation can override this to avoid creating
+    /// and parsing intermediate text, returning the same value as `to_json`.
+    ///
+    /// # Errors
+    /// Returns an error if JSON serialization or parsing fails.
+    fn to_json_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        let json = self.to_json().map_err(|e| {
+            serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })?;
+        serde_json::from_str(&json)
+    }
+
     /// Python-facing JSON serialization. Default implementation forwards to `to_json`.
     /// Override if a different behavior is needed for the Python API.
     ///
@@ -444,10 +459,7 @@ impl CustomData {
 
 impl CustomData {
     fn to_envelope_json_value(&self) -> Result<serde_json::Value, serde_json::Error> {
-        let json = self.data.to_json().map_err(|e| {
-            serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        })?;
-        let payload: serde_json::Value = serde_json::from_str(&json)?;
+        let payload = self.data.to_json_value()?;
         let metadata_value = self.data_type.metadata().map_or(
             serde_json::Value::Object(serde_json::Map::new()),
             |m| {
