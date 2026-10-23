@@ -26,6 +26,7 @@ use nautilus_model::{
     types::{Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
+use serde::Deserialize;
 
 use crate::http::models::FeeSchedule;
 
@@ -73,7 +74,7 @@ impl FeeModel for PolymarketFeeModel {
             .info
             .as_ref()
             .and_then(|info| info.get("fee_schedule"))
-            .map(|value| serde_json::from_value::<FeeSchedule>(value.clone()))
+            .map(FeeSchedule::deserialize)
             .transpose()
             .context("invalid Polymarket fee schedule")?
         else {
@@ -147,6 +148,29 @@ mod tests {
         models::{FeeSchedule, GammaMarket},
         parse::{create_instrument_from_def, parse_gamma_market},
     };
+
+    #[rstest]
+    fn borrowed_current_fee_metadata_matches_owned_parsing_exactly() {
+        use serde::Deserialize;
+
+        for value in [
+            serde_json::json!({"exponent":"1","rate":"0.1234567890123456789012345678","rebateRate":"0.2","takerOnly":true}),
+            serde_json::json!({"exponent":1,"rate":0.07,"rebateRate":0.2,"takerOnly":true}),
+            serde_json::json!({"exponent":"bad","rate":"0.07","rebateRate":"0.2","takerOnly":true}),
+            serde_json::json!({"exponent":"1","rebateRate":"0.2"}),
+        ] {
+            let owned = serde_json::from_value::<FeeSchedule>(value.clone());
+            let borrowed = FeeSchedule::deserialize(&value);
+            assert_eq!(owned.is_ok(), borrowed.is_ok());
+
+            if let (Ok(a), Ok(b)) = (owned, borrowed) {
+                assert_eq!(
+                    serde_json::to_value(a).unwrap(),
+                    serde_json::to_value(b).unwrap()
+                );
+            }
+        }
+    }
 
     #[rstest]
     fn test_fee_model_preserves_instrument_metadata_precision() {

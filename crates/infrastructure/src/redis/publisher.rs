@@ -425,8 +425,11 @@ fn batch_pipeline(
     maximum_messages: usize,
 ) -> (Pipeline, usize, usize) {
     let mut pipe = redis::pipe();
-    pipe.atomic();
     let count = maximum_messages.min(buffer.len());
+    // XADD is itself atomic. Preserve transactions only for multi-record batches.
+    if count > 1 {
+        pipe.atomic();
+    }
     let mut bytes = 0;
     for message in buffer.drain(..count) {
         bytes += message_bytes(&message);
@@ -513,7 +516,7 @@ where
 
         tokio::select! {
             // Poll ordered request futures before accepting the next batch.
-            // This submits each MULTI/EXEC before its successor on the same driver.
+            // This submits each batch before its successor on the same driver.
             biased;
             confirmation = pending.next(), if !pending.is_empty() => {
                 confirmation.expect("Pending publisher confirmation")?;
@@ -690,10 +693,11 @@ mod tests {
             config,
             Some(worker_budget),
             move |pipeline| {
-                let sink = sink.clone();
+                // Observe submission order, as the real Redis driver does.
+                // Confirmation futures may complete in a different order.
+                sink.lock().unwrap().push(pipeline.get_packed_pipeline());
                 async move {
                     tokio::task::yield_now().await;
-                    sink.lock().unwrap().push(pipeline.get_packed_pipeline());
                     Ok(())
                 }
             },
@@ -1059,6 +1063,25 @@ mod tests {
         assert!(published[0].windows(8).any(|part| part == b"accepted"));
         assert_eq!(budget.outstanding.lock().unwrap().messages, 0);
     }
+
+    #[rstest]
+    fn only_multi_record_batches_have_transaction_wrappers() {
+        for count in [1, 2, 4] {
+            let mut buffer = (0..count)
+                .map(|_| message("events.order", b"fact"))
+                .collect();
+            let (pipe, messages, _) =
+                batch_pipeline(&mut buffer, "facts", &MessageBusConfig::default(), count);
+            let packed = pipe.get_packed_pipeline();
+            let text = String::from_utf8(packed).unwrap();
+            assert_eq!(messages, count);
+            assert!(buffer.is_empty());
+            assert_eq!(text.matches("MULTI").count(), usize::from(count > 1));
+            assert_eq!(text.matches("EXEC").count(), usize::from(count > 1));
+            assert_eq!(text.matches("XADD").count(), count);
+        }
+    }
+
     async fn resp_command(reader: &mut BufReader<TcpStream>) -> Vec<Vec<u8>> {
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
@@ -1080,7 +1103,7 @@ mod tests {
     }
 
     // Exercises the canonical Redis multiplexed driver on one real TCP socket.
-    // The server withholds the first EXEC reply until it checks for batch two.
+    // The server withholds the first XADD reply until it checks for batch two.
     #[tokio::test]
     async fn canonical_driver_pipelines_both_roles_before_ack_and_preserves_fact_order() {
         use tokio::{io::AsyncWriteExt, net::TcpListener};
@@ -1094,16 +1117,13 @@ mod tests {
                     let mut reader = BufReader::new(socket);
                     loop {
                         let args = resp_command(&mut reader).await;
-                        if args[0] == b"MULTI" {
+                        if args[0] == b"XADD" {
+                            assert!(args.iter().any(|value| value == b"first"));
                             break;
                         }
                         assert_eq!(args[0], b"CLIENT");
                         reader.get_mut().write_all(b"+OK\r\n").await.unwrap();
                     }
-                    let first = resp_command(&mut reader).await;
-                    assert_eq!(first[0], b"XADD");
-                    assert!(first.iter().any(|value| value == b"first"));
-                    assert_eq!(resp_command(&mut reader).await[0], b"EXEC");
                     let before_ack = if reader.buffer().is_empty() {
                         let mut byte = [0];
                         tokio::time::timeout(
@@ -1115,21 +1135,11 @@ mod tests {
                     } else {
                         true
                     };
-                    reader
-                        .get_mut()
-                        .write_all(b"+OK\r\n+QUEUED\r\n*1\r\n$3\r\n1-0\r\n")
-                        .await
-                        .unwrap();
-                    assert_eq!(resp_command(&mut reader).await[0], b"MULTI");
+                    reader.get_mut().write_all(b"$3\r\n1-0\r\n").await.unwrap();
                     let second = resp_command(&mut reader).await;
                     assert_eq!(second[0], b"XADD");
                     assert!(second.iter().any(|value| value == b"second"));
-                    assert_eq!(resp_command(&mut reader).await[0], b"EXEC");
-                    reader
-                        .get_mut()
-                        .write_all(b"+OK\r\n+QUEUED\r\n*1\r\n$3\r\n2-0\r\n")
-                        .await
-                        .unwrap();
+                    reader.get_mut().write_all(b"$3\r\n2-0\r\n").await.unwrap();
                     before_ack
                 });
                 let client = redis::Client::open(format!("redis://{address}/")).unwrap();
