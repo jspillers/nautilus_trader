@@ -252,7 +252,7 @@ impl Portfolio {
             TypedHandler::from(move |event: &AccountState| {
                 if let Some(inner_rc) = inner.upgrade() {
                     let inner_rc: Rc<RefCell<PortfolioState>> = inner_rc.into();
-                    update_account(&clock, &cache, &inner_rc, config, event);
+                    update_account(&clock, &cache, &inner_rc, config, event, false);
                 }
             })
         };
@@ -322,8 +322,20 @@ impl Portfolio {
             })
         };
 
+        let update_account_endpoint_handler = {
+            let cache = Rc::clone(cache);
+            let clock = Rc::clone(clock);
+            let inner = WeakCell::clone(&inner_weak);
+
+            TypedHandler::from(move |event: &AccountState| {
+                if let Some(inner_rc) = inner.upgrade() {
+                    let inner_rc: Rc<RefCell<PortfolioState>> = inner_rc.into();
+                    update_account(&clock, &cache, &inner_rc, config, event, true);
+                }
+            })
+        };
         let endpoint = MessagingSwitchboard::portfolio_update_account();
-        msgbus::register_account_state_endpoint(endpoint, update_account_handler.clone());
+        msgbus::register_account_state_endpoint(endpoint, update_account_endpoint_handler);
 
         let update_order_endpoint_handler = {
             let cache = Rc::clone(cache);
@@ -2037,8 +2049,17 @@ impl Portfolio {
     }
 
     /// Updates portfolio with a new account state event.
+    /// Publishes applied native account state after the cache update so readers
+    /// can react without waiting for market data or a periodic refresh.
     pub fn update_account(&mut self, event: &AccountState) {
-        update_account(&self.clock, &self.cache, &self.inner, self.config, event);
+        update_account(
+            &self.clock,
+            &self.cache,
+            &self.inner,
+            self.config,
+            event,
+            true,
+        );
     }
 
     /// Updates portfolio calculations based on an order event.
@@ -4117,6 +4138,7 @@ fn update_account(
     inner: &Rc<RefCell<PortfolioState>>,
     config: PortfolioConfig,
     event: &AccountState,
+    publish_applied: bool,
 ) {
     let already_applied = {
         cache
@@ -4125,6 +4147,13 @@ fn update_account(
             .and_then(|account| account.last_event())
             .is_some_and(|last_event| last_event.event_id == event.event_id)
     };
+
+    if already_applied && !publish_applied {
+        // The endpoint (or an order update) already applied native state. Its
+        // topic notification cannot reapply, log or recursively publish it.
+        register_equity_curve_account(clock, cache, inner, config, event.account_id);
+        return;
+    }
 
     if !already_applied && let Err(e) = cache.borrow_mut().update_account_state(event) {
         log::error!("Failed to update account state: {e}");
@@ -4164,6 +4193,12 @@ fn update_account(
     drop(inner_ref);
 
     register_equity_curve_account(clock, cache, inner, config, event.account_id);
+
+    if publish_applied {
+        // Both live and backtest account clients use this endpoint. Subscribers
+        // must observe applied native cache state, including at higher priority.
+        msgbus::publish_account_state(format!("events.account.{}", event.account_id).into(), event);
+    }
 }
 
 fn equity_curve_timer_name(account_id: AccountId) -> String {

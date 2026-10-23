@@ -11111,3 +11111,45 @@ fn test_unrealized_pnl_skips_empty_zero_quote_side(mut portfolio: Portfolio) {
     let snapshot = portfolio.build_snapshot(&account_id).unwrap();
     assert!(snapshot.stale_instruments.contains(&instrument.id()));
 }
+
+#[rstest]
+fn account_endpoint_notifies_after_native_cache_update_without_recursive_publication(
+    simple_cache: Cache,
+    clock: VirtualClock,
+    cash_account_state: AccountState,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let portfolio = Portfolio::new(
+        Rc::new(RefCell::new(clock)),
+        Rc::new(RefCell::new(simple_cache)),
+        None,
+    );
+    let cache = Rc::clone(portfolio.cache());
+    let received = Rc::new(RefCell::new(Vec::new()));
+    let seen = Rc::clone(&received);
+    let handler = TypedHandler::from(move |event: &AccountState| {
+        let current = cache.borrow().account_owned(&event.account_id).unwrap();
+        assert_eq!(current.last_event().unwrap().event_id, event.event_id);
+        seen.borrow_mut().push(event.clone());
+    });
+    // Even a higher-priority observer must see native applied account state.
+    msgbus::subscribe_account_state("events.account.*".into(), handler, Some(100));
+    msgbus::send_account_state(
+        MessagingSwitchboard::portfolio_update_account(),
+        &cash_account_state,
+    );
+    assert_eq!(
+        received.borrow().as_slice(),
+        std::slice::from_ref(&cash_account_state)
+    );
+    // An existing applied-state topic notification must not be republished by
+    // Portfolio's own subscriber or change the original native timestamps.
+    msgbus::publish_account_state(
+        format!("events.account.{}", cash_account_state.account_id).into(),
+        &cash_account_state,
+    );
+    assert_eq!(
+        received.borrow().as_slice(),
+        &[cash_account_state.clone(), cash_account_state]
+    );
+}
