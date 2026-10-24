@@ -651,6 +651,19 @@ impl EventStoreLifecycle {
         Ok(Some(report.cache))
     }
 
+    /// Selects native bounded backpressure for final residual capture after trading stops.
+    ///
+    /// Advanced owners which defer sealing until after a live node's final drain call
+    /// this only after the native kernel has stopped the trader and closed ingress,
+    /// normal trading capture remains nonblocking and all writer fail-stop limits remain.
+    pub fn begin_shutdown_drain(&self) {
+        if let Some(session) = &self.session
+            && let Some(writer) = &session.writer
+        {
+            writer.begin_shutdown_drain();
+        }
+    }
+
     /// Seals the open session by writing `RunEnded` and updating the manifest to
     /// `Ended`. Idempotent: a closed or absent session makes this a no-op. Halted
     /// sessions skip the close (the recovery sweep on next boot owns the seal).

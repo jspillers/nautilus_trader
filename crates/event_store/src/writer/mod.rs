@@ -176,6 +176,7 @@ mod imp {
         halt: HaltCallback,
         halt_threshold: Duration,
         nonblocking_submit: bool,
+        shutdown_drain: AtomicBool,
         // Shared with the writer thread so any halt fire latches it exactly once;
         // subsequent submits return Closed instead of re-entering the retry loop.
         halted: Arc<AtomicBool>,
@@ -247,6 +248,7 @@ mod imp {
                 halt,
                 halt_threshold,
                 nonblocking_submit,
+                shutdown_drain: AtomicBool::new(false),
                 halted,
                 clock,
             })
@@ -369,7 +371,17 @@ mod imp {
         /// Returns whether captures and snapshot callbacks must avoid waiting for disk.
         #[must_use]
         pub fn nonblocking_submit(&self) -> bool {
-            self.nonblocking_submit
+            self.nonblocking_submit && !self.shutdown_drain.load(Ordering::Acquire)
+        }
+
+        /// Selects bounded writer backpressure for residual capture after trading stops.
+        ///
+        /// This irreversible lifecycle transition is only for an owner which has stopped
+        /// the trader and closed external ingress before draining its remaining events,
+        /// the existing queue, disk writer, halt threshold and durable acknowledgements
+        /// remain authoritative, and an already halted run cannot be rearmed.
+        pub fn begin_shutdown_drain(&self) {
+            self.shutdown_drain.store(true, Ordering::Release);
         }
 
         /// Queues an ordered snapshot anchor without awaiting its durable acknowledgement.
@@ -407,7 +419,7 @@ mod imp {
             mut pending: WriterMessage,
             start: Instant,
         ) -> Result<(), EnqueueFailure> {
-            if self.nonblocking_submit {
+            if self.nonblocking_submit() {
                 return match tx.try_send(pending) {
                     Ok(()) => Ok(()),
                     Err(TrySendError::Full(_)) => {
@@ -659,6 +671,9 @@ mod imp {
                 }
             }
         }
+
+        /// Leaves deterministic synchronous simulation unchanged during shutdown.
+        pub fn begin_shutdown_drain(&self) {}
 
         /// Simulation keeps deterministic synchronous commits without a background queue.
         #[must_use]
@@ -1305,6 +1320,93 @@ mod tests {
         assert_eq!(anchor.high_watermark, 1);
         assert_eq!(anchor.blob_ref, "cache://P-1/0");
         assert!(captured.lock().is_empty());
+    }
+
+    #[rstest]
+    #[case::writer_recovers(true)]
+    #[case::writer_remains_stalled(false)]
+    fn shutdown_drain_uses_bounded_native_backpressure(
+        #[case] release: bool,
+        captured_halt: (HaltCallback, Arc<Mutex<Vec<HaltReason>>>),
+    ) {
+        let (halt, captured) = captured_halt;
+        let inner = Arc::new(Mutex::new(MemoryBackend::new()));
+        inner
+            .lock()
+            .open_run(manifest("shutdown-drain"))
+            .expect("open");
+        let gate = Arc::new((Mutex::new(false), parking_lot::Condvar::new()));
+        let appends_seen = Arc::new(AtomicUsize::new(0));
+        let backend = BlockingBackend::new(
+            Arc::clone(&inner),
+            Arc::clone(&gate),
+            Arc::clone(&appends_seen),
+        );
+        let writer = Arc::new(
+            EventStoreWriter::spawn(
+                Box::new(backend),
+                get_atomic_clock_static(),
+                halt,
+                WriterConfig {
+                    channel_capacity: 1,
+                    max_batch_entries: 1,
+                    nonblocking_submit: true,
+                    halt_threshold: Duration::from_millis(100),
+                    ..Default::default()
+                },
+            )
+            .expect("spawn"),
+        );
+        writer.submit(entry_draft(10)).expect("first");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while appends_seen.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let blocked = appends_seen.load(Ordering::SeqCst) > 0;
+        writer.submit(entry_draft(11)).expect("fills bounded queue");
+        assert!(writer.nonblocking_submit());
+        writer.begin_shutdown_drain();
+        assert!(!writer.nonblocking_submit());
+        let pending = Arc::clone(&writer);
+        let (done, completion) = std::sync::mpsc::channel();
+        let task = std::thread::spawn(move || {
+            done.send(pending.submit(entry_draft(12))).unwrap();
+        });
+        let early = completion.recv_timeout(Duration::from_millis(20));
+
+        if release {
+            *gate.0.lock() = true;
+            gate.1.notify_all();
+        }
+        let result = completion
+            .recv_timeout(Duration::from_secs(2))
+            .expect("bounded submit completes");
+        *gate.0.lock() = true;
+        gate.1.notify_all();
+        task.join().unwrap();
+        assert!(blocked, "backend did not reach gate");
+        assert!(
+            matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "must wait for writer, not discard tail"
+        );
+
+        if release {
+            result.expect("progress allows residual event");
+            let final_hwm = Arc::try_unwrap(writer)
+                .expect("sole owner")
+                .close(run_ended_draft())
+                .expect("seal");
+            assert_eq!(final_hwm, 4);
+            assert!(captured.lock().is_empty());
+        } else {
+            assert!(matches!(result, Err(SubmitError::HaltSignaled { .. })));
+            writer.begin_shutdown_drain();
+            assert!(
+                matches!(writer.submit(entry_draft(13)), Err(SubmitError::Closed)),
+                "transition must not rearm a halted writer"
+            );
+            assert_backpressure_stall(captured.lock().first(), Duration::from_millis(100));
+        }
     }
 
     #[rstest]
