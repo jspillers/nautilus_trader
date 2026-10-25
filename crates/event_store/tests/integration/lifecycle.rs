@@ -91,6 +91,8 @@ fn event_store_factory(
 
 fn config_with(base_dir: PathBuf) -> EventStoreConfig {
     EventStoreConfig {
+        max_pending_bytes: None,
+        max_batch_bytes: None,
         redb_cache_size_bytes: 128 * 1024 * 1024,
         base_dir,
         identity: RunIdentity {

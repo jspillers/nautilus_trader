@@ -1157,6 +1157,8 @@ const fn retention_tag(mode: RetentionMode) -> &'static str {
 fn writer_config_from(config: &EventStoreConfig) -> WriterConfig {
     WriterConfig {
         channel_capacity: config.channel_capacity,
+        max_pending_bytes: config.max_pending_bytes,
+        max_batch_bytes: config.max_batch_bytes,
         max_batch_entries: config.max_batch_entries,
         max_batch_latency: config.max_batch_latency,
         halt_threshold: config.halt_threshold,
@@ -1445,6 +1447,8 @@ mod tests {
 
     fn make_config(base_dir: PathBuf) -> EventStoreConfig {
         EventStoreConfig {
+            max_pending_bytes: None,
+            max_batch_bytes: None,
             redb_cache_size_bytes: 128 * 1024 * 1024,
             base_dir,
             identity: RunIdentity {

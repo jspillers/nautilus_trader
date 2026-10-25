@@ -261,6 +261,8 @@ fn writer_high_watermark_advances_only_after_backend_ack() {
         get_atomic_clock_static(),
         halt,
         WriterConfig {
+            max_pending_bytes: None,
+            max_batch_bytes: None,
             channel_capacity: 16,
             max_batch_entries: 2,
             max_batch_latency: Duration::from_millis(5),
@@ -310,6 +312,8 @@ fn writer_halts_instead_of_dropping_when_backend_blocks_past_channel_capacity() 
         get_atomic_clock_static(),
         halt,
         WriterConfig {
+            max_pending_bytes: None,
+            max_batch_bytes: None,
             channel_capacity: 2,
             max_batch_entries: 1,
             max_batch_latency: Duration::from_secs(30),
@@ -345,7 +349,9 @@ fn writer_halts_instead_of_dropping_when_backend_blocks_past_channel_capacity() 
 
     match stalled {
         SubmitError::HaltSignaled { .. } => {}
-        SubmitError::Closed | SubmitError::QueueFull => panic!("expected HaltSignaled"),
+        SubmitError::Closed | SubmitError::QueueFull | SubmitError::PendingBytesFull { .. } => {
+            panic!("expected HaltSignaled")
+        }
     }
     assert!(matches!(
         captured.lock().first(),
@@ -442,6 +448,8 @@ fn writer_committed_entries_are_scannable_after_close() {
         get_atomic_clock_static(),
         halt,
         WriterConfig {
+            max_pending_bytes: None,
+            max_batch_bytes: None,
             channel_capacity: 16,
             max_batch_entries: 4,
             max_batch_latency: Duration::from_millis(5),
@@ -513,6 +521,8 @@ fn writer_carries_high_watermark_through_batch_size_flushes() {
         get_atomic_clock_static(),
         halt,
         WriterConfig {
+            max_pending_bytes: None,
+            max_batch_bytes: None,
             channel_capacity: 64,
             max_batch_entries: 3,
             max_batch_latency: Duration::from_millis(5),

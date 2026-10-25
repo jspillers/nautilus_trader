@@ -300,6 +300,10 @@ fn halt_reason_from_submit(err: &SubmitError) -> HaltReason {
             threshold: *threshold,
         },
         SubmitError::QueueFull => HaltReason::QueueFull,
+        SubmitError::PendingBytesFull { limit, required } => HaltReason::PendingBytesFull {
+            limit: *limit,
+            required: *required,
+        },
         SubmitError::Closed => HaltReason::BackendError("event store writer closed".to_string()),
     }
 }

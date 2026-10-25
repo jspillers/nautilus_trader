@@ -272,6 +272,13 @@ pub struct EventStoreConfig {
     pub redb_cache_size_bytes: usize,
     /// Capacity of the writer's bounded submit channel.
     pub channel_capacity: usize,
+    /// Optional accounted bytes retained in the submit queue and in-flight batch.
+    /// A reservation is released only after durable append or failed-message drop.
+    #[serde(default)]
+    pub max_pending_bytes: Option<usize>,
+    /// Optional accounted batch bytes which trigger a commit before the count limit.
+    #[serde(default)]
+    pub max_batch_bytes: Option<usize>,
     /// Maximum entries collected before the writer forces a commit.
     pub max_batch_entries: usize,
     /// Maximum time a batch may accumulate before the writer forces a commit.
@@ -296,6 +303,8 @@ impl Default for EventStoreConfig {
             data_markers: None,
             redb_cache_size_bytes: default_redb_cache_size_bytes(),
             channel_capacity: 10_000,
+            max_pending_bytes: None,
+            max_batch_bytes: None,
             max_batch_entries: 100,
             max_batch_latency: Duration::from_millis(5),
             halt_threshold: Duration::from_millis(250),
@@ -345,6 +354,24 @@ mod tests {
             .remove("redb_cache_size_bytes");
         let restored: EventStoreConfig = serde_json::from_value(json).unwrap();
         assert_eq!(restored.redb_cache_size_bytes, 128 * 1024 * 1024);
+    }
+
+    #[rstest]
+    fn byte_budget_config_roundtrips_and_is_optional_for_existing_configs() {
+        let config = EventStoreConfig {
+            max_pending_bytes: Some(32 * 1024 * 1024),
+            max_batch_bytes: Some(1024 * 1024),
+            ..Default::default()
+        };
+        let mut value = serde_json::to_value(&config).unwrap();
+        let restored: EventStoreConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(restored.max_pending_bytes, config.max_pending_bytes);
+        assert_eq!(restored.max_batch_bytes, config.max_batch_bytes);
+        value.as_object_mut().unwrap().remove("max_pending_bytes");
+        value.as_object_mut().unwrap().remove("max_batch_bytes");
+        let restored: EventStoreConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.max_pending_bytes, None);
+        assert_eq!(restored.max_batch_bytes, None);
     }
 
     #[rstest]
