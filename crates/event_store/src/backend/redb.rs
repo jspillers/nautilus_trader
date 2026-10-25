@@ -64,6 +64,7 @@ const SNAPSHOT_ANCHOR_KEY: &str = "latest";
 pub struct RedbBackend {
     base_dir: PathBuf,
     state: Option<RunState>,
+    cache_size_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -109,6 +110,9 @@ impl RunDatabase {
     }
 }
 
+/// Default per-database cache budget, including readers and crash recovery.
+pub const DEFAULT_CACHE_SIZE_BYTES: usize = 128 * 1024 * 1024;
+
 impl RedbBackend {
     /// Creates a new [`RedbBackend`] rooted at `base_dir`.
     ///
@@ -119,7 +123,23 @@ impl RedbBackend {
         Self {
             base_dir: base_dir.into(),
             state: None,
+            cache_size_bytes: DEFAULT_CACHE_SIZE_BYTES,
         }
+    }
+
+    /// Returns the configured cache budget in bytes.
+    #[must_use]
+    pub const fn cache_size_bytes(&self) -> usize {
+        self.cache_size_bytes
+    }
+
+    /// Selects the redb cache budget for this backend's writable run.
+    ///
+    /// The database still owns eviction, transactions and durability.
+    #[must_use]
+    pub fn with_cache_size(mut self, bytes: usize) -> Self {
+        self.cache_size_bytes = bytes;
+        self
     }
 
     /// Returns the directory the backend writes run files to for `instance_id`.
@@ -212,7 +232,10 @@ impl RedbBackend {
             )));
         }
 
-        let db = ReadOnlyDatabase::open(&path).map_err(map_read_only_database_err)?;
+        let db = Database::builder()
+            .set_cache_size(DEFAULT_CACHE_SIZE_BYTES)
+            .open_read_only(&path)
+            .map_err(map_database_err)?;
         format::verify_store_format(&db)?;
         let manifest = Self::read_manifest(&db)?.ok_or_else(|| {
             EventStoreError::Corrupted(format!(
@@ -245,6 +268,7 @@ impl RedbBackend {
 
         Ok(Self {
             base_dir: base,
+            cache_size_bytes: DEFAULT_CACHE_SIZE_BYTES,
             state: Some(RunState {
                 db: RunDatabase::ReadOnly(db),
                 manifest,
@@ -323,7 +347,10 @@ impl RedbBackend {
     }
 
     fn read_run_manifest(path: &Path) -> Result<RunManifest, EventStoreError> {
-        let manifest = match ReadOnlyDatabase::open(path) {
+        let manifest = match Database::builder()
+            .set_cache_size(DEFAULT_CACHE_SIZE_BYTES)
+            .open_read_only(path)
+        {
             Ok(db) => {
                 Self::verify_listed_store_format(&db, path)?;
                 Self::read_manifest(&db)?
@@ -336,7 +363,10 @@ impl RedbBackend {
                     "Run file {} was not shut down cleanly, repairing",
                     path.display()
                 );
-                let db = Database::open(path).map_err(map_database_err)?;
+                let db = Database::builder()
+                    .set_cache_size(DEFAULT_CACHE_SIZE_BYTES)
+                    .open(path)
+                    .map_err(map_database_err)?;
                 Self::verify_listed_store_format(&db, path)?;
                 Self::read_manifest(&db)?
             }
@@ -502,7 +532,10 @@ impl EventStore for RedbBackend {
         let path = self.run_path(&manifest.instance_id, &manifest.run_id);
         let path_existed = path.exists();
 
-        let db = Database::create(&path).map_err(map_database_err)?;
+        let db = Database::builder()
+            .set_cache_size(self.cache_size_bytes)
+            .create(&path)
+            .map_err(map_database_err)?;
 
         if path_existed {
             format::verify_store_format(&db)?;

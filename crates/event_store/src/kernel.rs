@@ -190,7 +190,8 @@ impl EventStoreLifecycleOptions {
 }
 
 fn default_backend_opener(config: &EventStoreConfig, manifest: &RunManifest) -> BackendOpenResult {
-    let mut backend = RedbBackend::new(config.base_dir.clone());
+    let mut backend =
+        RedbBackend::new(config.base_dir.clone()).with_cache_size(config.redb_cache_size_bytes);
     backend.open_run(manifest.clone())?;
     Ok(Box::new(backend))
 }
@@ -1444,6 +1445,7 @@ mod tests {
 
     fn make_config(base_dir: PathBuf) -> EventStoreConfig {
         EventStoreConfig {
+            redb_cache_size_bytes: 128 * 1024 * 1024,
             base_dir,
             identity: RunIdentity {
                 binary_hash: "deadbeef".to_string(),

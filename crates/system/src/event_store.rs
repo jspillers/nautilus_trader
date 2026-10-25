@@ -245,6 +245,10 @@ const fn default_data_marker_channel_capacity() -> usize {
     DEFAULT_DATA_MARKER_CHANNEL_CAPACITY
 }
 
+const fn default_redb_cache_size_bytes() -> usize {
+    128 * 1024 * 1024
+}
+
 /// Configuration for the kernel-managed event store run lifecycle.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EventStoreConfig {
@@ -263,6 +267,9 @@ pub struct EventStoreConfig {
     /// Data-marker sidecar settings. `None` disables marker capture for the run.
     #[serde(default)]
     pub data_markers: Option<DataMarkerConfig>,
+    /// Per-database redb cache budget in bytes; independent of event count.
+    #[serde(default = "default_redb_cache_size_bytes")]
+    pub redb_cache_size_bytes: usize,
     /// Capacity of the writer's bounded submit channel.
     pub channel_capacity: usize,
     /// Maximum entries collected before the writer forces a commit.
@@ -287,6 +294,7 @@ impl Default for EventStoreConfig {
             retention: RetentionMode::default(),
             replay_from_run_id: None,
             data_markers: None,
+            redb_cache_size_bytes: default_redb_cache_size_bytes(),
             channel_capacity: 10_000,
             max_batch_entries: 100,
             max_batch_latency: Duration::from_millis(5),
@@ -309,6 +317,7 @@ mod tests {
         let json = serde_json::to_string(&config).expect("serialize");
         let restored: EventStoreConfig = serde_json::from_str(&json).expect("deserialize");
 
+        assert_eq!(restored.redb_cache_size_bytes, config.redb_cache_size_bytes);
         assert_eq!(restored.channel_capacity, config.channel_capacity);
         assert_eq!(restored.max_batch_entries, config.max_batch_entries);
         assert_eq!(restored.max_batch_latency, config.max_batch_latency);
@@ -320,6 +329,22 @@ mod tests {
         assert_eq!(restored.replay_from_run_id, config.replay_from_run_id);
         assert_eq!(restored.identity, config.identity);
         assert_eq!(restored.data_markers, config.data_markers);
+    }
+
+    #[rstest]
+    fn event_store_cache_budget_is_configurable_and_defaults_for_old_configs() {
+        let config = EventStoreConfig {
+            redb_cache_size_bytes: 64 * 1024 * 1024,
+            ..Default::default()
+        };
+        let mut json = serde_json::to_value(&config).unwrap();
+        let restored: EventStoreConfig = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(restored.redb_cache_size_bytes, 64 * 1024 * 1024);
+        json.as_object_mut()
+            .unwrap()
+            .remove("redb_cache_size_bytes");
+        let restored: EventStoreConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.redb_cache_size_bytes, 128 * 1024 * 1024);
     }
 
     #[rstest]

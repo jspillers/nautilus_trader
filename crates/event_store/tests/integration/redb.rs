@@ -1912,3 +1912,24 @@ fn iter_index_keys_errors_when_no_run_open() {
         other => panic!("expected Backend, was {other:?}"),
     }
 }
+
+#[rstest]
+fn small_cache_budget_preserves_committed_entries_and_sealed_reader() {
+    let tmp = TempDir::new().unwrap();
+    let mut backend = RedbBackend::new(tmp.path()).with_cache_size(1024 * 1024);
+    assert_eq!(backend.cache_size_bytes(), 1024 * 1024);
+    backend.open_run(manifest("small-cache")).unwrap();
+    let batch = vec![
+        append_with(1, 10, Vec::new()),
+        append_with(2, 11, Vec::new()),
+    ];
+    backend.append_batch(&batch).unwrap();
+    backend.seal(RunStatus::Ended).unwrap();
+    let path = backend.current_path().unwrap().to_owned();
+    drop(backend);
+    let reader = RedbBackend::open_sealed_file(path).unwrap();
+    assert_eq!(reader.cache_size_bytes(), 128 * 1024 * 1024);
+    assert_eq!(reader.manifest().unwrap().status, RunStatus::Ended);
+    assert_eq!(reader.high_watermark().unwrap(), 2);
+    assert_eq!(reader.scan_seq(2).unwrap().unwrap(), batch[1].entry);
+}
