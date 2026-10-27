@@ -62,11 +62,12 @@ impl<T: 'static> TypedSubscription<T> {
     }
 
     fn delivery_order(&self, other: &Self) -> Ordering {
+        // Keep priority and lexical pattern precedence. Stable sorting preserves
+        // insertion order for ties without using generated handler identities.
         other
             .priority
             .cmp(&self.priority)
-            .then_with(|| self.pattern.cmp(&other.pattern))
-            .then_with(|| self.handler_id.cmp(&other.handler_id))
+            .then_with(|| self.pattern.as_str().cmp(other.pattern.as_str()))
     }
 }
 
@@ -188,7 +189,7 @@ impl<T: 'static> TopicRouter<T> {
 
         self.subscriptions.push(sub);
 
-        // Re-sort by priority descending, pattern ascending, then handler ID ascending.
+        // Stable sorting retains insertion order at equal priority and pattern.
         // Clear the index cache since sorting can rearrange all indices.
         self.subscriptions
             .sort_by(TypedSubscription::delivery_order);
@@ -438,7 +439,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_topic_router_publish_orders_by_full_delivery_key() {
+    fn test_topic_router_publish_orders_by_priority_and_insertion() {
         let mut router = TopicRouter::<i32>::new();
         let order = Rc::new(RefCell::new(Vec::new()));
 
@@ -469,8 +470,47 @@ mod tests {
 
         assert_eq!(
             *order.borrow(),
-            vec!["wildcard-b", "exact-a", "exact-b", "low-z"]
+            vec!["wildcard-b", "exact-b", "exact-a", "low-z"]
         );
+    }
+
+    #[rstest]
+    fn generated_handler_ids_preserve_insertion_across_cache_and_resubscription() {
+        let mut router = TopicRouter::<i32>::new();
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let handlers = (0..8)
+            .map(|label| {
+                let order = order.clone();
+                TypedHandler::from(move |_: &i32| order.borrow_mut().push(label))
+            })
+            .collect::<Vec<_>>();
+
+        for handler in &handlers {
+            router.subscribe("native.order.*".into(), handler.clone(), 0);
+        }
+        router.subscribe("native.order.*".into(), handlers[2].clone(), 0);
+        let priority_order = order.clone();
+        router.subscribe(
+            "native.order.*".into(),
+            TypedHandler::from(move |_: &i32| priority_order.borrow_mut().push(99)),
+            10,
+        );
+        router.publish("native.order.cached".into(), &1);
+        assert_eq!(*order.borrow(), vec![99, 0, 1, 2, 3, 4, 5, 6, 7]);
+
+        let late_order = order.clone();
+        router.subscribe(
+            "native.order.*".into(),
+            TypedHandler::from(move |_: &i32| late_order.borrow_mut().push(8)),
+            0,
+        );
+        router.unsubscribe("native.order.*".into(), &handlers[2]);
+        router.subscribe("native.order.*".into(), handlers[2].clone(), 0);
+        for topic in ["native.order.cached", "native.order.uncached"] {
+            order.borrow_mut().clear();
+            router.publish(topic.into(), &2);
+            assert_eq!(*order.borrow(), vec![99, 0, 1, 3, 4, 5, 6, 7, 8, 2]);
+        }
     }
 
     #[rstest]

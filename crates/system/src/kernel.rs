@@ -46,7 +46,7 @@ use std::{
 use nautilus_common::{
     actor::{DataActor, registry::try_get_actor_unchecked},
     cache::{Cache, CacheConfig, database::CacheDatabaseAdapter},
-    clock::Clock,
+    clock::{Clock, VirtualClock},
     component::Component,
     enums::{ComponentState, Environment},
     logging::{
@@ -91,7 +91,7 @@ use crate::{
     controller::Controller,
     event_store::{EventStoreFactory, KernelEventStore, RegisteredComponents},
     strategy_factory::StrategyFactory,
-    trader::Trader,
+    trader::{ComponentStateLimits, RegisteredComponentState, Trader},
 };
 
 /// Core Nautilus system kernel.
@@ -1065,6 +1065,47 @@ impl NautilusKernel {
     #[must_use]
     pub fn event_store(&self) -> Option<&dyn KernelEventStore> {
         self.event_store.as_deref()
+    }
+
+    /// Restores bounded standard component state in an opened offline recorded run.
+    ///
+    /// The component must be registered at its first Ready revision without timers or
+    /// owned financial history. The existing typed `on_load` callback receives the exact
+    /// opaque bytes once. Financial cache and database state are never restored here.
+    /// The live-node recorded owner additionally fences failed runs and current node state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without calling the hook for an unsupported runtime/source,
+    /// lifecycle/registration mismatch, repeated attempt or invalid bounds. Callback
+    /// failures retain their actual error and cannot be retried within the registration.
+    pub fn restore_recorded_component_state(
+        &self,
+        state: RegisteredComponentState,
+        limits: ComponentStateLimits,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.environment() == Environment::Sandbox
+                && self.clock.try_borrow()?.as_any().is::<VirtualClock>()
+                && self.trader.try_borrow()?.state() == ComponentState::Running,
+            "Component state restore requires running offline Sandbox and VirtualClock"
+        );
+        anyhow::ensure!(
+            !self.config.load_state()
+                && !self.cache.try_borrow()?.has_backing()
+                && !self.is_event_store_replay_configured()
+                && !get_message_bus().try_borrow()?.has_backing,
+            "Component state restore cannot use backing, egress or cache restoration"
+        );
+        anyhow::ensure!(
+            self.event_store().is_some_and(|store| {
+                store.recorded_origin_instance_id() == Some(self.instance_id)
+                    && store.parent_run_id().is_none()
+                    && !store.is_halted()
+            }),
+            "Component state restore requires an opened verified recorded origin"
+        );
+        Trader::restore_component_state(&self.trader, state, limits)
     }
 
     /// Returns whether the event-store integration is running an event-store replay start.

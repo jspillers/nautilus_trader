@@ -19,9 +19,12 @@
 //! and individual trading components. It manages component lifecycles, provides
 //! unique identification, and coordinates with system engines.
 
+mod component_state;
+
 use std::{cell::RefCell, fmt::Debug, rc::Rc};
 
 use ahash::AHashMap;
+pub use component_state::{ComponentStateKind, ComponentStateLimits, RegisteredComponentState};
 use indexmap::IndexMap;
 #[cfg(feature = "python")]
 use nautilus_common::python::wrappers::release_python_wrapper;
@@ -85,6 +88,20 @@ type ComponentStateSaveFn = fn(Ustr) -> anyhow::Result<PersistedComponentState>;
 struct ComponentStateCallbacks {
     load: ComponentStateLoadFn,
     save: ComponentStateSaveFn,
+    recorded_restore_attempted: bool,
+}
+
+impl ComponentStateCallbacks {
+    fn new<T>() -> Self
+    where
+        T: DataActor + DataActorNative + Debug + 'static,
+    {
+        Self {
+            load: Trader::load_component_state::<T>,
+            save: Trader::save_component_state::<T>,
+            recorded_restore_attempted: false,
+        }
+    }
 }
 
 /// Central orchestrator for managing trading components.
@@ -364,13 +381,8 @@ impl Trader {
 
         // Store actor ID for lifecycle management
         self.actor_ids.push(actor_id);
-        self.actor_state_callbacks.insert(
-            actor_id,
-            ComponentStateCallbacks {
-                load: Self::load_component_state::<T>,
-                save: Self::save_component_state::<T>,
-            },
-        );
+        self.actor_state_callbacks
+            .insert(actor_id, ComponentStateCallbacks::new::<T>());
 
         log::info!("Registered actor {actor_id} with trader {}", self.trader_id);
 
@@ -397,13 +409,8 @@ impl Trader {
 
         // Store actor ID for lifecycle management
         self.actor_ids.push(actor_id);
-        self.actor_state_callbacks.insert(
-            actor_id,
-            ComponentStateCallbacks {
-                load: Self::load_component_state::<T>,
-                save: Self::save_component_state::<T>,
-            },
-        );
+        self.actor_state_callbacks
+            .insert(actor_id, ComponentStateCallbacks::new::<T>());
 
         log::debug!(
             "Added actor ID '{actor_id}' to trader {} for lifecycle management",
@@ -514,13 +521,8 @@ impl Trader {
             .register(strategy_control_endpoint(strategy_id), control_handler);
 
         self.strategy_ids.push(strategy_id);
-        self.strategy_state_callbacks.insert(
-            strategy_id,
-            ComponentStateCallbacks {
-                load: Self::load_component_state::<T>,
-                save: Self::save_component_state::<T>,
-            },
-        );
+        self.strategy_state_callbacks
+            .insert(strategy_id, ComponentStateCallbacks::new::<T>());
         self.strategy_handler_ids
             .insert(strategy_id, (order_handler_id, position_handler_id));
 
@@ -707,13 +709,8 @@ impl Trader {
             .register(strategy_control_endpoint(strategy_id), control_handler);
 
         self.strategy_ids.push(strategy_id);
-        self.strategy_state_callbacks.insert(
-            strategy_id,
-            ComponentStateCallbacks {
-                load: Self::load_component_state::<T>,
-                save: Self::save_component_state::<T>,
-            },
-        );
+        self.strategy_state_callbacks
+            .insert(strategy_id, ComponentStateCallbacks::new::<T>());
         self.strategy_handler_ids
             .insert(strategy_id, (order_handler_id, position_handler_id));
 

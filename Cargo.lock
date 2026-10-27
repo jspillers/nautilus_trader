@@ -6093,6 +6093,7 @@ dependencies = [
  "nautilus-model",
  "nautilus-persistence",
  "nautilus-system",
+ "nautilus-trading",
  "parking_lot",
  "proptest",
  "redb",

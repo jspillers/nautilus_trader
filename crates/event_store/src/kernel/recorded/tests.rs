@@ -17,11 +17,13 @@ use std::{cell::RefCell, io::Write, rc::Rc, time::Duration};
 
 use nautilus_common::clock::VirtualClock;
 use nautilus_core::time::get_atomic_clock_static;
-use nautilus_system::RegisteredComponents;
+use nautilus_system::{KernelEventStore as KernelEventStoreTrait, RegisteredComponents};
 use rstest::rstest;
 
 use super::*;
 use crate::{CheckpointLimits, EventStore, HaltSignal, RedbBackend, open_run_with_options};
+
+mod component_state;
 
 fn source_origin() -> anyhow::Result<(tempfile::TempDir, UUID4, RecordedRunOrigin)> {
     let temp = tempfile::tempdir()?;
@@ -86,6 +88,7 @@ fn verified_origin_keeps_original_id_and_actual_constructed_identity() -> anyhow
         Rc::new(RefCell::new(VirtualClock::new())),
         EventStoreLifecycleOptions::new().with_recorded_origin(origin.clone()),
     )?;
+    anyhow::ensure!(KernelEventStoreTrait::recorded_origin_instance_id(&lifecycle).is_none());
     recorded::begin_startup_validation(vec![]);
     let result = lifecycle.open(
         instance,
@@ -94,6 +97,9 @@ fn verified_origin_keeps_original_id_and_actual_constructed_identity() -> anyhow
     );
     recorded::disable_capture();
     result?;
+    anyhow::ensure!(
+        KernelEventStoreTrait::recorded_origin_instance_id(&lifecycle) == Some(instance)
+    );
     let witness = lifecycle.recorded_origin().unwrap();
     anyhow::ensure!(witness.source == origin.source);
     anyhow::ensure!(
@@ -108,6 +114,7 @@ fn verified_origin_keeps_original_id_and_actual_constructed_identity() -> anyhow
     anyhow::ensure!(std::fs::read(&origin.source.journal_path)? == original_bytes);
     anyhow::ensure!(witness.artifact_path != origin.source.journal_path);
     lifecycle.seal(30.into());
+    anyhow::ensure!(KernelEventStoreTrait::recorded_origin_instance_id(&lifecycle).is_none());
     Ok(())
 }
 

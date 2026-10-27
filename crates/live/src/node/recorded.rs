@@ -34,6 +34,7 @@ use nautilus_common::{
 };
 use nautilus_core::UnixNanos;
 use nautilus_model::{data::Data, identifiers::ActorId};
+use nautilus_system::trader::{ComponentStateLimits, RegisteredComponentState};
 
 use super::{LiveNode, NodeState};
 use crate::runner::{AsyncRunner, PendingRunnerEvent};
@@ -87,6 +88,36 @@ pub(super) struct RecordedRunnerState {
 }
 
 impl LiveNode {
+    /// Restores an original bounded component callback payload before its first start.
+    ///
+    /// This is an owner-thread operation between recorded inputs, after native creation
+    /// registered the target at Ready and before an original Start/probe input. The opened
+    /// native recorded origin and cold runtime guards remain mandatory. The fresh native
+    /// registration UUID is preserved. A rejected or failed restore fails this offline run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an absent/failed recorded runtime, unsupported origin, changed
+    /// registration or lifecycle, invalid bounds or an actual standard callback failure.
+    pub fn restore_recorded_component_state(
+        &mut self,
+        state: RegisteredComponentState,
+        limits: ComponentStateLimits,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.state() == NodeState::Running
+                && self.recorded.as_ref().is_some_and(|state| !state.failed),
+            "Component state restore requires a healthy active recorded node"
+        );
+        let result = self.kernel.restore_recorded_component_state(state, limits);
+        if result.is_err()
+            && let Some(state) = self.recorded.as_mut()
+        {
+            state.failed = true;
+        }
+        result
+    }
+
     /// Enables native queue dispatch witnesses before startup without changing scheduling.
     ///
     /// # Errors

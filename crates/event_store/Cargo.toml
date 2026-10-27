@@ -59,6 +59,7 @@ ustr = { workspace = true }
 
 [dev-dependencies]
 nautilus-model = { workspace = true, features = ["test-support"] }
+nautilus-trading = { workspace = true }
 
 async-trait = { workspace = true }
 criterion = { workspace = true }

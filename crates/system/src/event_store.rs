@@ -112,6 +112,15 @@ pub trait KernelEventStore: Debug {
     /// Returns the configured replay source or recovered parent run id, when present.
     fn parent_run_id(&self) -> Option<&str>;
 
+    /// Returns the source instance of an actually opened, verified offline recorded origin.
+    ///
+    /// Ordinary live capture and cache-bootstrap replay return `None`. Implementations must
+    /// not derive this capability from caller configuration without verifying the source and
+    /// opening the distinct exclusively created recorded journal.
+    fn recorded_origin_instance_id(&self) -> Option<UUID4> {
+        None
+    }
+
     /// Returns whether the current config enables event-store replay.
     ///
     /// Event-store replay restores cache state and opens a child run for inspection. The kernel

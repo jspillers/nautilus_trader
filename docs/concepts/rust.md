@@ -686,6 +686,35 @@ the verified source, actual constructed manifest identity and canonical new
 artifact path. Original signed inputs and source files are never rewritten.
 Ordinary startup and low-level event-store open cannot bypass this admission.
 
+### Preserving opaque component identity before first start
+
+An original signed input may bind an operational identity created by a component's
+constructor. After ordinary native registration and before its first start,
+`Trader::export_component_state(&trader, component_id, limits)` calls the actual
+registered type's standard `on_save` hook. The returned `RegisteredComponentState`
+retains the exact opaque byte values, source trader/instance, component kind and ID,
+native registration and lifecycle witness. `ComponentStateLimits` bounds key count,
+key/value sizes and their total; native debug formatting omits the payload.
+
+During a healthy recorded run, a caller may pass that payload to
+`LiveNode::restore_recorded_component_state` between recorded inputs, after native
+creation returned and before the original Start or probe. The kernel requires an
+actually opened verified recorded origin, Sandbox with VirtualClock, no cache
+backing, no database load and no external egress. The component must still be Ready
+at lifecycle revision one, with no timers or target-owned order/position history.
+The ID, callback kind and per-ID registration generation must match. The source
+registration UUID stays evidence; the fresh native registration is never replaced.
+
+The existing type-erased `on_load` callback receives the exact bytes once, after
+the Trader borrow is released. Its native trader identity, registration, Ready
+lifecycle and target VirtualClock must remain unchanged after the hook. An
+attempted hook cannot be retried even if it fails, and the recorded node fails
+the run. No financial cache, account, order,
+clock or lifecycle state is restored. The caller must independently verify the
+source/configuration provenance and review the component's opaque state contract;
+this seam alone does not make arbitrary persisted strategy state replayable.
+Ordinary live persistence and Python callback behavior are unchanged.
+
 ## Related guides
 
 - [Python](python.md) - Python ownership, runtime, and public API boundaries.

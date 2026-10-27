@@ -93,7 +93,7 @@ use std::{
 };
 
 use ahash::{AHashMap, AHashSet};
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use nautilus_core::UUID4;
 use nautilus_model::{
     data::{
@@ -166,11 +166,12 @@ impl Subscription {
     }
 
     pub(crate) fn delivery_order(&self, other: &Self) -> std::cmp::Ordering {
+        // Keep priority and lexical pattern precedence. Stable sorting preserves
+        // insertion order for ties without using generated handler identities.
         other
             .priority
             .cmp(&self.priority)
-            .then_with(|| self.pattern.cmp(&other.pattern))
-            .then_with(|| self.handler_id.cmp(&other.handler_id))
+            .then_with(|| self.pattern.as_str().cmp(other.pattern.as_str()))
     }
 }
 
@@ -233,7 +234,7 @@ pub struct MessageBus {
     /// If the message bus is backed by a database.
     pub has_backing: bool,
     pub(crate) switchboard: MessagingSwitchboard,
-    pub(crate) subscriptions: AHashSet<Subscription>,
+    pub(crate) subscriptions: IndexSet<Subscription>,
     pub(crate) topics: IndexMap<MStr<Topic>, Vec<Subscription>>,
     pub(crate) endpoints: IndexMap<MStr<Endpoint>, ShareableMessageHandler>,
     pub(crate) correlation_index: AHashMap<UUID4, ShareableMessageHandler>,
@@ -328,7 +329,7 @@ impl MessageBus {
             instance_id,
             name: name.unwrap_or(stringify!(MessageBus).to_owned()),
             switchboard: MessagingSwitchboard::default(),
-            subscriptions: AHashSet::new(),
+            subscriptions: IndexSet::new(),
             topics: IndexMap::new(),
             endpoints: IndexMap::new(),
             correlation_index: AHashMap::new(),
@@ -1353,7 +1354,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_matching_subscriptions_orders_by_full_delivery_key_on_cache_miss() {
+    fn test_matching_subscriptions_orders_by_priority_and_insertion_on_cache_miss() {
         MessageBus::default().register_message_bus();
         let order = Rc::new(RefCell::new(Vec::new()));
 
@@ -1390,15 +1391,15 @@ mod tests {
             actual,
             vec![
                 (10, "delivery.*", "handler-b"),
-                (10, "delivery.topic", "handler-a"),
                 (10, "delivery.topic", "handler-b"),
+                (10, "delivery.topic", "handler-a"),
                 (1, "delivery.*", "handler-z"),
             ]
         );
     }
 
     #[rstest]
-    fn test_first_uncached_publish_any_orders_by_full_delivery_key() {
+    fn test_first_uncached_publish_any_orders_by_priority_and_insertion() {
         MessageBus::default().register_message_bus();
         let order = Rc::new(RefCell::new(Vec::new()));
 
@@ -1427,12 +1428,51 @@ mod tests {
 
         assert_eq!(
             *order.borrow(),
-            vec!["wildcard-b", "exact-a", "exact-b", "low-z"]
+            vec!["wildcard-b", "exact-b", "exact-a", "low-z"]
         );
     }
 
     #[rstest]
-    fn test_late_subscription_orders_cached_any_topic_by_full_delivery_key() {
+    fn generated_any_handler_ids_preserve_insertion_across_cache_and_resubscription() {
+        MessageBus::default().register_message_bus();
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let handlers = (0..8)
+            .map(|label| {
+                let order = order.clone();
+                ShareableMessageHandler::from_any(move |_| order.borrow_mut().push(label))
+            })
+            .collect::<Vec<_>>();
+
+        for handler in &handlers {
+            msgbus::subscribe_any("native.order.*".into(), handler.clone(), None);
+        }
+        msgbus::subscribe_any("native.order.*".into(), handlers[2].clone(), None);
+        let priority_order = order.clone();
+        msgbus::subscribe_any(
+            "native.order.*".into(),
+            ShareableMessageHandler::from_any(move |_| priority_order.borrow_mut().push(99)),
+            Some(10),
+        );
+        msgbus::publish_any("native.order.cached".into(), &());
+        assert_eq!(*order.borrow(), vec![99, 0, 1, 2, 3, 4, 5, 6, 7]);
+
+        let late_order = order.clone();
+        msgbus::subscribe_any(
+            "native.order.*".into(),
+            ShareableMessageHandler::from_any(move |_| late_order.borrow_mut().push(8)),
+            None,
+        );
+        msgbus::unsubscribe_any("native.order.*".into(), &handlers[2]);
+        msgbus::subscribe_any("native.order.*".into(), handlers[2].clone(), None);
+        for topic in ["native.order.cached", "native.order.uncached"] {
+            order.borrow_mut().clear();
+            msgbus::publish_any(topic.into(), &());
+            assert_eq!(*order.borrow(), vec![99, 0, 1, 3, 4, 5, 6, 7, 8, 2]);
+        }
+    }
+
+    #[rstest]
+    fn test_late_subscription_orders_cached_any_topic_by_priority_and_insertion() {
         MessageBus::default().register_message_bus();
         let order = Rc::new(RefCell::new(Vec::new()));
 
@@ -1463,7 +1503,7 @@ mod tests {
 
         assert_eq!(
             *order.borrow(),
-            vec!["wildcard-b", "exact-a", "exact-b", "low-z"]
+            vec!["wildcard-b", "exact-b", "exact-a", "low-z"]
         );
     }
 

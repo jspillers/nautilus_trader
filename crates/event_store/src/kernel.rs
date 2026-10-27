@@ -1495,6 +1495,13 @@ impl KernelEventStoreTrait for EventStoreLifecycle {
         EventStoreLifecycle::parent_run_id(self)
     }
 
+    fn recorded_origin_instance_id(&self) -> Option<UUID4> {
+        self.recorded_origin
+            .as_ref()
+            .filter(|_| self.session.is_some())
+            .and_then(|origin| origin.source.instance_id.parse().ok())
+    }
+
     fn is_event_store_replay_configured(&self) -> bool {
         EventStoreLifecycle::is_event_store_replay_configured(self)
     }
