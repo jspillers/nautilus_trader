@@ -240,7 +240,15 @@ pub(crate) fn spawn_export(
                         .min(Duration::from_millis(10));
 
                     match frozen.recv_timeout(remaining) {
-                        Ok(result) => break result.map_err(CheckpointError::Source)?,
+                        Ok(result) => {
+                            // The writer can acknowledge a cancelled queued freeze with Closed.
+                            // Cancellation may win while this worker is blocked receiving that
+                            // response; it does not mean the recording source was closed.
+                            if cancelled_for_worker.load(Ordering::Acquire) {
+                                return Err(CheckpointError::Cancelled);
+                            }
+                            break result.map_err(CheckpointError::Source)?;
+                        }
                         Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => {
                             return Err(CheckpointError::WorkerClosed);
@@ -740,6 +748,7 @@ mod tests {
         reached: SyncSender<()>,
         release: Receiver<()>,
         first: AtomicBool,
+        closed_after_gate: bool,
     }
     impl EventStore for GateBackend {
         fn open_run(&mut self, manifest: RunManifest) -> Result<(), EventStoreError> {
@@ -772,6 +781,10 @@ mod tests {
             if self.first.swap(false, Ordering::AcqRel) {
                 self.reached.send(()).unwrap();
                 self.release.recv().unwrap();
+
+                if self.closed_after_gate {
+                    return Err(EventStoreError::Closed);
+                }
             }
             self.inner.freeze_prefix(now)
         }
@@ -802,6 +815,7 @@ mod tests {
             reached,
             release: release_rx,
             first: AtomicBool::new(true),
+            closed_after_gate: false,
         };
         let halted = Arc::new(AtomicBool::new(false));
         let halted_clone = halted.clone();
@@ -842,6 +856,66 @@ mod tests {
         };
         assert_eq!(finished(&next).unwrap().prefix.high_watermark, 1);
         assert!(!cancelled_path.exists());
+        assert!(!halted.load(Ordering::Acquire));
+        drop(writer);
+    }
+
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn cancellation_before_freeze_reply_is_not_reported_as_a_closed_source(#[case] cancel: bool) {
+        let directory = TempDir::new().unwrap();
+        let (reached, reached_rx) = mpsc::sync_channel(1);
+        let (release, release_rx) = mpsc::sync_channel(1);
+        let backend = GateBackend {
+            inner: backend(&directory),
+            reached,
+            release: release_rx,
+            first: AtomicBool::new(true),
+            // Reproduce the writer response for a freeze cancelled before admission.
+            closed_after_gate: true,
+        };
+        let halted = Arc::new(AtomicBool::new(false));
+        let halted_clone = halted.clone();
+
+        let writer = EventStoreWriter::spawn(
+            Box::new(backend),
+            get_atomic_clock_static(),
+            Arc::new(move |_| {
+                halted_clone.store(true, Ordering::Release);
+            }),
+            WriterConfig::default(),
+        )
+        .unwrap();
+        let release_on_drop = ReleaseOnDrop(release);
+        let destination = directory.path().join("cancel-before-response.checkpoint");
+        let job = writer
+            .start_prefix_checkpoint(&destination, limits())
+            .unwrap();
+        reached_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+
+        if cancel {
+            job.cancel();
+        }
+        release_on_drop.0.send(()).unwrap();
+        let result = finished(&job);
+        if cancel {
+            assert!(matches!(result, Err(CheckpointError::Cancelled)));
+        } else {
+            assert!(matches!(
+                result,
+                Err(CheckpointError::Source(EventStoreError::Closed))
+            ));
+        }
+        assert!(!destination.exists());
+        assert!(!halted.load(Ordering::Acquire));
+        writer.submit(draft(1)).unwrap();
+        let next = writer
+            .start_prefix_checkpoint(directory.path().join("continued.checkpoint"), limits())
+            .unwrap();
+        let descriptor = finished(&next).unwrap();
+        assert_eq!(descriptor.prefix.high_watermark, 1);
+        assert_eq!(descriptor.prefix.source_manifest.status, RunStatus::Running);
         assert!(!halted.load(Ordering::Acquire));
         drop(writer);
     }

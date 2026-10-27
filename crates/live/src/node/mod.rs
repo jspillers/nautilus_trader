@@ -3025,6 +3025,7 @@ impl LiveNode {
         Ok(())
     }
 
+    #[cfg(feature = "python")]
     pub(crate) fn rollback_external_order_claims(
         &self,
         strategy_id: StrategyId,
