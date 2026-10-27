@@ -59,7 +59,7 @@ use nautilus_execution::{
     },
 };
 use nautilus_model::{
-    accounts::{AccountAny, MarginAccount},
+    accounts::{Account, AccountAny, MarginAccount},
     data::{Bar, BarType, Data, InstrumentClose, InstrumentStatus, QuoteTick, TradeTick},
     enums::{
         AccountType, AggressorSide, BookType, ContingencyType, InstrumentCloseType, LiquiditySide,
@@ -79,7 +79,7 @@ use nautilus_model::{
     },
     orders::{Order, OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs},
     position::Position,
-    types::{Currency, Money, Price, Quantity},
+    types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use nautilus_sandbox::{SandboxExecutionClient, SandboxExecutionClientConfig};
 #[cfg(feature = "python")]
@@ -2578,6 +2578,100 @@ async fn test_client_connect(mut execution_client: SandboxExecutionClient) {
 
     assert!(result.is_ok());
     assert!(execution_client.is_connected());
+}
+
+#[rstest]
+#[case::fresh_cash(false)]
+#[case::restored_cash(true)]
+#[tokio::test]
+async fn test_client_connect_preserves_cached_cash_balances(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+    #[case] restored: bool,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let context = create_test_context_with(trader_id, account_id, venue, |config| {
+        config.account_type = AccountType::Cash;
+        config.starting_balances = vec![Money::from("100.00 USD")];
+    });
+    setup_account_state_handler(context.cache.clone());
+    let expected = if restored {
+        let balance = AccountBalance::new(
+            Money::from("90.00 USD"),
+            Money::from("10.00 USD"),
+            Money::from("80.00 USD"),
+        );
+        context
+            .client
+            .generate_account_state(vec![balance], vec![], false, 0.into(), None)
+            .unwrap();
+        balance
+    } else {
+        AccountBalance::new(
+            Money::from("100.00 USD"),
+            Money::from("0.00 USD"),
+            Money::from("100.00 USD"),
+        )
+    };
+    let mut client = context.client;
+
+    client.connect().await.unwrap();
+
+    let cache = context.cache.borrow();
+    let account = cache.account(&account_id).unwrap();
+    assert!(account.is_cash_account());
+    assert!(account.calculated_account_state());
+    assert_eq!(account.balances()[&Currency::USD()], expected);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_client_connect_after_execution_engine_reset_uses_starting_cash(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let context = create_test_context_with(trader_id, account_id, venue, |config| {
+        config.account_type = AccountType::Cash;
+        config.starting_balances = vec![Money::from("100.00 USD")];
+    });
+    setup_account_state_handler(context.cache.clone());
+    context
+        .client
+        .generate_account_state(
+            vec![AccountBalance::new(
+                Money::from("90.00 USD"),
+                Money::from("0.00 USD"),
+                Money::from("90.00 USD"),
+            )],
+            vec![],
+            false,
+            0.into(),
+            None,
+        )
+        .unwrap();
+    let mut engine = ExecutionEngine::new(context.test_clock, context.cache.clone(), None);
+    let client_id = context.client.client_id();
+    engine.register_client(Box::new(context.client)).unwrap();
+
+    engine.reset();
+
+    assert!(context.cache.borrow().account(&account_id).is_none());
+    engine
+        .get_client_adapter_mut(&client_id)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let cache = context.cache.borrow();
+    let account = cache.account(&account_id).unwrap();
+    assert_eq!(
+        account.balance_total(Some(Currency::USD())),
+        Some(Money::from("100.00 USD"))
+    );
+    assert!(account.calculated_account_state());
 }
 
 #[rstest]

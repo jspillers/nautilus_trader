@@ -858,7 +858,9 @@ impl ExecutionClient for SandboxExecutionClient {
             return Ok(());
         }
 
-        let balances = self.get_account_balances();
+        // Reconnect after native cache loading preserves the calculated account;
+        // a fresh or fully reset cache still uses configured starting balances.
+        let balances = self.get_current_account_balances();
         let ts_event = self.clock.borrow().timestamp_ns();
         self.generate_account_state(balances, vec![], false, ts_event, None)?;
 
