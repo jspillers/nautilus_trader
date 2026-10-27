@@ -43,6 +43,34 @@ const CALLBACK_CLOSED: usize = 1 << (usize::BITS - 1);
 const CALLBACK_LEASES: usize = CALLBACK_CLOSED - 1;
 static NEXT_TIME_EVENT_CALLBACK_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Sends a settlement marker through the existing native execution-event FIFO.
+///
+/// A runtime without that channel publishes an unsupported result; a closed
+/// channel never creates a settlement certificate.
+pub fn send_strategy_settlement_marker(
+    marker: crate::messages::execution::StrategySettlementMarker,
+    observed_at: nautilus_core::UnixNanos,
+) {
+    #[cfg(feature = "live")]
+    if let Some(sender) = crate::live::runner::try_get_exec_event_sender() {
+        if let Err(e) = sender.send(crate::messages::ExecutionEvent::StrategySettlement(marker)) {
+            log::error!("Cannot send native strategy settlement marker: {e}");
+        }
+        return;
+    }
+
+    let result = crate::messages::execution::StrategySettlementResult {
+        query: marker.query,
+        native_instance_id: marker.native_instance_id,
+        state: crate::messages::execution::ExecutionClientSettlement::Unsupported,
+        clients: Vec::new(),
+        native_boundary: false,
+        observed_at,
+        error: Some("Runtime does not provide an execution settlement boundary".to_string()),
+    };
+    msgbus::publish_any(result.query.topic().into(), &result);
+}
+
 /// A monitored message channel feeding the runner event loop.
 ///
 /// Each variant identifies an engine-facing channel tracked by the queue monitor.
@@ -862,6 +890,53 @@ mod tests {
 
     use super::*;
     use crate::messages::execution::QueryAccount;
+
+    #[cfg(not(feature = "live"))]
+    #[rstest]
+    fn strategy_settlement_without_live_fifo_is_unsupported() {
+        use crate::{
+            messages::execution::{
+                ExecutionClientSettlement, QueryStrategySettlement, StrategySettlementMarker,
+                StrategySettlementResult,
+            },
+            msgbus::ShareableMessageHandler,
+        };
+
+        let query = QueryStrategySettlement {
+            trader_id: "SETTLEMENT-001".into(),
+            expected_instance_id: UUID4::new(),
+            strategy_id: "SettlementFallback-001".into(),
+            command_id: UUID4::new(),
+            ts_init: 1.into(),
+        };
+        let captured = Rc::new(RefCell::new(None));
+        let received = captured.clone();
+        let handler =
+            ShareableMessageHandler::from_typed(move |result: &StrategySettlementResult| {
+                *received.borrow_mut() = Some(result.clone());
+            });
+        let topic = query.topic();
+        msgbus::subscribe_any(topic.as_str().into(), handler.clone(), None);
+        let native_instance_id = UUID4::new();
+
+        send_strategy_settlement_marker(
+            StrategySettlementMarker {
+                query: query.clone(),
+                native_instance_id,
+                observed_at: 2.into(),
+            },
+            3.into(),
+        );
+
+        let result = captured.borrow_mut().take().unwrap();
+        assert_eq!(result.query, query);
+        assert_eq!(result.native_instance_id, native_instance_id);
+        assert_eq!(result.state, ExecutionClientSettlement::Unsupported);
+        assert!(!result.native_boundary);
+        assert!(result.clients.is_empty());
+        assert_eq!(result.observed_at, UnixNanos::from(3));
+        msgbus::unsubscribe_any(topic.as_str().into(), &handler);
+    }
 
     #[derive(Debug)]
     struct NoopTimeEventSender;

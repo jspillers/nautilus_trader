@@ -90,6 +90,8 @@ pub enum ExecutionEvent {
     Report(ExecutionReport),
     #[strum(transparent)]
     Account(AccountState),
+    #[strum(transparent)]
+    StrategySettlement(execution::StrategySettlementMarker),
 }
 
 #[cfg(test)]

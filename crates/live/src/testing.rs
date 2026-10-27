@@ -493,6 +493,8 @@ pub enum RoutedKind {
     Report,
     /// Account-state path.
     Account,
+    /// Native execution-settlement boundary path.
+    StrategySettlement,
 }
 
 impl RoutedKind {
@@ -500,6 +502,7 @@ impl RoutedKind {
         match event {
             ExecutionEvent::Report(_) => Self::Report,
             ExecutionEvent::Account(_) => Self::Account,
+            ExecutionEvent::StrategySettlement(_) => Self::StrategySettlement,
             _ => Self::Order,
         }
     }

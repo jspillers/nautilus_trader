@@ -25,7 +25,7 @@ use nautilus_serialization::{
 
 use crate::messages::execution::{
     BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder, QueryAccount,
-    QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+    QueryOrder, QueryStrategySettlement, SubmitOrder, SubmitOrderList, TradingCommand,
 };
 
 /// Populates a `StringMap` builder from `Params` (`IndexMap<String, Value>`).
@@ -310,6 +310,21 @@ impl<'a> ToCapnp<'a> for QueryAccount {
     }
 }
 
+impl<'a> ToCapnp<'a> for QueryStrategySettlement {
+    type Builder = trading_capnp::query_strategy_settlement::Builder<'a>;
+
+    fn to_capnp(&self, mut builder: Self::Builder) {
+        self.trader_id.to_capnp(builder.reborrow().init_trader_id());
+        self.expected_instance_id
+            .to_capnp(builder.reborrow().init_expected_instance_id());
+        self.strategy_id
+            .to_capnp(builder.reborrow().init_strategy_id());
+        self.command_id
+            .to_capnp(builder.reborrow().init_command_id());
+        builder.reborrow().init_ts_init().set_value(*self.ts_init);
+    }
+}
+
 impl<'a> ToCapnp<'a> for SubmitOrder {
     type Builder = trading_capnp::submit_order::Builder<'a>;
 
@@ -420,6 +435,9 @@ impl<'a> ToCapnp<'a> for TradingCommand {
                 let query_builder = builder.init_query_account();
                 command.to_capnp(query_builder);
             }
+            Self::QueryStrategySettlement(command) => {
+                command.to_capnp(builder.init_query_strategy_settlement());
+            }
         }
     }
 }
@@ -480,6 +498,61 @@ mod tests {
     #[fixture]
     fn client_id() -> ClientId {
         ClientId::new("TEST")
+    }
+
+    #[rstest]
+    fn test_strategy_settlement_serialization_preserves_query_identity() {
+        let query = QueryStrategySettlement {
+            trader_id: "SETTLEMENT-001".into(),
+            expected_instance_id: UUID4::new(),
+            strategy_id: "Settlement-001".into(),
+            command_id: UUID4::new(),
+            ts_init: 123.into(),
+        };
+        let mut message = Builder::new_default();
+        {
+            let builder = message.init_root::<trading_capnp::trading_command::Builder>();
+            TradingCommand::QueryStrategySettlement(query.clone()).to_capnp(builder);
+        }
+        let command = message
+            .get_root_as_reader::<trading_capnp::trading_command::Reader>()
+            .unwrap();
+        let trading_capnp::trading_command::QueryStrategySettlement(reader) =
+            command.which().unwrap()
+        else {
+            panic!("Expected native strategy settlement query union variant");
+        };
+        let reader = reader.unwrap();
+
+        assert_eq!(
+            reader
+                .get_trader_id()
+                .unwrap()
+                .get_value()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            query.trader_id.as_str()
+        );
+        assert_eq!(
+            reader
+                .get_strategy_id()
+                .unwrap()
+                .get_value()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            query.strategy_id.as_str()
+        );
+        assert_eq!(
+            UUID4::from_capnp(reader.get_expected_instance_id().unwrap()).unwrap(),
+            query.expected_instance_id
+        );
+        assert_eq!(
+            UUID4::from_capnp(reader.get_command_id().unwrap()).unwrap(),
+            query.command_id
+        );
+        assert_eq!(reader.get_ts_init().unwrap().get_value(), *query.ts_init);
     }
 
     #[rstest]

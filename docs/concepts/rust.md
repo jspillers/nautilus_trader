@@ -555,6 +555,31 @@ Most adapters include `node_data_tester.rs` and `node_exec_tester.rs`
 examples. These test data requests, streaming, and order execution
 against live venues.
 
+### Online execution settlement
+
+Rust strategies can call `Strategy::query_strategy_settlement()` after pausing entry
+admission and making their native orders and positions flat. The method returns a query
+UUID and sends an ordinary native execution command. Subscribe to
+`events.execution.strategy_settlement.<strategy_id>` for the typed
+`StrategySettlementResult`, and match the exact pending query UUID and native instance.
+Keep entry admission paused while the result is pending. The result closes no order or
+position, stops no component, and grants no authority for later submissions.
+
+`Quiescent` requires `native_boundary = true`, the same running strategy registration
+from query dispatch to the execution-event FIFO marker, and supported clients with no
+remaining strategy-owned work. The live runner also requires its execution command and
+event queues, callback dispatch, and report collection to be clear at that marker.
+Unrelated execution activity can therefore conservatively produce `Pending`; the query
+does not pause or drain peers or infer a timed quiet period. Callers must retain their own
+strategy-incarnation authority and reject results for unknown or obsolete query UUIDs.
+
+The Sandbox client supports inspection of its delayed command queue, matching state and
+unapplied execution projections. Other execution clients default to `Unsupported` until
+their adapter implements this capability. A client-only snapshot or a runtime without the
+matching live-node boundary cannot certify settlement. Unsupported results and missing
+replies must remain unqualified. The result is native typed Rust data; this API adds no
+dedicated external result decoder or Python facade.
+
 ## Related guides
 
 - [Python](python.md) - Python ownership, runtime, and public API boundaries.

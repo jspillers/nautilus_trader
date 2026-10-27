@@ -19,6 +19,7 @@ pub mod cancel;
 pub mod modify;
 pub mod query;
 pub mod report;
+pub mod strategy_settlement;
 pub mod submit;
 
 use std::fmt::Display;
@@ -29,6 +30,10 @@ use nautilus_model::{
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
 };
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+pub use strategy_settlement::{
+    ExecutionClientSettlement, QueryStrategySettlement, StrategySettlementClient,
+    StrategySettlementMarker, StrategySettlementResult,
+};
 use strum::Display as StrumDisplay;
 
 pub use self::{
@@ -104,6 +109,8 @@ pub enum TradingCommand {
     QueryOrder(QueryOrder),
     #[strum(transparent)]
     QueryAccount(QueryAccount),
+    #[strum(transparent)]
+    QueryStrategySettlement(QueryStrategySettlement),
 }
 
 #[derive(Deserialize)]
@@ -117,6 +124,7 @@ enum TradingCommandType {
     CancelAllOrders,
     QueryOrder,
     QueryAccount,
+    QueryStrategySettlement,
 }
 
 #[derive(Deserialize)]
@@ -163,6 +171,9 @@ impl<'de> Deserialize<'de> for TradingCommand {
             TradingCommandType::QueryAccount => serde_json::from_value(value)
                 .map(Self::QueryAccount)
                 .map_err(D::Error::custom),
+            TradingCommandType::QueryStrategySettlement => serde_json::from_value(value)
+                .map(Self::QueryStrategySettlement)
+                .map_err(D::Error::custom),
         }
     }
 }
@@ -180,6 +191,7 @@ impl TradingCommand {
             Self::CancelAllOrders(command) => command.client_id,
             Self::QueryOrder(command) => command.client_id,
             Self::QueryAccount(command) => command.client_id,
+            Self::QueryStrategySettlement(_) => None,
         }
     }
 
@@ -187,7 +199,8 @@ impl TradingCommand {
     ///
     /// # Panics
     ///
-    /// Panics if the command is `QueryAccount` which does not have an instrument ID.
+    /// Panics if the command is `QueryAccount` or `QueryStrategySettlement`,
+    /// neither of which has an instrument ID.
     #[must_use]
     pub const fn instrument_id(&self) -> InstrumentId {
         match self {
@@ -200,6 +213,7 @@ impl TradingCommand {
             Self::CancelAllOrders(command) => command.instrument_id,
             Self::QueryOrder(command) => command.instrument_id,
             Self::QueryAccount(_) => panic!("No instrument ID for command"),
+            Self::QueryStrategySettlement(_) => panic!("No instrument ID for command"),
         }
     }
 
@@ -215,6 +229,7 @@ impl TradingCommand {
             Self::CancelAllOrders(command) => command.ts_init,
             Self::QueryOrder(command) => command.ts_init,
             Self::QueryAccount(command) => command.ts_init,
+            Self::QueryStrategySettlement(command) => command.ts_init,
         }
     }
 
@@ -230,6 +245,7 @@ impl TradingCommand {
             Self::CancelAllOrders(command) => Some(command.strategy_id),
             Self::QueryOrder(command) => Some(command.strategy_id),
             Self::QueryAccount(_) => None,
+            Self::QueryStrategySettlement(command) => Some(command.strategy_id),
         }
     }
 
@@ -245,6 +261,7 @@ impl TradingCommand {
             Self::CancelAllOrders(command) => command.params.as_ref(),
             Self::QueryOrder(command) => command.params.as_ref(),
             Self::QueryAccount(command) => command.params.as_ref(),
+            Self::QueryStrategySettlement(_) => None,
         }
     }
 }
@@ -393,6 +410,13 @@ mod tests {
                 None,
                 None,
             )),
+            TradingCommand::QueryStrategySettlement(QueryStrategySettlement {
+                trader_id,
+                expected_instance_id: UUID4::from("00000000-0000-4000-8000-000000000012"),
+                strategy_id,
+                command_id: UUID4::from("00000000-0000-4000-8000-000000000013"),
+                ts_init,
+            }),
         ]
     }
 
@@ -463,6 +487,7 @@ mod tests {
                 TradingCommand::CancelAllOrders(command) => command.to_string(),
                 TradingCommand::QueryOrder(command) => command.to_string(),
                 TradingCommand::QueryAccount(command) => command.to_string(),
+                TradingCommand::QueryStrategySettlement(command) => command.to_string(),
             };
 
             assert_eq!(command.to_string(), expected);
@@ -496,7 +521,7 @@ mod tests {
             error.to_string(),
             "unknown variant `UnknownCommand`, expected one of `SubmitOrder`, `SubmitOrderList`, \
              `ModifyOrder`, `BatchModifyOrders`, `CancelOrder`, `BatchCancelOrders`, \
-             `CancelAllOrders`, `QueryOrder`, `QueryAccount`",
+             `CancelAllOrders`, `QueryOrder`, `QueryAccount`, `QueryStrategySettlement`",
         );
     }
 
@@ -507,15 +532,28 @@ mod tests {
         let ts_init = UnixNanos::from(1_000_000_000);
 
         for command in trading_commands() {
-            assert_eq!(command.client_id(), Some(ClientId::from("EXTERNAL")));
+            assert_eq!(
+                command.client_id(),
+                if matches!(command, TradingCommand::QueryStrategySettlement(_)) {
+                    None
+                } else {
+                    Some(ClientId::from("EXTERNAL"))
+                }
+            );
             assert_eq!(command.ts_init(), ts_init);
             assert_eq!(command.params(), None);
 
-            if matches!(command, TradingCommand::QueryAccount(_)) {
-                assert_eq!(command.strategy_id(), None);
-            } else {
-                assert_eq!(command.strategy_id(), Some(strategy_id));
-                assert_eq!(command.instrument_id(), instrument_id);
+            match command {
+                TradingCommand::QueryAccount(_) => {
+                    assert_eq!(command.strategy_id(), None);
+                }
+                TradingCommand::QueryStrategySettlement(_) => {
+                    assert_eq!(command.strategy_id(), Some(strategy_id));
+                }
+                _ => {
+                    assert_eq!(command.strategy_id(), Some(strategy_id));
+                    assert_eq!(command.instrument_id(), instrument_id);
+                }
             }
         }
     }
@@ -548,6 +586,17 @@ mod tests {
             .into_iter()
             .find(|command| matches!(command, TradingCommand::QueryAccount(_)))
             .expect("query account command must be present");
+
+        let _ = command.instrument_id();
+    }
+
+    #[rstest]
+    #[should_panic(expected = "No instrument ID for command")]
+    fn trading_command_instrument_id_panics_for_strategy_settlement() {
+        let command = trading_commands()
+            .into_iter()
+            .find(|command| matches!(command, TradingCommand::QueryStrategySettlement(_)))
+            .expect("strategy settlement query must be present");
 
         let _ = command.instrument_id();
     }

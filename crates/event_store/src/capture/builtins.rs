@@ -44,7 +44,8 @@ use nautilus_common::{
         },
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecutionReport,
-            ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+            ModifyOrder, QueryAccount, QueryOrder, QueryStrategySettlement,
+            StrategySettlementResult, SubmitOrder, SubmitOrderList, TradingCommand,
         },
     },
     timer::TimeEvent,
@@ -93,6 +94,10 @@ pub const PAYLOAD_TYPE_BATCH_CANCEL_ORDERS: &str = "BatchCancelOrders";
 pub const PAYLOAD_TYPE_QUERY_ORDER: &str = "QueryOrder";
 /// The canonical `payload_type` tag for [`QueryAccount`].
 pub const PAYLOAD_TYPE_QUERY_ACCOUNT: &str = "QueryAccount";
+/// The canonical `payload_type` tag for [`QueryStrategySettlement`].
+pub const PAYLOAD_TYPE_QUERY_STRATEGY_SETTLEMENT: &str = "QueryStrategySettlement";
+/// The canonical `payload_type` tag for [`StrategySettlementResult`].
+pub const PAYLOAD_TYPE_STRATEGY_SETTLEMENT_RESULT: &str = "StrategySettlementResult";
 
 /// The canonical `payload_type` tag for [`OrderInitialized`].
 pub const PAYLOAD_TYPE_ORDER_INITIALIZED: &str = "OrderInitialized";
@@ -220,6 +225,8 @@ pub(crate) const DEFAULT_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_BATCH_CANCEL_ORDERS,
     PAYLOAD_TYPE_QUERY_ORDER,
     PAYLOAD_TYPE_QUERY_ACCOUNT,
+    PAYLOAD_TYPE_QUERY_STRATEGY_SETTLEMENT,
+    PAYLOAD_TYPE_STRATEGY_SETTLEMENT_RESULT,
     PAYLOAD_TYPE_ORDER_INITIALIZED,
     PAYLOAD_TYPE_ORDER_DENIED,
     PAYLOAD_TYPE_ORDER_EMULATED,
@@ -320,6 +327,14 @@ pub fn register_default(registry: &mut EncoderRegistry) {
         payload_type(PAYLOAD_TYPE_TRADING_COMMAND),
         encode_trading_command,
     );
+    registry.register::<QueryStrategySettlement, _>(
+        payload_type(PAYLOAD_TYPE_QUERY_STRATEGY_SETTLEMENT),
+        encode_query_strategy_settlement,
+    );
+    registry.register::<StrategySettlementResult, _>(
+        payload_type(PAYLOAD_TYPE_STRATEGY_SETTLEMENT_RESULT),
+        encode_strategy_settlement_result,
+    );
     registry.register::<OrderEventAny, _>(
         payload_type(PAYLOAD_TYPE_ORDER_EVENT_ANY),
         encode_order_event_any,
@@ -369,6 +384,12 @@ fn register_default_headers(registry: &mut EncoderRegistry) {
     registry.register_headers::<BatchCancelOrders, _>(extract_batch_cancel_orders_headers);
     registry.register_headers::<QueryOrder, _>(extract_query_order_headers);
     registry.register_headers::<QueryAccount, _>(extract_query_account_headers);
+    registry.register_headers::<QueryStrategySettlement, _>(|query| {
+        headers_from_fields(Some(query.command_id), None)
+    });
+    registry.register_headers::<StrategySettlementResult, _>(|result| {
+        headers_from_fields(Some(result.query.command_id), None)
+    });
     registry.register_headers::<TradingCommand, _>(extract_trading_command_headers);
     registry.register_headers::<DataCommand, _>(extract_data_command_headers);
     registry.register_headers::<DataResponse, _>(extract_data_response_headers);
@@ -385,6 +406,9 @@ fn register_default_identities(registry: &mut EncoderRegistry) {
     registry.register_identity::<SubmitOrder, _>(|command| Some(command.command_id));
     registry.register_identity::<OrderFilled, _>(|event| Some(event.event_id));
     registry.register_identity::<TradingCommand, _>(|c| Some(extract_trading_command_identity(c)));
+    registry.register_identity::<QueryStrategySettlement, _>(|query| Some(query.command_id));
+    // The result's query UUID correlates it with the request; it is not an event
+    // identity. Registering that UUID would deduplicate away the actual result.
     registry.register_identity::<OrderEventAny, _>(|e| Some(extract_order_event_any_identity(e)));
     registry.register_identity::<AccountState, _>(|state| Some(state.event_id));
     registry.register_identity::<DataCommand, _>(extract_data_command_identity);
@@ -417,6 +441,7 @@ fn extract_trading_command_identity(command: &TradingCommand) -> UUID4 {
         TradingCommand::CancelAllOrders(c) => c.command_id,
         TradingCommand::QueryOrder(c) => c.command_id,
         TradingCommand::QueryAccount(c) => c.command_id,
+        TradingCommand::QueryStrategySettlement(c) => c.command_id,
     }
 }
 
@@ -499,6 +524,9 @@ fn extract_trading_command_headers(command: &TradingCommand) -> Headers {
         TradingCommand::CancelAllOrders(cmd) => extract_cancel_all_orders_headers(cmd),
         TradingCommand::QueryOrder(cmd) => extract_query_order_headers(cmd),
         TradingCommand::QueryAccount(cmd) => extract_query_account_headers(cmd),
+        TradingCommand::QueryStrategySettlement(cmd) => {
+            headers_from_fields(Some(cmd.command_id), None)
+        }
     }
 }
 
@@ -596,6 +624,7 @@ pub fn encode_trading_command(command: &TradingCommand) -> Result<EncodedPayload
         TradingCommand::CancelAllOrders(cmd) => encode_cancel_all_orders(cmd),
         TradingCommand::QueryOrder(cmd) => encode_query_order(cmd),
         TradingCommand::QueryAccount(cmd) => encode_query_account(cmd),
+        TradingCommand::QueryStrategySettlement(cmd) => encode_query_strategy_settlement(cmd),
     }
 }
 
@@ -1018,6 +1047,26 @@ fn encode_query_account(cmd: &QueryAccount) -> Result<EncodedPayload, EncodeErro
     Ok(EncodedPayload::with_payload_type(
         payload_type(PAYLOAD_TYPE_QUERY_ACCOUNT),
         payload,
+        Vec::new(),
+    ))
+}
+
+fn encode_query_strategy_settlement(
+    cmd: &QueryStrategySettlement,
+) -> Result<EncodedPayload, EncodeError> {
+    Ok(EncodedPayload::with_payload_type(
+        payload_type(PAYLOAD_TYPE_QUERY_STRATEGY_SETTLEMENT),
+        encode_serde(cmd)?,
+        Vec::new(),
+    ))
+}
+
+fn encode_strategy_settlement_result(
+    result: &StrategySettlementResult,
+) -> Result<EncodedPayload, EncodeError> {
+    Ok(EncodedPayload::with_payload_type(
+        payload_type(PAYLOAD_TYPE_STRATEGY_SETTLEMENT_RESULT),
+        encode_serde(result)?,
         Vec::new(),
     ))
 }
@@ -1718,6 +1767,14 @@ mod tests {
                 registry.contains::<TradingCommand>(),
             ),
             (
+                "send_trading_command / bare QueryStrategySettlement",
+                registry.contains::<QueryStrategySettlement>(),
+            ),
+            (
+                "events.execution.strategy_settlement.* / StrategySettlementResult",
+                registry.contains::<StrategySettlementResult>(),
+            ),
+            (
                 "publish_order_event / OrderEventAny",
                 registry.contains::<OrderEventAny>(),
             ),
@@ -2175,6 +2232,75 @@ mod tests {
     }
 
     #[rstest]
+    fn strategy_settlement_capture_preserves_correlated_command_and_distinct_result() {
+        use nautilus_common::messages::execution::{
+            ExecutionClientSettlement, StrategySettlementClient, StrategySettlementMarker,
+        };
+
+        let query = QueryStrategySettlement {
+            trader_id: trader_id(),
+            expected_instance_id: UUID4::new(),
+            strategy_id: strategy_id(),
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::from(10),
+        };
+        let command = TradingCommand::QueryStrategySettlement(query.clone());
+        let registry = default_registry();
+        let (bare_tag, bare) = registry.encode(&query).unwrap().unwrap();
+        let (wrapped_tag, wrapped) = registry.encode(&command).unwrap().unwrap();
+        assert_eq!(bare_tag.as_str(), PAYLOAD_TYPE_QUERY_STRATEGY_SETTLEMENT);
+        assert_eq!(bare_tag, wrapped_tag);
+        assert_eq!(bare.payload, wrapped.payload);
+        assert!(wrapped.index_keys.is_empty());
+        assert_eq!(
+            registry.identity_for_any(&command),
+            registry.identity_for_any(&query),
+        );
+        assert_eq!(registry.identity_for_any(&query), Some(query.command_id));
+        assert_eq!(
+            registry.headers_for_any(&command).unwrap(),
+            Headers {
+                correlation_id: Some(query.command_id),
+                causation_id: None,
+            },
+        );
+        let decoded: QueryStrategySettlement = rmp_serde::from_slice(&wrapped.payload).unwrap();
+        assert_eq!(decoded, query);
+
+        let result = StrategySettlementResult {
+            query: query.clone(),
+            native_instance_id: query.expected_instance_id,
+            state: ExecutionClientSettlement::Pending,
+            clients: vec![StrategySettlementClient {
+                client_id: ClientId::from("SANDBOX"),
+                state: ExecutionClientSettlement::Pending,
+                error: Some("Native work remains pending".to_string()),
+            }],
+            native_boundary: true,
+            observed_at: UnixNanos::from(11),
+            error: None,
+        };
+        let (tag, encoded) = registry.encode(&result).unwrap().unwrap();
+        assert_eq!(tag.as_str(), PAYLOAD_TYPE_STRATEGY_SETTLEMENT_RESULT);
+        assert!(encoded.index_keys.is_empty());
+        assert_eq!(
+            encoded.payload.as_ref(),
+            rmp_serde::to_vec_named(&result).unwrap().as_slice(),
+        );
+        assert_eq!(registry.identity_for_any(&result), None);
+        assert_eq!(
+            registry.headers_for_any(&result).unwrap().correlation_id,
+            Some(query.command_id),
+        );
+        let marker = StrategySettlementMarker {
+            query,
+            native_instance_id: result.native_instance_id,
+            observed_at: result.observed_at,
+        };
+        assert!(registry.encode(&marker).unwrap().is_none());
+    }
+
+    #[rstest]
     fn order_event_any_envelope_stamps_inner_filled_payload_type() {
         let filled = make_order_filled();
         let bare = encode_order_filled(&filled).expect("bare");
@@ -2264,6 +2390,17 @@ mod tests {
     #[case::query_account(
         TradingCommand::QueryAccount(make_query_account()),
         PAYLOAD_TYPE_QUERY_ACCOUNT,
+        0
+    )]
+    #[case::query_strategy_settlement(
+        TradingCommand::QueryStrategySettlement(QueryStrategySettlement {
+            trader_id: trader_id(),
+            expected_instance_id: UUID4::new(),
+            strategy_id: strategy_id(),
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::from(10),
+        }),
+        PAYLOAD_TYPE_QUERY_STRATEGY_SETTLEMENT,
         0
     )]
     fn trading_command_envelope_stamps_inner_tag_for_every_variant(

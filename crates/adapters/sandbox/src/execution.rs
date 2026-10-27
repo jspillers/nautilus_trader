@@ -29,9 +29,9 @@ use nautilus_common::{
         ExecutionEvent,
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
-            GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
-            GeneratePositionStatusReports, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
-            SubmitOrderList, TradingCommand,
+            ExecutionClientSettlement, GenerateFillReports, GenerateOrderStatusReport,
+            GenerateOrderStatusReports, GeneratePositionStatusReports, ModifyOrder, QueryAccount,
+            QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
         },
     },
     msgbus::{
@@ -748,6 +748,30 @@ impl ExecutionClient for SandboxExecutionClient {
         self.config.oms_type
     }
 
+    fn strategy_settlement(
+        &self,
+        strategy_id: StrategyId,
+    ) -> anyhow::Result<ExecutionClientSettlement> {
+        if !self.core.try_borrow()?.is_connected() {
+            return Ok(ExecutionClientSettlement::Pending);
+        }
+        let mut inner = self.inner.try_borrow_mut()?;
+        if inner.inbound_queue.iter().any(|delayed| {
+            delayed
+                .command
+                .strategy_id()
+                .is_none_or(|id| id == strategy_id)
+        }) || inner
+            .matching_engines
+            .values_mut()
+            .any(|engine| engine.has_strategy_work(strategy_id))
+        {
+            Ok(ExecutionClientSettlement::Pending)
+        } else {
+            Ok(ExecutionClientSettlement::Quiescent)
+        }
+    }
+
     fn settles_contract_expirations(&self) -> bool {
         true
     }
@@ -1425,7 +1449,9 @@ impl SandboxInner {
             TradingCommand::CancelOrder(cmd) => self.apply_cancel_order(cmd),
             TradingCommand::CancelOrders(cmd) => self.apply_batch_cancel_orders(cmd),
             TradingCommand::CancelAllOrders(cmd) => self.apply_cancel_all_orders(cmd),
-            TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_) => {}
+            TradingCommand::QueryOrder(_)
+            | TradingCommand::QueryAccount(_)
+            | TradingCommand::QueryStrategySettlement(_) => {}
         }
         Ok(())
     }
@@ -1532,7 +1558,9 @@ impl SandboxInner {
             // `CancelAllOrders` names no orders and the strategy marks none `PENDING_CANCEL` for
             // it, so there is no pending state to release and the FSM would refuse a rejection.
             TradingCommand::CancelAllOrders(_) => {}
-            TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_) => {}
+            TradingCommand::QueryOrder(_)
+            | TradingCommand::QueryAccount(_)
+            | TradingCommand::QueryStrategySettlement(_) => {}
         }
     }
 
@@ -1838,7 +1866,9 @@ impl SandboxInner {
             TradingCommand::CancelOrder(_)
             | TradingCommand::CancelOrders(_)
             | TradingCommand::CancelAllOrders(_) => latency_model.get_delete_latency(),
-            TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_) => DurationNanos::ZERO,
+            TradingCommand::QueryOrder(_)
+            | TradingCommand::QueryAccount(_)
+            | TradingCommand::QueryStrategySettlement(_) => DurationNanos::ZERO,
         }
     }
 

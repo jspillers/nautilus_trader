@@ -150,6 +150,7 @@ mod metrics;
 mod queue;
 mod reconciliation;
 mod state;
+mod strategy_settlement;
 
 use builder::ExternalMessageBusIngress;
 pub use builder::LiveNodeBuilder;
@@ -207,6 +208,7 @@ pub struct LiveNode {
     external_msgbus: Option<ExternalMessageBusIngress>,
     stream_processors: Vec<StreamProcessor>,
     shutdown_deadline: Option<dst::time::Instant>,
+    strategy_settlements: strategy_settlement::PendingStrategySettlements,
     #[cfg(feature = "plugin")]
     plugins: plugin::NodePlugins,
     _thread_owner: Rc<()>,
@@ -248,6 +250,7 @@ impl LiveNode {
             external_msgbus,
             stream_processors: Vec::new(),
             shutdown_deadline: None,
+            strategy_settlements: strategy_settlement::PendingStrategySettlements::default(),
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
             _thread_owner: thread_owner,
@@ -328,6 +331,7 @@ impl LiveNode {
             external_msgbus: None,
             stream_processors: Vec::new(),
             shutdown_deadline: None,
+            strategy_settlements: strategy_settlement::PendingStrategySettlements::default(),
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
             _thread_owner: thread_owner,
@@ -1906,7 +1910,20 @@ impl LiveNode {
                         residual_events += 1;
                     }
 
-                    evt.dispatch(|evt| self.process_exec_event(evt));
+                    let settlement_eligible = is_running
+                        && exec_cmd_rx.is_empty()
+                        && exec_evt_rx.is_empty()
+                        && !callbacks_pending
+                        && open_order_report_task.is_none()
+                        && targeted_order_report_task.is_none()
+                        && position_report_task.is_none();
+                    evt.dispatch(|evt| {
+                        if let ExecutionEvent::StrategySettlement(marker) = evt {
+                            self.finish_strategy_settlement(marker, settlement_eligible);
+                        } else {
+                            self.process_exec_event(evt);
+                        }
+                    });
                     record_runner_dispatch(
                         &metrics,
                         SystemChannel::ExecEvents,
@@ -2247,6 +2264,10 @@ impl LiveNode {
     }
 
     fn process_exec_event(&mut self, event: ExecutionEvent) {
+        if let ExecutionEvent::StrategySettlement(marker) = event {
+            self.finish_strategy_settlement(marker, false);
+            return;
+        }
         let clear_closed_orders = matches!(
             &event,
             ExecutionEvent::Order(_) | ExecutionEvent::OrderCanceledBatch(_)
@@ -2740,7 +2761,7 @@ impl LiveNode {
                     order_ids.push(client_order_id);
                 }
             }
-            ExecutionEvent::Account(_) => {}
+            ExecutionEvent::Account(_) | ExecutionEvent::StrategySettlement(_) => {}
         }
 
         Some(order_ids)
@@ -2811,6 +2832,9 @@ impl LiveNode {
                 for child in &cancel.cancels {
                     self.exec_manager.register_inflight(child.client_order_id);
                 }
+            }
+            TradingCommand::QueryStrategySettlement(query) => {
+                self.strategy_settlements.begin(query);
             }
             _ => {}
         }
@@ -3385,7 +3409,9 @@ impl PendingEvents {
             // Account events are safe to process immediately. Reports and orders need
             // ExecEngine access, which may conflict with the driven startup future's borrow.
             match event {
-                ExecutionEvent::Account(_) => AsyncRunner::handle_exec_event(event),
+                ExecutionEvent::Account(_) | ExecutionEvent::StrategySettlement(_) => {
+                    AsyncRunner::handle_exec_event(event);
+                }
                 ExecutionEvent::Report(report) => self.exec_reports.push(if rooted {
                     DispatchMessage::new(report, owner)
                 } else {

@@ -834,7 +834,9 @@ impl SimulatedExchange {
     pub fn send(&mut self, command: TradingCommand) {
         if matches!(
             &command,
-            TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_)
+            TradingCommand::QueryOrder(_)
+                | TradingCommand::QueryAccount(_)
+                | TradingCommand::QueryStrategySettlement(_)
         ) {
             log::warn!("Simulated exchange does not support queries: {command}");
             return;

@@ -34,9 +34,9 @@ use rust_decimal::Decimal;
 
 use super::log_not_implemented;
 use crate::messages::execution::{
-    BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-    GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
-    GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
+    BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecutionClientSettlement,
+    GenerateFillReports, GenerateFillReportsBuilder, GenerateOrderStatusReport,
+    GenerateOrderStatusReports, GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
     GeneratePositionStatusReportsBuilder, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
     SubmitOrderList,
 };
@@ -107,6 +107,23 @@ pub trait ExecutionClient {
     fn venue(&self) -> Venue;
     fn oms_type(&self) -> OmsType;
     fn get_account(&self) -> Option<AccountAny>;
+
+    /// Returns whether this client's existing strategy-owned work is quiescent.
+    ///
+    /// Implementations inspect their pending commands and venue/matching state.
+    /// Cache flatness or missing reports is insufficient. This snapshot alone
+    /// does not establish a native runner settlement boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if existing native client work cannot be inspected.
+    /// Runners treat inspection errors as pending work, never quiescence.
+    fn strategy_settlement(
+        &self,
+        _strategy_id: StrategyId,
+    ) -> anyhow::Result<ExecutionClientSettlement> {
+        Ok(ExecutionClientSettlement::Unsupported)
+    }
 
     /// Returns whether unacknowledged orders require venue evidence before local closure.
     ///
@@ -559,6 +576,18 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    fn strategy_settlement_defaults_to_unsupported() {
+        let client = RecordingExecutionClient::new(Rc::new(RefCell::new(Vec::new())));
+
+        assert_eq!(
+            client
+                .strategy_settlement(StrategyId::from("Settlement-001"))
+                .unwrap(),
+            ExecutionClientSettlement::Unsupported
+        );
+    }
 
     struct RecordingExecutionClient {
         modified_order_ids: Rc<RefCell<Vec<ClientOrderId>>>,

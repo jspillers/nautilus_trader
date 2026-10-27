@@ -610,6 +610,12 @@ impl AsyncRunner {
                     account,
                 );
             }
+            ExecutionEvent::StrategySettlement(marker) => {
+                let result = marker.unsupported(
+                    "Standalone runner does not provide a LiveNode settlement boundary",
+                );
+                msgbus::publish_any(result.query.topic().into(), &result);
+            }
         }
     }
 

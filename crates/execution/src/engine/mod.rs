@@ -48,8 +48,10 @@ use nautilus_common::{
     messages::{
         ExecutionReport,
         execution::{
-            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
-            QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
+            ExecutionClientSettlement, ModifyOrder, QueryAccount, QueryOrder,
+            StrategySettlementClient, StrategySettlementMarker, SubmitOrder, SubmitOrderList,
+            TradingCommand,
         },
     },
     msgbus::{
@@ -58,8 +60,8 @@ use nautilus_common::{
         typed_handler::ShareableMessageHandler,
     },
     runner::{
-        TradingCommandMessage, capture_trading_cmd, trading_cmd_is_dispatching,
-        try_get_trading_cmd_sender,
+        TradingCommandMessage, capture_trading_cmd, send_strategy_settlement_marker,
+        trading_cmd_is_dispatching, try_get_trading_cmd_sender,
     },
     timer::{TimeEvent, TimeEventCallback},
 };
@@ -550,6 +552,42 @@ impl ExecutionEngine {
     #[must_use]
     pub fn get_all_clients(&self) -> Vec<&dyn ExecutionClient> {
         self.clients.values().map(|a| a.client.as_ref()).collect()
+    }
+
+    /// Inspects registered clients without certifying native runner eligibility.
+    pub fn inspect_strategy_settlement(
+        &self,
+        strategy_id: StrategyId,
+    ) -> Vec<StrategySettlementClient> {
+        let mut clients: Vec<_> = self
+            .clients
+            .iter()
+            .map(|(id, adapter)| {
+                let (state, error) = match adapter.client.strategy_settlement(strategy_id) {
+                    Ok(state) => (state, None),
+                    Err(e) => (ExecutionClientSettlement::Pending, Some(e.to_string())),
+                };
+                StrategySettlementClient {
+                    client_id: *id,
+                    state,
+                    error,
+                }
+            })
+            .collect();
+
+        for id in &self.external_clients {
+            if !clients.iter().any(|client| client.client_id == *id) {
+                clients.push(StrategySettlementClient {
+                    client_id: *id,
+                    state: ExecutionClientSettlement::Unsupported,
+                    error: Some(
+                        "External execution client does not expose native settlement".to_string(),
+                    ),
+                });
+            }
+        }
+        clients.sort_by_key(|client| client.client_id);
+        clients
     }
 
     #[must_use]
@@ -2066,6 +2104,17 @@ impl ExecutionEngine {
             log::debug!("{RECV}{CMD} {command}");
         }
 
+        if let TradingCommand::QueryStrategySettlement(query) = command {
+            let observed_at = self.clock.borrow().timestamp_ns();
+            let marker = StrategySettlementMarker {
+                query,
+                native_instance_id: get_message_bus().borrow().instance_id,
+                observed_at,
+            };
+            send_strategy_settlement_marker(marker, observed_at);
+            return;
+        }
+
         match self.validate_submission(&command) {
             SubmissionValidationResult::Valid => {}
             SubmissionValidationResult::StaleOrder {
@@ -2170,6 +2219,9 @@ impl ExecutionEngine {
             TradingCommand::CancelAllOrders(cmd) => self.handle_cancel_all_orders(client, &cmd),
             TradingCommand::QueryOrder(cmd) => self.handle_query_order(client, cmd),
             TradingCommand::QueryAccount(cmd) => self.handle_query_account(client, cmd),
+            TradingCommand::QueryStrategySettlement(_) => {
+                unreachable!("settlement queries bypass client routing")
+            }
         }
     }
 
@@ -2312,6 +2364,9 @@ impl ExecutionEngine {
                 let issuer = cmd.account_id.get_issuer();
                 format!("account_id={}, issuer={issuer}", cmd.account_id)
             }
+            TradingCommand::QueryStrategySettlement(cmd) => {
+                format!("strategy_id={}", cmd.strategy_id)
+            }
         }
     }
 
@@ -2374,6 +2429,7 @@ impl ExecutionEngine {
             | TradingCommand::CancelOrders(_)
             | TradingCommand::CancelAllOrders(_)
             | TradingCommand::QueryOrder(_) => None,
+            TradingCommand::QueryStrategySettlement(_) => None,
         }
     }
 
@@ -2388,6 +2444,7 @@ impl ExecutionEngine {
             TradingCommand::CancelAllOrders(cmd) => Some(cmd.instrument_id),
             TradingCommand::QueryOrder(cmd) => Some(cmd.instrument_id),
             TradingCommand::QueryAccount(_) => None,
+            TradingCommand::QueryStrategySettlement(_) => None,
         }
     }
 

@@ -15,3 +15,4 @@
 
 mod execution;
 mod python;
+mod strategy_settlement;

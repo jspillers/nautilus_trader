@@ -34,9 +34,10 @@ use nautilus_common::{
     clients::{ExecutionClient, ExecutionReportTask},
     live::dst::task::JoinHandle,
     messages::execution::{
-        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-        GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
-        ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
+        ExecutionClientSettlement, GenerateFillReports, GenerateOrderStatusReport,
+        GenerateOrderStatusReports, GeneratePositionStatusReports, ModifyOrder, QueryAccount,
+        QueryOrder, SubmitOrder, SubmitOrderList,
     },
 };
 use nautilus_core::{Params, UnixNanos};
@@ -306,6 +307,16 @@ impl ExecutionClient for LiveExecutionClient {
 
     fn get_account(&self) -> Option<AccountAny> {
         self.client.borrow().get_account()
+    }
+
+    fn strategy_settlement(
+        &self,
+        strategy_id: StrategyId,
+    ) -> anyhow::Result<ExecutionClientSettlement> {
+        self.client
+            .try_borrow()
+            .map_err(|e| anyhow::anyhow!("Execution client is busy: {e}"))?
+            .strategy_settlement(strategy_id)
     }
 
     fn retain_unresolved_submissions(&self) -> bool {
