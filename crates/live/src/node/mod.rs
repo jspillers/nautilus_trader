@@ -2961,7 +2961,7 @@ impl LiveNode {
     /// - The strategy configures one or more external order instrument IDs and the cache is already
     ///   borrowed.
     /// - The strategy configures an OMS type override and the execution engine is already borrowed.
-    pub fn add_strategy<T>(&mut self, mut strategy: T) -> anyhow::Result<()>
+    pub fn add_strategy<T>(&mut self, strategy: T) -> anyhow::Result<()>
     where
         T: Strategy + StrategyNative + DataActorNative + Component + Debug + 'static,
     {
@@ -2971,65 +2971,11 @@ impl LiveNode {
             );
         }
 
-        // Capture strategy-owned values before adding the strategy, which moves it
-        let strategy_id = self
-            .kernel
+        self.kernel
             .trader
-            .borrow()
-            .prepare_strategy_for_registration(&mut strategy)?;
-        let oms_type = StrategyNative::strategy_core(&strategy).config.oms_type;
-        let instrument_ids = strategy.external_order_instrument_ids().unwrap_or_default();
-
-        if !instrument_ids.is_empty() {
-            self.register_external_order_claims(strategy_id, &instrument_ids)?;
-        }
-
-        let mut exec_engine = match oms_type
-            .map(|_| {
-                self.kernel
-                    .exec_engine
-                    .try_borrow_mut()
-                    .map_err(|e| anyhow::anyhow!("Cannot register OMS type: {e}"))
-            })
-            .transpose()
-        {
-            Ok(exec_engine) => exec_engine,
-            Err(e) => {
-                if !instrument_ids.is_empty()
-                    && let Err(rollback_error) =
-                        self.rollback_external_order_claims(strategy_id, &instrument_ids)
-                {
-                    anyhow::bail!(
-                        "{e}; failed to roll back external order claims for {strategy_id}: {rollback_error}"
-                    );
-                }
-
-                return Err(e);
-            }
-        };
-
-        if let Err(add_error) = self.kernel.trader.borrow_mut().add_strategy(strategy) {
-            drop(exec_engine);
-
-            if !instrument_ids.is_empty()
-                && let Err(rollback_error) =
-                    self.rollback_external_order_claims(strategy_id, &instrument_ids)
-            {
-                anyhow::bail!(
-                    "Failed to add strategy {strategy_id}: {add_error}; failed to roll back external order claims: {rollback_error}"
-                );
-            }
-
-            return Err(add_error);
-        }
-
-        if let Some(exec_engine) = &mut exec_engine
-            && let Some(oms_type) = oms_type
-        {
-            exec_engine.register_oms_type(strategy_id, oms_type);
-        }
-
-        Ok(())
+            .borrow_mut()
+            .add_strategy_with_execution_engine(strategy, &self.kernel.exec_engine)
+            .map(|_| ())
     }
 
     /// Registers external order claims in the shared cache.

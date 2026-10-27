@@ -54,6 +54,7 @@
 
 pub mod backend;
 pub mod capture;
+pub mod checkpoint;
 pub mod codec;
 pub mod entry;
 pub mod error;
@@ -82,6 +83,11 @@ pub use capture::{
     PAYLOAD_TYPE_SUBMIT_ORDER, TypedEncoder, default_registry, encode_account_state,
     encode_fill_report, encode_order_filled, encode_order_status_report,
     encode_position_status_report, encode_submit_order, register_default,
+};
+pub use checkpoint::{
+    CheckpointError, CheckpointJob, CheckpointKind, CheckpointLimits, CheckpointStatus,
+    FrozenPrefix, PrefixCheckpointDescriptor, PrefixCheckpointReader, PrefixCheckpointVerifyReport,
+    PrefixMetadata, TableDigest,
 };
 pub use entry::{EventStoreEntry, PayloadType, Topic};
 pub use error::EventStoreError;

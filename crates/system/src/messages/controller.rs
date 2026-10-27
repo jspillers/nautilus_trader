@@ -57,6 +57,8 @@ impl CreateActor {
 #[serde(tag = "type")]
 pub struct CreateStrategy {
     pub strategy_config: ImportableStrategyConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_strategy_id: Option<StrategyId>,
     pub start: bool,
     pub command_id: UUID4,
     pub ts_init: UnixNanos,
@@ -73,10 +75,18 @@ impl CreateStrategy {
     ) -> Self {
         Self {
             strategy_config,
+            expected_strategy_id: None,
             start,
             command_id,
             ts_init,
         }
+    }
+
+    /// Requires the native prepared identity to match before registration or startup.
+    #[must_use]
+    pub const fn with_expected_strategy_id(mut self, strategy_id: StrategyId) -> Self {
+        self.expected_strategy_id = Some(strategy_id);
+        self
     }
 
     #[must_use]
@@ -249,6 +259,17 @@ pub enum ControllerCommand {
     RemoveStrategy(RemoveStrategy),
 }
 
+/// The native component identity affected by a successful controller call.
+///
+/// Create operations return the identity determined by native registration. This
+/// result does not imply that deferred stopping, market exit, or removal recovery
+/// has completed; callers can inspect the native component state independently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControllerCommandResult {
+    Actor(ActorId),
+    Strategy(StrategyId),
+}
+
 impl From<CreateActor> for ControllerCommand {
     fn from(command: CreateActor) -> Self {
         Self::CreateActor(command)
@@ -383,6 +404,33 @@ mod tests {
             ControllerCommand::from(command),
             ControllerCommand::CreateStrategy(_)
         ));
+    }
+
+    #[rstest]
+    fn test_create_strategy_expected_identity_is_optional_and_round_trips() {
+        let config = ImportableStrategyConfig {
+            strategy_path: "native:Strategy".into(),
+            config_path: "native:Config".into(),
+            config: HashMap::new(),
+        };
+        let legacy = CreateStrategy::new(config, false, UUID4::new(), UnixNanos::default());
+        let value = serde_json::to_value(&legacy).unwrap();
+        assert!(value.get("expected_strategy_id").is_none());
+        assert!(
+            serde_json::from_value::<CreateStrategy>(value)
+                .unwrap()
+                .expected_strategy_id
+                .is_none()
+        );
+        let command = legacy.with_expected_strategy_id("Native-001".into());
+        let value = serde_json::to_value(command).unwrap();
+        assert_eq!(value["expected_strategy_id"], "Native-001");
+        assert_eq!(
+            serde_json::from_value::<CreateStrategy>(value)
+                .unwrap()
+                .expected_strategy_id,
+            Some("Native-001".into())
+        );
     }
 
     #[rstest]

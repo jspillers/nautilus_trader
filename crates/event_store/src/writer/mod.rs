@@ -178,6 +178,7 @@ pub enum SubmitError {
 mod imp {
     use std::{
         fmt::Debug,
+        path::PathBuf,
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicU64, Ordering},
@@ -210,6 +211,7 @@ mod imp {
         halt_threshold: Duration,
         nonblocking_submit: bool,
         shutdown_drain: AtomicBool,
+        checkpoint_active: Arc<AtomicBool>,
         // Shared with the writer thread so any halt fire latches it exactly once;
         // subsequent submits return Closed instead of re-entering the retry loop.
         halted: Arc<AtomicBool>,
@@ -284,6 +286,7 @@ mod imp {
                 halt_threshold,
                 nonblocking_submit,
                 shutdown_drain: AtomicBool::new(false),
+                checkpoint_active: Arc::new(AtomicBool::new(false)),
                 halted,
                 clock,
             })
@@ -409,6 +412,79 @@ mod imp {
                     "snapshot anchor ack channel disconnected".to_string(),
                 )),
             }
+        }
+
+        /// Starts one optional immutable-prefix export without waiting on the node owner thread.
+        ///
+        /// The existing writer channel establishes the durable boundary. A single owned export
+        /// worker performs native reads and writes; dropping its ticket requests cancellation.
+        /// Optional admission pressure returns `Busy` without invoking capture's halt callback.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error for invalid limits, active export, a full/closed writer queue or a
+        /// worker-spawn failure. Acceptance is not publication or replay qualification.
+        pub fn start_prefix_checkpoint(
+            &self,
+            destination: impl Into<PathBuf>,
+            limits: crate::checkpoint::CheckpointLimits,
+        ) -> Result<crate::checkpoint::CheckpointJob, crate::checkpoint::CheckpointError> {
+            use crate::checkpoint::{CheckpointError, spawn_export};
+            limits.validate()?;
+
+            if self.halted.load(Ordering::Acquire) {
+                return Err(CheckpointError::Source(EventStoreError::Closed));
+            }
+
+            if self
+                .checkpoint_active
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(CheckpointError::Busy);
+            }
+            let admitted = (|| {
+                let tx = self
+                    .tx
+                    .as_ref()
+                    .ok_or(CheckpointError::Source(EventStoreError::Closed))?;
+                let started = Instant::now();
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let (ack, frozen) = mpsc::sync_channel(1);
+                let message = WriterMessage::FreezePrefix {
+                    ack,
+                    cancelled: cancelled.clone(),
+                };
+                let bytes = message.accounted_bytes();
+                let reservation = self
+                    .budget
+                    .reserve(bytes)
+                    .map_err(|()| CheckpointError::Busy)?;
+                tx.try_send(BudgetedMessage {
+                    message,
+                    reservation,
+                    bytes,
+                })
+                .map_err(|e| match e {
+                    TrySendError::Full(_) => CheckpointError::Busy,
+                    TrySendError::Disconnected(_) => {
+                        CheckpointError::Source(EventStoreError::Closed)
+                    }
+                })?;
+                spawn_export(
+                    frozen,
+                    destination.into(),
+                    limits,
+                    cancelled,
+                    self.checkpoint_active.clone(),
+                    started,
+                )
+            })();
+
+            if admitted.is_err() {
+                self.checkpoint_active.store(false, Ordering::Release);
+            }
+            admitted
         }
 
         /// Returns whether captures and snapshot callbacks must avoid waiting for disk.
@@ -797,6 +873,24 @@ mod imp {
                     Err(e)
                 }
             }
+        }
+
+        /// Rejects asynchronous export in deterministic synchronous simulation.
+        ///
+        /// # Errors
+        ///
+        /// Always returns an explicit unsupported error; simulation does not spawn export workers.
+        pub fn start_prefix_checkpoint(
+            &self,
+            _destination: impl Into<std::path::PathBuf>,
+            _limits: crate::checkpoint::CheckpointLimits,
+        ) -> Result<crate::checkpoint::CheckpointJob, crate::checkpoint::CheckpointError> {
+            Err(crate::checkpoint::CheckpointError::Source(
+                EventStoreError::Backend(
+                    "asynchronous prefix export is unavailable under deterministic simulation"
+                        .to_string(),
+                ),
+            ))
         }
 
         /// Returns empty usage because deterministic simulation has no writer queue.

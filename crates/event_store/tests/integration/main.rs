@@ -14,6 +14,8 @@
 // -------------------------------------------------------------------------------------------------
 
 mod capture;
+#[cfg(not(madsim))]
+mod checkpoint;
 mod envelope;
 mod lifecycle;
 mod reader;

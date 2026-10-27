@@ -71,6 +71,13 @@ pub(super) enum WriterMessage {
         /// One-shot reply channel for the close result.
         ack: SyncSender<Result<u64, EventStoreError>>,
     },
+    /// Freezes a durable prefix without exporting on the writer thread or sealing the run.
+    FreezePrefix {
+        /// One-shot handoff to the owned export worker.
+        ack: SyncSender<Result<crate::checkpoint::FrozenPrefix, EventStoreError>>,
+        /// A dropped ticket or expired export request can avoid pinning a read view.
+        cancelled: Arc<AtomicBool>,
+    },
     /// Records a cache snapshot anchor after all pending entries have been flushed.
     RecordSnapshotAnchor {
         /// Cache-owned reference to the snapshot blob.
@@ -104,6 +111,7 @@ impl WriterMessage {
         base.saturating_add(match self {
             Self::Entry { draft, .. } => draft_bytes(draft),
             Self::Close { run_ended, .. } => draft_bytes(run_ended),
+            Self::FreezePrefix { .. } => 0,
             Self::RecordSnapshotAnchor {
                 blob_ref,
                 content_hash,
@@ -116,7 +124,7 @@ impl WriterMessage {
         let draft = match self {
             Self::Entry { draft, .. } => draft,
             Self::Close { run_ended, .. } => run_ended,
-            Self::RecordSnapshotAnchor { .. } => return,
+            Self::RecordSnapshotAnchor { .. } | Self::FreezePrefix { .. } => return,
         };
         // A Bytes slice can retain an arbitrarily large caller-owned backing allocation,
         // an independent exact-length copy makes the queue's payload accounting finite.
@@ -320,6 +328,29 @@ pub(super) fn run(
                 return;
             }
             Ok(BudgetedMessage {
+                message: WriterMessage::FreezePrefix { ack, cancelled },
+                reservation,
+                ..
+            }) => {
+                if cancelled.load(Ordering::Acquire) {
+                    let _ = ack.send(Err(EventStoreError::Closed));
+                    continue;
+                }
+
+                if !batch.is_empty()
+                    && !flush(backend.as_mut(), &mut batch, &halt, high_watermark.as_ref())
+                {
+                    let _ = ack.send(Err(EventStoreError::Backend(
+                        "writer fail-stopped before prefix freeze".to_string(),
+                    )));
+                    return;
+                }
+                let frozen = backend.freeze_prefix(clock.get_time_ns());
+                let _ = ack.send(frozen);
+                drop(reservation);
+                batch_deadline = None;
+            }
+            Ok(BudgetedMessage {
                 message:
                     WriterMessage::RecordSnapshotAnchor {
                         blob_ref,
@@ -430,6 +461,9 @@ fn drain_pending(
                 let _ = ack.send(Err(EventStoreError::Backend(
                     "writer is already closing".to_string(),
                 )));
+            }
+            WriterMessage::FreezePrefix { ack, .. } => {
+                let _ = ack.send(Err(EventStoreError::Closed));
             }
             WriterMessage::RecordSnapshotAnchor { ack, .. } => {
                 let _ = ack.send(Err(EventStoreError::Backend(

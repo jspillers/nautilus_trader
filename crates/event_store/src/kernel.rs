@@ -59,10 +59,10 @@ use parking_lot::Mutex;
 use ustr::Ustr;
 
 use crate::{
-    BusCaptureAdapter, CacheReplayError, CacheReplayReport, CaptureError, EncoderRegistry,
-    EntryDraft, EventStore, EventStoreError, EventStoreWriter, HaltCallback, HaltReason, Headers,
-    RedbBackend, RunId, RunManifest, RunStatus, ScanDirection, Topic, WriterConfig,
-    compute_snapshot_content_hash, default_registry,
+    BusCaptureAdapter, CacheReplayError, CacheReplayReport, CaptureError, CheckpointError,
+    CheckpointJob, CheckpointLimits, EncoderRegistry, EntryDraft, EventStore, EventStoreError,
+    EventStoreWriter, HaltCallback, HaltReason, Headers, RedbBackend, RunId, RunManifest,
+    RunStatus, ScanDirection, Topic, WriterConfig, compute_snapshot_content_hash, default_registry,
     markers::{
         DataClass, DataMarkerCapture, DataMarkerExtractorRegistry, MarkerBackend, MarkerManifest,
         MarkerWriter, MarkerWriterConfig, RedbMarkerBackend,
@@ -371,6 +371,27 @@ impl EventStoreSession {
     #[must_use]
     pub fn adapter(&self) -> Option<&Arc<BusCaptureAdapter>> {
         self.adapter.as_ref()
+    }
+
+    /// Starts an optional immutable-prefix export while the source run remains active.
+    ///
+    /// Delegates to the owned writer without exposing or retaining its ownership. The caller
+    /// must retain the returned ticket until completion; dropping it requests cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError::Source`] with [`EventStoreError::Closed`] after the session
+    /// has closed, or a writer admission error. Export failures are returned through the ticket;
+    /// acceptance is not publication.
+    pub fn start_prefix_checkpoint(
+        &self,
+        destination: impl Into<PathBuf>,
+        limits: CheckpointLimits,
+    ) -> Result<CheckpointJob, CheckpointError> {
+        self.writer
+            .as_ref()
+            .ok_or(CheckpointError::Source(EventStoreError::Closed))?
+            .start_prefix_checkpoint(destination, limits)
     }
 
     /// Submits the terminal `RunEnded` entry, drains pending entries, and seals the
@@ -729,6 +750,27 @@ impl EventStoreLifecycle {
         self.session
             .as_ref()
             .and_then(EventStoreSession::snapshot_anchorer)
+    }
+
+    /// Starts an optional immutable-prefix export through the active native session.
+    ///
+    /// The existing writer establishes the ordered boundary and owns export admission. This
+    /// method does not seal the run, expose the writer or wait for export on the owner thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError::Source`] with [`EventStoreError::Closed`] when capture is
+    /// disabled, not yet open or already sealed, or a writer admission error. Export failures
+    /// are returned through the ticket; acceptance is not publication.
+    pub fn start_prefix_checkpoint(
+        &self,
+        destination: impl Into<PathBuf>,
+        limits: CheckpointLimits,
+    ) -> Result<CheckpointJob, CheckpointError> {
+        self.session
+            .as_ref()
+            .ok_or(CheckpointError::Source(EventStoreError::Closed))?
+            .start_prefix_checkpoint(destination, limits)
     }
 
     /// Returns whether the writer has signaled fail-stop.

@@ -26,8 +26,9 @@ use std::{
 };
 
 use nautilus_event_store::{
-    EventStoreError, IndexDrift, MarkerCountKind, MarkerFinding, MarkerRecordKind, MarkerVerifier,
-    MarkerVerifyReport, RedbMarkerBackend, Verifier, VerifyError, VerifyFinding, VerifyReport,
+    CheckpointError, EventStoreError, IndexDrift, MarkerCountKind, MarkerFinding, MarkerRecordKind,
+    MarkerVerifier, MarkerVerifyReport, PrefixCheckpointReader, RedbMarkerBackend, Verifier,
+    VerifyError, VerifyFinding, VerifyReport,
 };
 
 const EXIT_CLEAN: u8 = 0;
@@ -49,6 +50,12 @@ enum MarkerScan {
     Present(MarkerVerifyReport),
 }
 
+#[derive(Clone, Copy)]
+enum ArtifactKind {
+    Run,
+    PrefixCheckpoint,
+}
+
 fn main() -> ExitCode {
     let mut args = env::args_os();
     let program = args.next().unwrap_or_else(|| OsStr::new("verify").into());
@@ -57,32 +64,41 @@ fn main() -> ExitCode {
         return ExitCode::from(EXIT_ERROR);
     };
 
-    if first.as_os_str() == OsStr::new("--worker") {
+    let worker = first.as_os_str() == OsStr::new("--worker");
+    let first = if worker {
+        let Some(first) = args.next() else {
+            print_usage(&program);
+            return ExitCode::from(EXIT_ERROR);
+        };
+        first
+    } else {
+        first
+    };
+    let (kind, path) = if first.as_os_str() == OsStr::new("--prefix-checkpoint") {
         let Some(path) = args.next() else {
             print_usage(&program);
             return ExitCode::from(EXIT_ERROR);
         };
-
-        if args.next().is_some() {
-            print_usage(&program);
-            return ExitCode::from(EXIT_ERROR);
-        }
-
-        let path = PathBuf::from(path);
-        return verify_run_file_worker(path.as_path());
-    }
+        (ArtifactKind::PrefixCheckpoint, path)
+    } else {
+        (ArtifactKind::Run, first)
+    };
 
     if args.next().is_some() {
         print_usage(&program);
         return ExitCode::from(EXIT_ERROR);
     }
 
-    let path = PathBuf::from(first);
-    verify_run_file(path.as_path())
+    let path = PathBuf::from(path);
+    if worker {
+        verify_file_worker(path.as_path(), kind)
+    } else {
+        verify_file(path.as_path(), kind)
+    }
 }
 
-fn verify_run_file(path: &Path) -> ExitCode {
-    let output = match run_worker(path) {
+fn verify_file(path: &Path, kind: ArtifactKind) -> ExitCode {
+    let output = match run_worker(path, kind) {
         Ok(output) => output,
         Err(e) => {
             eprintln!("error path={} error=\"worker: {e}\"", path.display());
@@ -126,13 +142,16 @@ fn classify_worker_exit(path: &Path, output: &Output) -> ExitCode {
     }
 }
 
-fn verify_run_file_worker(path: &Path) -> ExitCode {
+fn verify_file_worker(path: &Path, kind: ArtifactKind) -> ExitCode {
     abort_worker_when_requested();
     sleep_worker_when_requested();
 
     let previous_hook = panic::take_hook();
     panic::set_hook(Box::new(|_| {}));
-    let result = panic::catch_unwind(AssertUnwindSafe(|| verify_run_file_inner(path)));
+    let result = panic::catch_unwind(AssertUnwindSafe(|| match kind {
+        ArtifactKind::Run => verify_run_file_inner(path),
+        ArtifactKind::PrefixCheckpoint => verify_prefix_checkpoint_inner(path),
+    }));
     panic::set_hook(previous_hook);
 
     match result {
@@ -144,6 +163,48 @@ fn verify_run_file_worker(path: &Path) -> ExitCode {
                 panic_message(payload.as_ref()),
             );
             ExitCode::from(EXIT_CORRUPT)
+        }
+    }
+}
+
+fn verify_prefix_checkpoint_inner(path: &Path) -> ExitCode {
+    match PrefixCheckpointReader::open(path).and_then(PrefixCheckpointReader::verify) {
+        Ok(report) => {
+            println!(
+                "{} artifact_kind=prefix_checkpoint source_run_id={} source_status={:?} high_watermark={} entries_scanned={} table_digests_match={} markers=not-exported exact_replay=unqualified quarantine=not-performed",
+                if report.is_clean() {
+                    "clean"
+                } else {
+                    "corrupt"
+                },
+                report.descriptor.prefix.source_manifest.run_id,
+                report.descriptor.prefix.source_manifest.status,
+                report.descriptor.prefix.high_watermark,
+                report.run_integrity.entries_scanned,
+                report.table_digests_match,
+            );
+
+            for finding in &report.run_integrity.findings {
+                print_finding(finding);
+            }
+            ExitCode::from(if report.is_clean() {
+                EXIT_CLEAN
+            } else {
+                EXIT_CORRUPT
+            })
+        }
+        Err(e) => {
+            let corrupt = matches!(
+                e,
+                CheckpointError::Verification(_)
+                    | CheckpointError::Source(EventStoreError::Corrupted(_))
+            );
+            println!(
+                "{} artifact_kind=prefix_checkpoint path={} error=\"{e}\" quarantine=not-performed",
+                if corrupt { "corrupt" } else { "error" },
+                path.display(),
+            );
+            ExitCode::from(if corrupt { EXIT_CORRUPT } else { EXIT_ERROR })
         }
     }
 }
@@ -470,13 +531,20 @@ fn marker_count_name(kind: MarkerCountKind) -> &'static str {
 }
 
 fn print_usage(program: &OsStr) {
-    eprintln!("usage: {} <run-file.redb>", program.to_string_lossy());
+    eprintln!(
+        "usage: {} [--prefix-checkpoint] <artifact-file>",
+        program.to_string_lossy(),
+    );
 }
 
-fn run_worker(path: &Path) -> io::Result<WorkerOutput> {
+fn run_worker(path: &Path, kind: ArtifactKind) -> io::Result<WorkerOutput> {
     let current_exe = env::current_exe()?;
-    let mut child = Command::new(current_exe)
-        .arg("--worker")
+    let mut command = Command::new(current_exe);
+    command.arg("--worker");
+    if matches!(kind, ArtifactKind::PrefixCheckpoint) {
+        command.arg("--prefix-checkpoint");
+    }
+    let mut child = command
         .arg(path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

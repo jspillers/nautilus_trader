@@ -44,6 +44,7 @@ use std::{
 };
 
 use nautilus_common::{
+    actor::{DataActor, registry::try_get_actor_unchecked},
     cache::{Cache, CacheConfig, database::CacheDatabaseAdapter},
     clock::Clock,
     component::Component,
@@ -87,7 +88,9 @@ use crate::{
     builder::NautilusKernelBuilder,
     clock_factory::ClockFactory,
     config::NautilusKernelConfig,
+    controller::Controller,
     event_store::{EventStoreFactory, KernelEventStore, RegisteredComponents},
+    strategy_factory::StrategyFactory,
     trader::Trader,
 };
 
@@ -119,7 +122,7 @@ pub struct NautilusKernel {
     pub exec_engine: Rc<RefCell<ExecutionEngine>>,
     /// The order emulator for handling emulated orders.
     pub order_emulator: OrderEmulatorAdapter,
-    /// The trader component (shared for [`Controller`](crate::controller::Controller) access).
+    /// The trader component (shared for [`Controller`] access).
     pub trader: Rc<RefCell<Trader>>,
     /// The UNIX timestamp (nanoseconds) when the kernel was created.
     pub ts_created: UnixNanos,
@@ -152,6 +155,7 @@ pub struct NautilusKernelDependencies {
     clock_factory: Option<ClockFactory>,
     cache_database: Option<Box<dyn CacheDatabaseAdapter>>,
     event_store_factory: Option<EventStoreFactory>,
+    strategy_factories: Vec<StrategyFactory>,
 }
 
 impl Debug for NautilusKernelDependencies {
@@ -160,11 +164,18 @@ impl Debug for NautilusKernelDependencies {
             .field("clock_factory", &self.clock_factory.is_some())
             .field("cache_database", &self.cache_database.is_some())
             .field("event_store_factory", &self.event_store_factory.is_some())
+            .field("strategy_factories", &self.strategy_factories)
             .finish()
     }
 }
 
 impl NautilusKernelDependencies {
+    /// Installs compiled native strategy factories for the configured controller.
+    #[must_use]
+    pub fn with_strategy_factories(mut self, factories: Vec<StrategyFactory>) -> Self {
+        self.strategy_factories = factories;
+        self
+    }
     /// Add a clock factory.
     #[must_use]
     pub fn with_clock_factory(mut self, clock_factory: Option<ClockFactory>) -> Self {
@@ -366,6 +377,7 @@ impl NautilusKernel {
             clock_factory,
             cache_database,
             event_store_factory,
+            strategy_factories,
         } = dependencies;
         let instance_id = config.instance_id().unwrap_or_default();
         let machine_id = Self::determine_machine_id()?;
@@ -489,7 +501,7 @@ impl NautilusKernel {
             })
             .transpose()?;
 
-        Ok(Self {
+        let kernel = Self {
             name,
             instance_id,
             machine_id,
@@ -512,7 +524,68 @@ impl NautilusKernel {
             state_save_armed: false,
             #[cfg(feature = "streaming")]
             streaming_writer,
-        })
+        };
+        kernel.configure_native_strategies(strategy_factories)?;
+        Ok(kernel)
+    }
+
+    fn configure_native_strategies(&self, factories: Vec<StrategyFactory>) -> anyhow::Result<()> {
+        let strategies = self.config.strategies();
+        let Some(config) = self.config.native_controller() else {
+            anyhow::ensure!(
+                factories.is_empty() && strategies.is_empty(),
+                "Native strategy configuration requires a native controller"
+            );
+            return Ok(());
+        };
+        let mut controller = Controller::new(self.trader.clone(), Some(config))
+            .with_execution_engine(self.exec_engine.clone());
+
+        for factory in factories {
+            controller.register_strategy_factory(factory)?;
+        }
+        let controller_id = controller.actor_id();
+        self.trader.borrow_mut().add_actor(controller)?;
+        let mut registered = Vec::new();
+        let outcome = (|| -> anyhow::Result<()> {
+            let controller = try_get_actor_unchecked::<Controller>(&controller_id.inner())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Native controller {controller_id} is not registered")
+                })?;
+
+            for config in strategies {
+                registered.push(controller.create_strategy_from_config(&config, false)?);
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = outcome {
+            let mut rollback_errors = Vec::new();
+
+            if let Some(controller) = try_get_actor_unchecked::<Controller>(&controller_id.inner())
+            {
+                for id in registered.into_iter().rev() {
+                    if let Err(e) = controller.remove_strategy(&id) {
+                        rollback_errors.push(e.to_string());
+                    }
+                }
+            } else {
+                rollback_errors.push(format!(
+                    "Native controller {controller_id} disappeared during rollback"
+                ));
+            }
+
+            if let Err(e) = self.trader.borrow_mut().remove_actor(&controller_id) {
+                rollback_errors.push(e.to_string());
+            }
+            anyhow::ensure!(
+                rollback_errors.is_empty(),
+                "Native strategy construction failed: {e}; rollback failed: {}",
+                rollback_errors.join("; ")
+            );
+            return Err(e);
+        }
+        Ok(())
     }
 
     fn register_shutdown_handler(trader_id: TraderId, shutdown_requested: Rc<Cell<bool>>) {
@@ -1254,13 +1327,116 @@ impl NautilusKernel {
 
 #[cfg(all(test, feature = "python"))]
 mod tests {
-    use nautilus_common::messages::system::ShutdownSystem;
+    use nautilus_common::{
+        actor::DataActorConfig, component::get_component, messages::system::ShutdownSystem,
+    };
     use nautilus_core::UUID4;
+    use nautilus_model::{
+        enums::OmsType,
+        identifiers::{ActorId, InstrumentId, StrategyId},
+    };
+    use nautilus_trading::{
+        ImportableStrategyConfig, nautilus_strategy,
+        strategy::{StrategyConfig, StrategyCore},
+    };
     use rstest::*;
     use ustr::Ustr;
 
     use super::*;
-    use crate::builder::NautilusKernelBuilder;
+    use crate::{builder::NautilusKernelBuilder, config::KernelConfig};
+
+    #[derive(Debug)]
+    struct ConfiguredStrategy {
+        core: StrategyCore,
+    }
+    impl DataActor for ConfiguredStrategy {}
+    nautilus_strategy!(ConfiguredStrategy, {
+        fn external_order_instrument_ids(&self) -> Option<Vec<InstrumentId>> {
+            self.core.config.external_order_instrument_ids.clone()
+        }
+    });
+
+    #[rstest]
+    fn failed_native_selection_retires_oms_claims_and_preserves_registered_peer() {
+        let mut kernel = NautilusKernelBuilder::default().build().unwrap();
+        let peer = StrategyId::from("Peer-001");
+        let target = StrategyId::from("Staged-002");
+        let peer_instrument = InstrumentId::from("AUDUSD.SIM");
+        let target_instrument = InstrumentId::from("EURUSD.SIM");
+        let controller = ActorId::from("CONFIG-ROLLBACK-CONTROLLER");
+        kernel
+            .trader
+            .borrow_mut()
+            .add_strategy_with_execution_engine(
+                ConfiguredStrategy {
+                    core: StrategyCore::new(StrategyConfig {
+                        strategy_id: Some(peer),
+                        oms_type: Some(OmsType::Netting),
+                        external_order_instrument_ids: Some(vec![peer_instrument]),
+                        ..Default::default()
+                    }),
+                },
+                &kernel.exec_engine,
+            )
+            .unwrap();
+        let first = ImportableStrategyConfig {
+            strategy_path: "native:Configured".into(),
+            config_path: "native:StrategyConfig".into(),
+            config: serde_json::from_value(
+                serde_json::to_value(StrategyConfig {
+                    strategy_id: Some(target),
+                    oms_type: Some(OmsType::Hedging),
+                    external_order_instrument_ids: Some(vec![target_instrument]),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+        };
+        let mut invalid = first.clone();
+        invalid.config_path = "native:WrongConfig".into();
+        kernel.config = Box::new(KernelConfig {
+            native_controller: Some(DataActorConfig {
+                actor_id: Some(controller),
+                ..Default::default()
+            }),
+            strategies: vec![first, invalid],
+            ..Default::default()
+        });
+        let clocks = kernel.trader.borrow().get_component_clocks().len();
+        let factory = StrategyFactory::new(
+            "native:Configured",
+            "native:StrategyConfig",
+            |config: StrategyConfig| {
+                Ok(ConfiguredStrategy {
+                    core: StrategyCore::new(config),
+                })
+            },
+        )
+        .unwrap();
+        assert!(kernel.configure_native_strategies(vec![factory]).is_err());
+        assert!(get_component(&target.inner()).is_none());
+        assert!(get_component(&controller.inner()).is_none());
+        assert_eq!(kernel.trader.borrow().strategy_ids(), vec![peer]);
+        assert_eq!(kernel.trader.borrow().get_component_clocks().len(), clocks);
+        assert_eq!(kernel.exec_engine.borrow().oms_type_override(target), None);
+        assert_eq!(
+            kernel
+                .cache
+                .borrow()
+                .external_order_claim(&target_instrument),
+            None
+        );
+        assert_eq!(
+            kernel.exec_engine.borrow().oms_type_override(peer),
+            Some(OmsType::Netting)
+        );
+        assert_eq!(
+            kernel.cache.borrow().external_order_claim(&peer_instrument),
+            Some(peer)
+        );
+        kernel.dispose();
+    }
 
     #[rstest]
     fn test_shutdown_system_sets_kernel_flag() {

@@ -24,6 +24,7 @@ use std::{
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use nautilus_core::UnixNanos;
@@ -42,6 +43,8 @@ use crate::{
     manifest::{RunManifest, RunStatus},
     snapshot::{SnapshotAnchor, validate_new_anchor},
 };
+
+pub(crate) mod checkpoint;
 
 const ENTRIES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("entries");
 const MANIFEST_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("manifest");
@@ -77,7 +80,7 @@ struct RunState {
 }
 
 enum RunDatabase {
-    ReadWrite(Database),
+    ReadWrite(Arc<Database>),
     ReadOnly(ReadOnlyDatabase),
 }
 
@@ -93,14 +96,14 @@ impl Debug for RunDatabase {
 impl RunDatabase {
     fn readable(&self) -> &dyn ReadableDatabase {
         match self {
-            Self::ReadWrite(db) => db,
+            Self::ReadWrite(db) => db.as_ref(),
             Self::ReadOnly(db) => db,
         }
     }
 
     fn read_write(&self) -> Result<&Database, EventStoreError> {
         match self {
-            Self::ReadWrite(db) => Ok(db),
+            Self::ReadWrite(db) => Ok(db.as_ref()),
             Self::ReadOnly(_) => Err(EventStoreError::Closed),
         }
     }
@@ -237,6 +240,7 @@ impl RedbBackend {
             .open_read_only(&path)
             .map_err(map_database_err)?;
         format::verify_store_format(&db)?;
+        checkpoint::require_run_artifact(&db)?;
         let manifest = Self::read_manifest(&db)?.ok_or_else(|| {
             EventStoreError::Corrupted(format!(
                 "missing manifest in run file at {}",
@@ -379,6 +383,7 @@ impl RedbBackend {
         db: &D,
         path: &Path,
     ) -> Result<(), EventStoreError> {
+        checkpoint::require_run_artifact(db)?;
         match format::verify_store_format(db) {
             Ok(()) => Ok(()),
             Err(e) if format::is_missing_store_format(&e) && !Self::manifest_row_exists(db)? => {
@@ -539,6 +544,7 @@ impl EventStore for RedbBackend {
 
         if path_existed {
             format::verify_store_format(&db)?;
+            checkpoint::require_run_artifact(&db)?;
             let on_disk = Self::read_manifest(&db)?.ok_or_else(|| {
                 EventStoreError::Corrupted(format!(
                     "missing manifest in existing run file at {}",
@@ -558,7 +564,7 @@ impl EventStore for RedbBackend {
             let mut recovered = on_disk;
             recovered.high_watermark = high_watermark;
             self.state = Some(RunState {
-                db: RunDatabase::ReadWrite(db),
+                db: RunDatabase::ReadWrite(Arc::new(db)),
                 manifest: recovered,
                 high_watermark,
                 max_ts_init,
@@ -573,7 +579,7 @@ impl EventStore for RedbBackend {
         Self::initialize_fresh(&db, &manifest)?;
 
         self.state = Some(RunState {
-            db: RunDatabase::ReadWrite(db),
+            db: RunDatabase::ReadWrite(Arc::new(db)),
             manifest,
             high_watermark: 0,
             max_ts_init: UnixNanos::default(),
@@ -816,6 +822,46 @@ impl EventStore for RedbBackend {
 
     fn latest_snapshot_anchor(&self) -> Result<Option<SnapshotAnchor>, EventStoreError> {
         Self::read_snapshot_anchor(self.state()?.db.readable())
+    }
+
+    fn freeze_prefix(
+        &self,
+        frozen_at_ns: UnixNanos,
+    ) -> Result<crate::checkpoint::FrozenPrefix, EventStoreError> {
+        let state = self.state()?;
+        if state.manifest.status != RunStatus::Running {
+            return Err(EventStoreError::Closed);
+        }
+        let RunDatabase::ReadWrite(db) = &state.db else {
+            return Err(EventStoreError::Closed);
+        };
+        let transaction = db.begin_read().map_err(map_transaction_err)?;
+        let anchor = checkpoint::read_anchor(&transaction)?;
+        if anchor
+            .as_ref()
+            .is_some_and(|value| value.high_watermark > state.high_watermark)
+        {
+            return Err(EventStoreError::Corrupted(
+                "snapshot anchor exceeds frozen prefix".to_string(),
+            ));
+        }
+        let source_bytes = fs::metadata(&state.file_path)
+            .map_err(|e| EventStoreError::Backend(format!("source metadata: {e}")))?
+            .len();
+        Ok(crate::checkpoint::FrozenPrefix {
+            inner: checkpoint::RedbFrozenPrefix::new(
+                crate::checkpoint::PrefixMetadata {
+                    source_manifest: state.manifest.clone(),
+                    high_watermark: state.high_watermark,
+                    frozen_at_ns,
+                    snapshot_anchor: anchor,
+                },
+                transaction,
+                db.clone(),
+                state.file_path.clone(),
+                source_bytes,
+            ),
+        })
     }
 
     fn seal(&mut self, status: RunStatus) -> Result<(), EventStoreError> {

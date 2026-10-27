@@ -16,7 +16,8 @@
 use std::{fmt::Debug, time::Duration};
 
 use nautilus_common::{
-    cache::CacheConfig, enums::Environment, logging::logger::LoggerConfig, msgbus::MessageBusConfig,
+    actor::DataActorConfig, cache::CacheConfig, enums::Environment, logging::logger::LoggerConfig,
+    msgbus::MessageBusConfig,
 };
 use nautilus_core::UUID4;
 use nautilus_data::engine::config::DataEngineConfig;
@@ -26,9 +27,18 @@ use nautilus_model::identifiers::TraderId;
 pub use nautilus_persistence::config::{DataCatalogConfig, RotationConfig, StreamingConfig};
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
+use nautilus_trading::ImportableStrategyConfig;
 
 /// Configuration trait for a `NautilusKernel` core system instance.
 pub trait NautilusKernelConfig: Debug {
+    /// Returns the optional standard native controller configuration.
+    fn native_controller(&self) -> Option<DataActorConfig> {
+        None
+    }
+    /// Returns native strategy configurations to register before startup.
+    fn strategies(&self) -> Vec<ImportableStrategyConfig> {
+        Vec::new()
+    }
     /// Returns the kernel environment context.
     fn environment(&self) -> Environment;
     /// Returns the trader ID for the node.
@@ -84,6 +94,11 @@ pub trait NautilusKernelConfig: Debug {
 /// Basic implementation of `NautilusKernelConfig` for builder and testing.
 #[derive(Debug, Clone, bon::Builder)]
 pub struct KernelConfig {
+    /// The optional standard native controller configuration.
+    pub native_controller: Option<DataActorConfig>,
+    /// The importable strategies to register before startup through compiled factories.
+    #[builder(default)]
+    pub strategies: Vec<ImportableStrategyConfig>,
     /// The kernel environment context.
     #[builder(default = Environment::Backtest)]
     pub environment: Environment,
@@ -146,6 +161,12 @@ pub struct KernelConfig {
 }
 
 impl NautilusKernelConfig for KernelConfig {
+    fn native_controller(&self) -> Option<DataActorConfig> {
+        self.native_controller.clone()
+    }
+    fn strategies(&self) -> Vec<ImportableStrategyConfig> {
+        self.strategies.clone()
+    }
     fn environment(&self) -> Environment {
         self.environment
     }

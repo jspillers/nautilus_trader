@@ -636,6 +636,17 @@ impl ExecutionEngine {
         log::info!("Registered OMS::{oms_type:?} for {strategy_id}");
     }
 
+    /// Returns the configured OMS override for a strategy, if one is registered.
+    #[must_use]
+    pub fn oms_type_override(&self, strategy_id: StrategyId) -> Option<OmsType> {
+        self.oms_overrides.get(&strategy_id).copied()
+    }
+
+    /// Removes a strategy's configured OMS override after native retirement.
+    pub fn deregister_oms_type(&mut self, strategy_id: StrategyId) {
+        self.oms_overrides.remove(&strategy_id);
+    }
+
     /// Registers external order claims for a strategy.
     ///
     /// Venue-sourced external orders, fills, and materialized reconciliation activity for matching
@@ -5007,6 +5018,23 @@ mod tests {
     use rstest::*;
 
     use super::*;
+
+    #[rstest]
+    fn oms_override_retirement_preserves_other_strategies() {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let mut engine =
+            ExecutionEngine::new(Rc::new(RefCell::new(VirtualClock::new())), cache, None);
+        let retired = StrategyId::from("Retired-001");
+        let peer = StrategyId::from("Peer-002");
+        assert_eq!(engine.oms_type_override(retired), None);
+        engine.register_oms_type(retired, OmsType::Hedging);
+        engine.register_oms_type(peer, OmsType::Netting);
+        assert_eq!(engine.oms_type_override(retired), Some(OmsType::Hedging));
+        engine.deregister_oms_type(retired);
+        engine.deregister_oms_type(retired);
+        assert_eq!(engine.oms_type_override(retired), None);
+        assert_eq!(engine.oms_type_override(peer), Some(OmsType::Netting));
+    }
 
     #[rstest]
     fn netting_positions_open_for_report_scopes_positions_by_account() {
