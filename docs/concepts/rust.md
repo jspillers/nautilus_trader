@@ -592,3 +592,22 @@ dedicated external result decoder or Python facade.
 - [Strategies](strategies.md) - Strategy concepts and handler reference.
 - [Events](events/) - Event types and handler dispatch.
 - [Backtesting](backtesting/) - Backtest concepts and matching engine behavior.
+
+### Observing component lifecycle revisions
+
+Standard native data actors, strategies and execution algorithms expose an
+optional `Component::lifecycle_revision()` witness backed by `DataActorCore`.
+Each accepted lifecycle transition increments the checked revision before its
+hook runs, including when the hook fails. Invalid triggers do not advance it;
+overflow rejects the transition without changing state or entering the hook.
+Reset preserves the revision. `component_lifecycle_revision` reads the same
+capability through the existing borrow-checked component registry.
+
+This witness describes native lifecycle transitions, not financial settlement or
+component identity. A caller retaining an earlier stopped-state observation must
+also verify the same registered object and exact unchanged revision before
+reusing that observation. Standard strategies inherit this capability without a
+strategy-specific implementation. Custom `Component` implementations default to
+`None`, so callers requiring an intervening-transition witness fail closed for
+unsupported components. No Python facade, serialized counter or separate event
+observer is introduced.

@@ -6336,6 +6336,26 @@ mod tests {
         assert_eq!(err, "Strategy not registered: strategy_id is not set");
     }
 
+    #[rstest]
+    fn test_native_strategy_inherits_nonresetting_lifecycle_revision() {
+        let mut strategy = create_test_strategy();
+        assert_eq!(strategy.lifecycle_revision(), Some(0));
+        register_strategy(&mut strategy);
+        strategy.start().unwrap();
+        Component::stop(&mut strategy).unwrap();
+        let stopped = strategy.lifecycle_revision().unwrap();
+        strategy.resume().unwrap();
+        Component::stop(&mut strategy).unwrap();
+        assert_eq!(strategy.state(), ComponentState::Stopped);
+        assert!(strategy.lifecycle_revision().unwrap() > stopped);
+        let stopped_again = strategy.lifecycle_revision().unwrap();
+        strategy.reset().unwrap();
+        strategy.start().unwrap();
+        Component::stop(&mut strategy).unwrap();
+        assert_eq!(strategy.state(), ComponentState::Stopped);
+        assert!(strategy.lifecycle_revision().unwrap() > stopped_again);
+    }
+
     // -- QUERY TESTS ---------------------------------------------------------------------------------
 
     #[rstest]
