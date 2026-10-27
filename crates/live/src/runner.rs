@@ -719,8 +719,12 @@ impl AsyncRunner {
 
     pub(crate) fn recorded_external_empty(&self) -> bool {
         self.channels.data_evt_rx.is_empty()
-            && self.channels.time_evt_rx.is_empty()
+            && self.recorded_time_empty()
             && !matches!(self.recorded_front, Some(PendingRunnerEvent::DataEvent(_)))
+    }
+
+    pub(crate) fn recorded_time_empty(&self) -> bool {
+        self.channels.time_evt_rx.is_empty()
     }
 
     pub(crate) fn poll_pending(&mut self, mut process: impl FnMut(PendingRunnerEvent)) -> usize {

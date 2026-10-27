@@ -84,3 +84,30 @@ fn missing_native_dispatch_cannot_be_replaced_by_a_recorded_output() {
     assert_eq!(recorded::next_ordinal(expected.channel), expected.ordinal);
     recorded::disable_capture();
 }
+
+#[rstest]
+fn recorded_time_admission_preserves_pending_data_and_its_exact_front() {
+    recorded::enable_capture();
+    let mut runner = AsyncRunner::new();
+    let first = original();
+    let expected = expected(&first);
+    runner.data_evt_tx.send(first).unwrap();
+    assert!(!runner.recorded_external_empty());
+    assert!(runner.recorded_time_empty());
+    let mut wrong = expected.clone();
+    wrong.semantic = serde_json::json!({"wrong":"front"});
+    assert!(runner.take_recorded(&wrong).is_err());
+    assert!(!runner.recorded_external_empty());
+    assert!(runner.recorded_time_empty());
+    assert_eq!(recorded::next_ordinal(expected.channel), expected.ordinal);
+    let actual = runner.take_recorded(&expected).unwrap();
+    let PendingRunnerEvent::DataEvent(actual) = actual else {
+        panic!("original native front missing")
+    };
+    assert_eq!(
+        recorded::describe_data_event(actual.message()).semantic,
+        expected.semantic
+    );
+    assert!(runner.recorded_external_empty());
+    recorded::disable_capture();
+}

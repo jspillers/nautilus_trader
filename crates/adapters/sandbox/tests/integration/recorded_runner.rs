@@ -15,6 +15,8 @@
 
 //! Recorded inputs use actual LiveNode queues, Sandbox, native risk and accounts.
 
+mod queued_data;
+
 use std::{
     any::Any,
     cell::{Cell, RefCell},
