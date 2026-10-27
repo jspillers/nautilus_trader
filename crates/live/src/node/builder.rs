@@ -18,6 +18,7 @@
 use std::{cell::RefCell, collections::HashMap, fmt::Debug, rc::Rc, time::Duration};
 
 use ahash::{AHashMap, AHashSet};
+use indexmap::IndexMap;
 use nautilus_common::{
     actor::DataActorConfig,
     cache::{CacheConfig, database::CacheDatabaseFactory},
@@ -93,8 +94,8 @@ impl Debug for ExternalMessageBusIngress {
 pub struct LiveNodeBuilder {
     name: String,
     config: LiveNodeConfig,
-    data_client_factories: HashMap<String, Box<dyn DataClientFactory>>,
-    exec_client_factories: HashMap<String, ExecutionClientFactoryEntry>,
+    data_client_factories: IndexMap<String, Box<dyn DataClientFactory>>,
+    exec_client_factories: IndexMap<String, ExecutionClientFactoryEntry>,
     data_client_configs: HashMap<String, Box<dyn ClientConfig>>,
     exec_client_configs: HashMap<String, Box<dyn ClientConfig>>,
     data_client_routing: HashMap<String, RoutingConfig>,
@@ -178,8 +179,8 @@ impl LiveNodeBuilder {
         Ok(Self {
             name: "LiveNode".to_string(),
             config,
-            data_client_factories: HashMap::new(),
-            exec_client_factories: HashMap::new(),
+            data_client_factories: IndexMap::new(),
+            exec_client_factories: IndexMap::new(),
             data_client_configs: HashMap::new(),
             exec_client_configs: HashMap::new(),
             data_client_routing: HashMap::new(),
@@ -205,8 +206,8 @@ impl LiveNodeBuilder {
         Ok(Self {
             name: "LiveNode".to_string(),
             config,
-            data_client_factories: HashMap::new(),
-            exec_client_factories: HashMap::new(),
+            data_client_factories: IndexMap::new(),
+            exec_client_factories: IndexMap::new(),
             data_client_configs: HashMap::new(),
             exec_client_configs: HashMap::new(),
             data_client_routing: HashMap::new(),
@@ -924,6 +925,9 @@ impl ExternalMessageBusIngress {
         self.0.close();
     }
 }
+
+#[cfg(test)]
+mod client_order_tests;
 
 #[cfg(test)]
 mod tests {

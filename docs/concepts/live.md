@@ -70,6 +70,12 @@ Alternatively, `register_default_client` registers a client and makes it the def
 
 ## Live node lifecycle
 
+`LiveNodeBuilder` invokes data client factories and execution client factories in their respective
+registration order, preserving that order when registering clients with their engines. Data clients
+connect before execution clients. Connections within each phase remain concurrent, so independent
+network completion and subsequent input arrival order can differ. Registration order does not
+establish a global FIFO order across live inputs.
+
 Rust `LiveNode::run()` prepares cached and venue state before starting trader components, then owns
 the event loop and coordinated shutdown.
 
