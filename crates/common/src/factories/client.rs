@@ -116,6 +116,24 @@ pub trait SimulatedExecutionClientFactory: Debug {
         cache: Rc<RefCell<Cache>>,
     ) -> anyhow::Result<Box<dyn ExecutionClient>>;
 
+    /// Creates a simulated client using a native runtime-provided clock when supported.
+    ///
+    /// Existing factories retain their original construction behavior by default.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if client creation fails.
+    fn create_with_clock(
+        &self,
+        trader_id: TraderId,
+        name: &str,
+        config: &dyn ClientConfig,
+        cache: Rc<RefCell<Cache>>,
+        _clock: Rc<RefCell<dyn Clock>>,
+    ) -> anyhow::Result<Box<dyn ExecutionClient>> {
+        self.create(trader_id, name, config, cache)
+    }
+
     /// Returns the name of this factory.
     fn name(&self) -> &str;
 

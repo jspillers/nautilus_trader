@@ -23,6 +23,7 @@
 //! the first fail-stop reason for supervision; no runtime component polls it to stop
 //! the trader.
 
+mod recorded;
 use std::{
     any::Any,
     cell::RefCell,
@@ -40,7 +41,7 @@ use std::{
 use bytes::Bytes;
 use nautilus_common::{
     cache::{Cache, CacheSnapshotRef},
-    clock::Clock,
+    clock::{Clock, VirtualClock},
     enums::Environment,
     msgbus::{self, BusTap, Endpoint, MStr, MessagingSwitchboard},
 };
@@ -56,6 +57,7 @@ use nautilus_system::{
     event_store::{DataMarkerClass, DataMarkerConfig, EventStoreConfig, RetentionMode},
 };
 use parking_lot::Mutex;
+pub use recorded::{RecordedOriginSource, RecordedRunOrigin, RecordedRunOriginWitness};
 use ustr::Ustr;
 
 use crate::{
@@ -114,6 +116,8 @@ pub struct EventStoreLifecycleOptions {
     registry_factory: Arc<RegistryFactory>,
     backend_opener: Arc<BackendOpener>,
     marker_registry_factory: Arc<MarkerRegistryFactory>,
+    recorded_origin: Option<RecordedRunOrigin>,
+    recorded_open_admitted: bool,
 }
 
 impl Debug for EventStoreLifecycleOptions {
@@ -129,6 +133,8 @@ impl Default for EventStoreLifecycleOptions {
             registry_factory: Arc::new(default_registry),
             backend_opener: Arc::new(default_backend_opener),
             marker_registry_factory: Arc::new(DataMarkerExtractorRegistry::default_registry),
+            recorded_origin: None,
+            recorded_open_admitted: false,
         }
     }
 }
@@ -181,6 +187,18 @@ impl EventStoreLifecycleOptions {
     }
 
     fn open_backend(&self, config: &EventStoreConfig, manifest: &RunManifest) -> BackendOpenResult {
+        if self.recorded_origin.is_some() {
+            if !self.recorded_open_admitted {
+                return Err(EventStoreError::Backend(
+                    "Recorded origin requires lifecycle-validated offline startup".to_string(),
+                ));
+            }
+            let mut backend = RedbBackend::new(config.base_dir.clone())
+                .with_cache_size(config.redb_cache_size_bytes)
+                .with_exclusive_create();
+            backend.open_run(manifest.clone())?;
+            return Ok(Box::new(backend));
+        }
         (self.backend_opener)(config, manifest)
     }
 
@@ -455,6 +473,9 @@ fn close_marker_capture(marker_capture: Option<SharedMarkerCapture>) {
 /// fail-stop without inspecting individual writer/backend errors.
 #[derive(Debug, thiserror::Error)]
 pub enum KernelError {
+    /// The verified recorded-origin admission or exclusive destination failed.
+    #[error("recorded origin rejected: {0}")]
+    RecordedOrigin(String),
     /// The event-store boot path failed.
     #[error("event store boot failed: {0}")]
     EventStoreBoot(#[from] BootError),
@@ -482,6 +503,7 @@ pub struct EventStoreLifecycle {
     recovered: Vec<RecoveredRun>,
     parent_run_id: Option<String>,
     session: Option<EventStoreSession>,
+    recorded_origin: Option<RecordedRunOriginWitness>,
     halt: HaltSignal,
     // Held so `Drop` can stamp the seal even when the kernel never called seal()
     // explicitly. Cloning the kernel's clock Rc keeps the wrapper independent of
@@ -527,7 +549,27 @@ impl EventStoreLifecycle {
         clock: Rc<RefCell<dyn Clock>>,
         options: EventStoreLifecycleOptions,
     ) -> anyhow::Result<Self> {
-        let (recovered, parent_run_id) = if let Some(cfg) = config.as_ref() {
+        let (recovered, parent_run_id) = if options.recorded_origin.is_some() {
+            anyhow::ensure!(
+                clock.borrow().as_any().is::<VirtualClock>(),
+                "Recorded origin requires a native VirtualClock before boot"
+            );
+            let cfg = config.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("Recorded origin requires a native event-store config")
+            })?;
+            anyhow::ensure!(
+                cfg.replay_from_run_id.is_none(),
+                "Recorded origin cannot restore a replay source"
+            );
+            let dir = cfg.base_dir.join(instance_id.to_string());
+            if dir.try_exists()? {
+                anyhow::ensure!(
+                    std::fs::read_dir(&dir)?.next().is_none(),
+                    "Recorded artifact directory must be empty before boot"
+                );
+            }
+            (Vec::new(), None)
+        } else if let Some(cfg) = config.as_ref() {
             let outcome = recover_predecessors(&cfg.base_dir, &instance_id.to_string())?;
             if !outcome.recovered.is_empty() {
                 log::info!(
@@ -546,6 +588,7 @@ impl EventStoreLifecycle {
             recovered,
             parent_run_id,
             session: None,
+            recorded_origin: None,
             halt: HaltSignal::new(),
             clock,
         })
@@ -589,7 +632,12 @@ impl EventStoreLifecycle {
 
         let clock = Self::clock_for(environment);
         let start_ts_init = self.clock.borrow().timestamp_ns();
-        let run_id = build_run_id(start_ts_init);
+        let mut recorded_origin =
+            self.validate_recorded_origin(instance_id, environment, &config)?;
+        let run_id = recorded_origin.as_ref().map_or_else(
+            || build_run_id(start_ts_init),
+            |origin| origin.source.run_id.clone(),
+        );
         let parent_run_id = if let Some(replay_run_id) = config.replay_from_run_id.as_deref() {
             validate_event_store_replay_source(
                 config.base_dir.clone(),
@@ -600,6 +648,8 @@ impl EventStoreLifecycle {
         } else {
             self.parent_run_id.clone()
         };
+        let mut options = self.options.clone();
+        options.recorded_open_admitted = recorded_origin.is_some();
         let session = open_run_with_options(
             &config,
             &instance_id.to_string(),
@@ -609,7 +659,7 @@ impl EventStoreLifecycle {
             components,
             self.halt.clone(),
             clock,
-            &self.options,
+            &options,
         )?;
         log::info!(
             "Opened event-store run {} (parent_run_id={:?})",
@@ -617,10 +667,22 @@ impl EventStoreLifecycle {
             session.parent_run_id(),
         );
 
+        if let Some(origin) = recorded_origin.as_mut() {
+            origin.constructed_identity = recorded::identity_from(session.manifest());
+            origin.artifact_path = origin
+                .artifact_path
+                .canonicalize()
+                .map_err(|e| KernelError::RecordedOrigin(e.to_string()))?;
+        }
+
         if let Some(adapter) = session.adapter() {
             install_bus_tap(Arc::clone(adapter), session.marker_capture.clone(), clock);
         }
         self.session = Some(session);
+        self.recorded_origin = recorded_origin;
+        if let Some(origin) = self.recorded_origin.as_ref() {
+            msgbus::publish_any("events.runtime.recorded_origin".into(), origin);
+        }
         Ok(())
     }
 

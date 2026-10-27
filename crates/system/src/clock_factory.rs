@@ -34,6 +34,7 @@ use nautilus_common::{
 pub struct ClockFactory {
     clock: Rc<OnceCell<Rc<RefCell<dyn Clock>>>>,
     create_clock: Rc<dyn Fn() -> Rc<RefCell<dyn Clock>>>,
+    synchronize_virtual_time: bool,
 }
 
 impl ClockFactory {
@@ -46,6 +47,7 @@ impl ClockFactory {
         Self {
             clock: Rc::new(OnceCell::new()),
             create_clock: Rc::new(factory),
+            synchronize_virtual_time: false,
         }
     }
 
@@ -59,7 +61,11 @@ impl ClockFactory {
     #[must_use]
     pub fn for_environment(environment: Environment) -> Self {
         match environment {
-            Environment::Backtest => Self::new(|| Rc::new(RefCell::new(VirtualClock::new()))),
+            Environment::Backtest => {
+                let mut factory = Self::new(|| Rc::new(RefCell::new(VirtualClock::new())));
+                factory.synchronize_virtual_time = true;
+                factory
+            }
             Environment::Live | Environment::Sandbox => Self::live_default(),
         }
     }
@@ -71,9 +77,23 @@ impl ClockFactory {
     }
 
     /// Build a fresh component clock instance.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a backtest clock factory violates its `VirtualClock` invariant.
     #[must_use]
     pub fn create_component_clock(&self) -> Rc<RefCell<dyn Clock>> {
-        (self.create_clock)()
+        let clock = (self.create_clock)();
+        if self.synchronize_virtual_time {
+            let now = self.clock().borrow().timestamp_ns();
+            clock
+                .borrow_mut()
+                .as_any_mut()
+                .downcast_mut::<VirtualClock>()
+                .expect("Backtest clock factory creates VirtualClock")
+                .set_time(now);
+        }
+        clock
     }
 
     #[cfg(feature = "live")]
@@ -151,5 +171,46 @@ mod tests {
         let clock = factory.clock();
 
         assert!(clock.borrow_mut().as_any_mut().is::<VirtualClock>());
+    }
+
+    #[rstest]
+    fn native_component_clock_inherits_current_primary_time_only_at_creation() {
+        let factory = ClockFactory::test_default();
+        let first = factory.create_component_clock();
+        assert_eq!(first.borrow().timestamp_ns(), 0);
+        factory
+            .clock()
+            .borrow_mut()
+            .as_any_mut()
+            .downcast_mut::<VirtualClock>()
+            .unwrap()
+            .set_time(100.into());
+        let later = factory.create_component_clock();
+        assert_eq!(later.borrow().timestamp_ns(), 100);
+        assert_eq!(first.borrow().timestamp_ns(), 0);
+        later
+            .borrow_mut()
+            .as_any_mut()
+            .downcast_mut::<VirtualClock>()
+            .unwrap()
+            .set_time(200.into());
+        assert_eq!(factory.clock().borrow().timestamp_ns(), 100);
+    }
+
+    #[rstest]
+    fn custom_clock_factory_preserves_its_own_initialization() {
+        let factory = ClockFactory::new(|| {
+            let clock = VirtualClock::new();
+            clock.set_time(7.into());
+            Rc::new(RefCell::new(clock))
+        });
+        factory
+            .clock()
+            .borrow_mut()
+            .as_any_mut()
+            .downcast_mut::<VirtualClock>()
+            .unwrap()
+            .set_time(100.into());
+        assert_eq!(factory.create_component_clock().borrow().timestamp_ns(), 7);
     }
 }

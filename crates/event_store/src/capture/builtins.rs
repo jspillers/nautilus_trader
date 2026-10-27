@@ -36,6 +36,7 @@ use std::collections::HashSet;
 
 use bytes::Bytes;
 use nautilus_common::{
+    cache::bootstrap::BootstrapLoadWitness,
     messages::{
         data::{
             BarsResponse, BookDeltasResponse, BookDepthResponse, BookResponse, CustomDataResponse,
@@ -48,7 +49,8 @@ use nautilus_common::{
             StrategySettlementResult, SubmitOrder, SubmitOrderList, TradingCommand,
         },
     },
-    timer::TimeEvent,
+    runner::recorded::{RecordedRunnerCompletion, RecordedRunnerDispatch},
+    timer::{RecordedTimeEventDispatch, TimeEvent},
 };
 use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
@@ -74,6 +76,7 @@ use crate::{
     },
     entry::PayloadType,
     headers::Headers,
+    kernel::RecordedRunOriginWitness,
 };
 
 /// The canonical `payload_type` tag for [`SubmitOrder`].
@@ -157,6 +160,17 @@ pub const PAYLOAD_TYPE_ACCOUNT_STATE: &str = "AccountState";
 pub const PAYLOAD_TYPE_INSTRUMENT_CLOSE: &str = "InstrumentClose";
 /// The canonical `payload_type` tag for [`TimeEvent`].
 pub const PAYLOAD_TYPE_TIME_EVENT: &str = "TimeEvent";
+
+/// The canonical payload tag for the actual native timer callback dispatch witness.
+pub const PAYLOAD_TYPE_TIME_EVENT_DISPATCH: &str = "TimeEventDispatch";
+/// The canonical payload tag for an actual native runner queue dispatch.
+pub const PAYLOAD_TYPE_RUNTIME_DISPATCH: &str = "RuntimeDispatch";
+/// The canonical payload tag for the completion of a native runner dispatch.
+pub const PAYLOAD_TYPE_RUNTIME_DISPATCH_COMPLETE: &str = "RuntimeDispatchComplete";
+/// The canonical payload tag for actual consumed native bootstrap-load evidence.
+pub const PAYLOAD_TYPE_BOOTSTRAP_LOAD: &str = "BootstrapLoadWitness";
+/// The canonical payload tag for a verified original-to-constructed native run relation.
+pub const PAYLOAD_TYPE_RECORDED_RUN_ORIGIN: &str = "RecordedRunOrigin";
 
 /// The canonical `payload_type` tag for `RequestCommand`.
 pub const PAYLOAD_TYPE_REQUEST_COMMAND: &str = "RequestCommand";
@@ -256,6 +270,11 @@ pub(crate) const DEFAULT_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_ACCOUNT_STATE,
     PAYLOAD_TYPE_INSTRUMENT_CLOSE,
     PAYLOAD_TYPE_TIME_EVENT,
+    PAYLOAD_TYPE_TIME_EVENT_DISPATCH,
+    PAYLOAD_TYPE_RUNTIME_DISPATCH,
+    PAYLOAD_TYPE_RUNTIME_DISPATCH_COMPLETE,
+    PAYLOAD_TYPE_BOOTSTRAP_LOAD,
+    PAYLOAD_TYPE_RECORDED_RUN_ORIGIN,
     PAYLOAD_TYPE_REQUEST_COMMAND,
     PAYLOAD_TYPE_SUBSCRIBE_COMMAND,
     PAYLOAD_TYPE_UNSUBSCRIBE_COMMAND,
@@ -356,6 +375,26 @@ pub fn register_default(registry: &mut EncoderRegistry) {
         encode_instrument_close,
     );
     registry.register::<TimeEvent, _>(payload_type(PAYLOAD_TYPE_TIME_EVENT), encode_time_event);
+    registry.register::<RecordedTimeEventDispatch, _>(
+        payload_type(PAYLOAD_TYPE_TIME_EVENT_DISPATCH),
+        |dispatch| Ok(EncodedPayload::new(encode_serde(dispatch)?, Vec::new())),
+    );
+    registry.register::<RecordedRunnerDispatch, _>(
+        payload_type(PAYLOAD_TYPE_RUNTIME_DISPATCH),
+        |dispatch| Ok(EncodedPayload::new(encode_serde(dispatch)?, Vec::new())),
+    );
+    registry.register::<RecordedRunnerCompletion, _>(
+        payload_type(PAYLOAD_TYPE_RUNTIME_DISPATCH_COMPLETE),
+        |completion| Ok(EncodedPayload::new(encode_serde(completion)?, Vec::new())),
+    );
+    registry.register::<BootstrapLoadWitness, _>(
+        payload_type(PAYLOAD_TYPE_BOOTSTRAP_LOAD),
+        |witness| Ok(EncodedPayload::new(encode_serde(witness)?, Vec::new())),
+    );
+    registry.register::<RecordedRunOriginWitness, _>(
+        payload_type(PAYLOAD_TYPE_RECORDED_RUN_ORIGIN),
+        |witness| Ok(EncodedPayload::new(encode_serde(witness)?, Vec::new())),
+    );
     registry
         .register::<DataCommand, _>(payload_type(PAYLOAD_TYPE_DATA_COMMAND), encode_data_command);
     registry.register::<DataResponse, _>(
@@ -1797,6 +1836,26 @@ mod tests {
             (
                 "time event handler firing / TimeEvent",
                 registry.contains::<TimeEvent>(),
+            ),
+            (
+                "native callback dispatch / RecordedTimeEventDispatch",
+                registry.contains::<RecordedTimeEventDispatch>(),
+            ),
+            (
+                "native runner queue dispatch / RecordedRunnerDispatch",
+                registry.contains::<RecordedRunnerDispatch>(),
+            ),
+            (
+                "native runner dispatch completion / RecordedRunnerCompletion",
+                registry.contains::<RecordedRunnerCompletion>(),
+            ),
+            (
+                "actual consumed native bootstrap / BootstrapLoadWitness",
+                registry.contains::<BootstrapLoadWitness>(),
+            ),
+            (
+                "verified recorded run relation / RecordedRunOriginWitness",
+                registry.contains::<RecordedRunOriginWitness>(),
             ),
             (
                 "send_data_command / DataCommand",
@@ -4241,3 +4300,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "builtins/dispatch_tests.rs"]
+mod dispatch_tests;

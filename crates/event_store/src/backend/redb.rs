@@ -68,6 +68,7 @@ pub struct RedbBackend {
     base_dir: PathBuf,
     state: Option<RunState>,
     cache_size_bytes: usize,
+    exclusive_create: bool,
 }
 
 #[derive(Debug)]
@@ -127,7 +128,15 @@ impl RedbBackend {
             base_dir: base_dir.into(),
             state: None,
             cache_size_bytes: DEFAULT_CACHE_SIZE_BYTES,
+            exclusive_create: false,
         }
+    }
+
+    /// Requires an atomically new file rather than opening a predecessor.
+    #[must_use]
+    pub const fn with_exclusive_create(mut self) -> Self {
+        self.exclusive_create = true;
+        self
     }
 
     /// Returns the configured cache budget in bytes.
@@ -273,6 +282,7 @@ impl RedbBackend {
         Ok(Self {
             base_dir: base,
             cache_size_bytes: DEFAULT_CACHE_SIZE_BYTES,
+            exclusive_create: false,
             state: Some(RunState {
                 db: RunDatabase::ReadOnly(db),
                 manifest,
@@ -537,10 +547,28 @@ impl EventStore for RedbBackend {
         let path = self.run_path(&manifest.instance_id, &manifest.run_id);
         let path_existed = path.exists();
 
-        let db = Database::builder()
-            .set_cache_size(self.cache_size_bytes)
-            .create(&path)
-            .map_err(map_database_err)?;
+        let db = if self.exclusive_create {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|e| {
+                    EventStoreError::Backend(format!(
+                        "create exclusive recorded artifact {}: {e}",
+                        path.display()
+                    ))
+                })?;
+            Database::builder()
+                .set_cache_size(self.cache_size_bytes)
+                .create_file(file)
+                .map_err(map_database_err)?
+        } else {
+            Database::builder()
+                .set_cache_size(self.cache_size_bytes)
+                .create(&path)
+                .map_err(map_database_err)?
+        };
 
         if path_existed {
             format::verify_store_format(&db)?;

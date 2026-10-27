@@ -19,6 +19,8 @@
 //! message queues, and time event channels. It manages thread-local storage for
 //! system-wide components that need to be accessible across threads.
 
+pub mod recorded;
+
 use std::{
     cell::RefCell,
     fmt::{Debug, Display},
@@ -233,6 +235,11 @@ enum SendTimeEventCallback {
     #[cfg(feature = "python")]
     Python(Arc<crate::timer::PythonTimeEventCallback>),
     Rust(Arc<dyn Fn(TimeEvent) + Send + Sync>),
+    Bound {
+        callback: Box<Self>,
+        binding: crate::timer::TimerBinding,
+        execution_lease: Option<crate::clock::ExecutionClockLease>,
+    },
 }
 
 impl Debug for SendTimeEventCallback {
@@ -241,16 +248,50 @@ impl Debug for SendTimeEventCallback {
             #[cfg(feature = "python")]
             Self::Python(_) => f.write_str("Python callback"),
             Self::Rust(_) => f.write_str("Rust callback (thread-safe)"),
+            Self::Bound {
+                callback, binding, ..
+            } => f
+                .debug_struct(stringify!(SendTimeEventCallback))
+                .field("callback", callback)
+                .field("binding", binding)
+                .finish(),
         }
     }
 }
 
 impl SendTimeEventCallback {
+    fn from_callback(callback: TimeEventCallback) -> Self {
+        match callback {
+            #[cfg(feature = "python")]
+            TimeEventCallback::Python(callback) => Self::Python(callback),
+            TimeEventCallback::Rust(callback) => Self::Rust(callback),
+            TimeEventCallback::Bound {
+                callback,
+                binding,
+                execution_lease,
+            } => Self::Bound {
+                callback: Box::new(Self::from_callback(*callback)),
+                binding,
+                execution_lease,
+            },
+            TimeEventCallback::RustLocal(_) => {
+                unreachable!("Local callbacks require native registered dispatch")
+            }
+        }
+    }
+
     fn into_callback(self) -> TimeEventCallback {
         match self {
             #[cfg(feature = "python")]
             Self::Python(callback) => TimeEventCallback::Python(callback),
             Self::Rust(callback) => TimeEventCallback::Rust(callback),
+            Self::Bound {
+                callback,
+                binding,
+                execution_lease,
+            } => callback
+                .into_callback()
+                .with_runtime_binding(binding, execution_lease),
         }
     }
 }
@@ -262,31 +303,20 @@ pub(crate) struct TimeEventMessageFactory(SendTimeEventCallback);
 #[cfg(feature = "live")]
 impl TimeEventMessageFactory {
     pub(crate) fn new(callback: &TimeEventCallback) -> Self {
-        match callback {
-            #[cfg(feature = "python")]
-            TimeEventCallback::Python(callback) => {
-                Self(SendTimeEventCallback::Python(callback.clone()))
-            }
-            TimeEventCallback::Rust(callback) => {
-                Self(SendTimeEventCallback::Rust(callback.clone()))
-            }
-            TimeEventCallback::RustLocal(_) => {
-                unreachable!("RustLocal callbacks require registered dispatch")
-            }
-        }
+        Self(SendTimeEventCallback::from_callback(callback.clone()))
     }
 
     pub(crate) fn message(&self, event: TimeEvent) -> TimeEventMessage {
         TimeEventMessage {
             event,
-            dispatch: TimeEventDispatch::Direct(self.0.clone()),
+            dispatch: TimeEventDispatch::Direct(Box::new(self.0.clone())),
         }
     }
 }
 
 #[derive(Debug)]
 enum TimeEventDispatch {
-    Direct(SendTimeEventCallback),
+    Direct(Box<SendTimeEventCallback>),
     Registered(TimeEventCallbackLease),
     #[cfg(any(feature = "live", test))]
     Cleanup(TimeEventCallbackLease),
@@ -310,23 +340,19 @@ impl TimeEventMessage {
     /// Panics if the process-wide callback ID or lease count is exhausted.
     #[must_use]
     pub fn new(event: TimeEvent, callback: TimeEventCallback) -> Self {
-        match callback {
-            #[cfg(feature = "python")]
-            TimeEventCallback::Python(callback) => Self {
+        if callback.is_local() {
+            let token = TimeEventCallbackToken::register(callback);
+            let lease = token
+                .acquire()
+                .expect("new time event callback token should be open");
+            token.close();
+            Self::registered(event, lease)
+        } else {
+            Self {
                 event,
-                dispatch: TimeEventDispatch::Direct(SendTimeEventCallback::Python(callback)),
-            },
-            TimeEventCallback::Rust(callback) => Self {
-                event,
-                dispatch: TimeEventDispatch::Direct(SendTimeEventCallback::Rust(callback)),
-            },
-            callback @ TimeEventCallback::RustLocal(_) => {
-                let token = TimeEventCallbackToken::register(callback);
-                let lease = token
-                    .acquire()
-                    .expect("new time event callback token should be open");
-                token.close();
-                Self::registered(event, lease)
+                dispatch: TimeEventDispatch::Direct(Box::new(
+                    SendTimeEventCallback::from_callback(callback),
+                )),
             }
         }
     }
@@ -364,7 +390,7 @@ impl TimeEventMessage {
         let Self { event, dispatch } = self;
         match dispatch {
             TimeEventDispatch::Direct(callback) => {
-                TimeEventHandler::new(event, callback.into_callback()).run();
+                TimeEventHandler::new(event, (*callback).into_callback()).run();
                 true
             }
             TimeEventDispatch::Registered(lease) => {

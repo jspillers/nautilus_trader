@@ -40,7 +40,7 @@ use indexmap::{IndexMap, IndexSet};
 use nautilus_common::{
     cache::{Cache, PositionRef},
     clients::ExecutionClient,
-    clock::Clock,
+    clock::{Clock, ExecutionClockLease, ExecutionClockRegistration},
     enums::LogColor,
     generators::position_id::PositionIdGenerator,
     log_info,
@@ -129,6 +129,7 @@ pub struct ExecutionEngine {
     clock: Rc<RefCell<dyn Clock>>,
     cache: Rc<RefCell<Cache>>,
     clients: IndexMap<ClientId, ExecutionClientAdapter>,
+    client_clock_generations: AHashMap<ClientId, u64>,
     default_client_id: Option<ClientId>,
     routing_map: AHashMap<Venue, ClientId>,
     instrument_venues: AHashSet<Venue>,
@@ -179,6 +180,7 @@ impl ExecutionEngine {
             clock: clock.clone(),
             cache,
             clients: IndexMap::new(),
+            client_clock_generations: AHashMap::new(),
             default_client_id: None,
             routing_map: AHashMap::new(),
             instrument_venues: AHashSet::new(),
@@ -422,7 +424,7 @@ impl ExecutionEngine {
             anyhow::bail!("Client already registered with ID {client_id}");
         }
 
-        let adapter = ExecutionClientAdapter::new(client);
+        let adapter = self.create_client_adapter(client)?;
         self.cache
             .borrow_mut()
             .add_client_account(client_id, adapter.account_id);
@@ -432,10 +434,54 @@ impl ExecutionEngine {
         Ok(())
     }
 
+    fn create_client_adapter(
+        &mut self,
+        mut client: Box<dyn ExecutionClient>,
+    ) -> anyhow::Result<ExecutionClientAdapter> {
+        let client_id = client.client_id();
+        let generation = self
+            .client_clock_generations
+            .get(&client_id)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Native client registration generation exhausted"))?;
+        let lease = ExecutionClockLease::new(ExecutionClockRegistration {
+            client_id,
+            registration_id: UUID4::new(),
+            generation,
+        });
+        client.bind_clock_registration(lease.clone());
+        let mut adapter = ExecutionClientAdapter::new(client);
+        adapter.clock_registration = Some(lease);
+        self.client_clock_generations.insert(client_id, generation);
+        Ok(adapter)
+    }
+
+    /// Returns the current native execution-client clock registration identity.
+    #[must_use]
+    pub fn client_clock_registration(
+        &self,
+        client_id: ClientId,
+    ) -> Option<ExecutionClockRegistration> {
+        self.clients
+            .get(&client_id)?
+            .clock_registration
+            .as_ref()
+            .filter(|lease| lease.is_active())
+            .map(ExecutionClockLease::registration)
+    }
+
     /// Registers a default execution client for fallback routing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the checked native client registration generation is exhausted.
     pub fn register_default_client(&mut self, client: Box<dyn ExecutionClient>) {
         let client_id = client.client_id();
-        let adapter = ExecutionClientAdapter::new(client);
+        let adapter = self
+            .create_client_adapter(client)
+            .expect("Native client registration generation exhausted");
         {
             let mut cache = self.cache.borrow_mut();
             cache.add_client_account(client_id, adapter.account_id);
@@ -1081,12 +1127,12 @@ impl ExecutionEngine {
         self.cache.borrow_mut().cache_all().await?;
 
         // Snapshot before iterating: `get_or_init_own_order_book` re-enters `self.cache.borrow_mut()`.
-        let own_book_entries: Vec<(InstrumentId, OwnBookOrder)> = {
+        let (own_book_entries, cache_integrity): (Vec<(InstrumentId, OwnBookOrder)>, bool) = {
             let mut cache = self.cache.borrow_mut();
             cache.build_index();
-            let _ = cache.check_integrity();
+            let integrity = cache.check_integrity();
 
-            if self.config.manage_own_order_books {
+            let entries = if self.config.manage_own_order_books {
                 cache
                     .orders(None, None, None, None, None)
                     .into_iter()
@@ -1095,7 +1141,8 @@ impl ExecutionEngine {
                     .collect()
             } else {
                 Vec::new()
-            }
+            };
+            (entries, integrity)
         };
 
         for (instrument_id, own_order) in own_book_entries {
@@ -1104,6 +1151,9 @@ impl ExecutionEngine {
         }
 
         self.set_position_id_counts();
+        self.cache
+            .borrow()
+            .complete_bootstrap_cache_load(cache_integrity);
 
         log::info!(
             "Loaded cache in {}ms",

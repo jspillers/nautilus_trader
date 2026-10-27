@@ -119,6 +119,18 @@ impl<T> DispatchMessage<T> {
         self.context.is_some()
     }
 
+    /// Returns the retained native queue item without consuming its callback context.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the message has already been consumed.
+    #[must_use]
+    pub fn message(&self) -> &T {
+        self.message
+            .as_ref()
+            .expect("Undispatched native message is present")
+    }
+
     pub(super) fn mark_send(&mut self, timing: DispatchSendTiming) {
         self.send_timing = Some(timing);
     }
@@ -145,6 +157,9 @@ impl DispatchMessage<TradingCommandMessage> {
     /// - The observer or a command handler panics.
     pub fn dispatch_trading(mut self, before: impl FnMut(&TradingCommandMessage)) {
         let _timing = SendTimingScope::enter(self.send_timing);
+        let _recorded = crate::runner::recorded::RuntimeDispatchScope::enter(|| {
+            crate::runner::recorded::describe_trading_command(self.message())
+        });
         let context = self.take_context();
         dispatch_scoped_trading_command(
             self.message.take().expect("message is present"),

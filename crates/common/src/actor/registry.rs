@@ -62,6 +62,8 @@ use std::{
 };
 
 use ahash::AHashMap;
+use nautilus_core::UUID4;
+use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
 use super::Actor;
@@ -105,6 +107,7 @@ thread_local! {
 /// Registry for storing actors.
 pub struct ActorRegistry {
     actors: RefCell<AHashMap<Ustr, Registration>>,
+    generations: RefCell<AHashMap<Ustr, u64>>,
 }
 
 impl Debug for ActorRegistry {
@@ -127,19 +130,38 @@ impl ActorRegistry {
     pub fn new() -> Self {
         Self {
             actors: RefCell::new(AHashMap::new()),
+            generations: RefCell::new(AHashMap::new()),
         }
     }
 
+    /// Inserts an actor with a new native registration generation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the checked registration generation is exhausted.
     pub fn insert(&self, id: Ustr, actor: Rc<UnsafeCell<dyn Actor>>) {
         let mut actors = self.actors.borrow_mut();
         if actors.contains_key(&id) {
             log::warn!("Replacing existing actor with id: {id}");
         }
+        let generation = {
+            let mut generations = self.generations.borrow_mut();
+            let previous = generations.get(&id).copied().unwrap_or_default();
+            let generation = previous
+                .checked_add(1)
+                .expect("Actor registration generation exhausted");
+            generations.insert(id, generation);
+            generation
+        };
         let previous = actors.insert(
             id,
             Registration {
                 actor,
-                identity: Rc::new(()),
+                identity: Rc::new(ActorRegistration {
+                    actor_id: id,
+                    registration_id: UUID4::new(),
+                    generation,
+                }),
             },
         );
         drop(actors);
@@ -278,10 +300,37 @@ pub fn actor_count() -> usize {
     with_actor_registry(ActorRegistry::len)
 }
 
+/// Durable identity of one registration in the existing native actor registry.
+///
+/// The generation advances for each insertion under the same ID on this thread,
+/// including replacement. The UUID identifies the concrete registration; replay
+/// may reconcile fresh UUIDs only against the same ID and generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorRegistration {
+    /// The native actor ID shared by the component and callback registries.
+    pub actor_id: Ustr,
+    /// The identity of this concrete native registry insertion.
+    pub registration_id: UUID4,
+    /// The checked insertion generation for this actor ID on the owner thread.
+    pub generation: u64,
+}
+
+/// Returns the currently registered native actor identity.
+#[must_use]
+pub fn actor_registration(id: &Ustr) -> Option<ActorRegistration> {
+    with_actor_registry(|registry| {
+        registry
+            .actors
+            .borrow()
+            .get(id)
+            .map(|entry| *entry.identity)
+    })
+}
+
 #[derive(Clone)]
 struct Registration {
     actor: Rc<UnsafeCell<dyn Actor>>,
-    identity: Rc<()>,
+    identity: Rc<ActorRegistration>,
 }
 
 #[allow(
@@ -371,7 +420,10 @@ impl<T: Actor, E> ActorDelivery<T, E> {
 #[cfg(test)]
 /// Clears the actor registry (for test isolation).
 pub fn clear_actor_registry() {
-    let actors = with_actor_registry(|registry| std::mem::take(&mut *registry.actors.borrow_mut()));
+    let actors = with_actor_registry(|registry| {
+        registry.generations.borrow_mut().clear();
+        std::mem::take(&mut *registry.actors.borrow_mut())
+    });
     drop(actors);
 }
 

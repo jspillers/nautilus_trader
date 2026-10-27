@@ -351,8 +351,16 @@ impl Trader {
     {
         let actor_id = actor.actor_id();
 
+        let clock = actor.is_registered().then(|| actor.clock_rc());
         // Register in both component and actor registries (this consumes the actor)
         register_component_actor(actor);
+
+        if let (Some(clock), Some(owner)) = (
+            clock,
+            nautilus_common::actor::registry::actor_registration(&actor_id.inner()),
+        ) {
+            clock.borrow_mut().bind_actor_registration(owner);
+        }
 
         // Store actor ID for lifecycle management
         self.actor_ids.push(actor_id);
@@ -640,13 +648,19 @@ impl Trader {
                 log::error!("Strategy {actor_id} not found for time event handling");
             }
         });
-        clock.borrow_mut().register_default_handler(callback);
+        clock
+            .borrow_mut()
+            .register_default_handler(callback.with_native_target(actor_id));
 
         // Transition to Ready state
         strategy.initialize()?;
 
         // Register in both component and actor registries
         register_component_actor(strategy);
+
+        if let Some(owner) = nautilus_common::actor::registry::actor_registration(&actor_id) {
+            clock.borrow_mut().bind_actor_registration(owner);
+        }
 
         let order_topic = get_event_order_topic(strategy_id);
         let order_actor_id = actor_id;
@@ -747,12 +761,18 @@ impl Trader {
         let component_id = exec_algorithm.component_id();
         let clock = self.create_component_clock(component_id);
 
-        exec_algorithm.register(self.trader_id, clock, self.cache.clone())?;
+        exec_algorithm.register(self.trader_id, clock.clone(), self.cache.clone())?;
         exec_algorithm
             .exec_algorithm_core_mut()
             .set_portfolio(self.portfolio.clone());
 
         register_component_actor(exec_algorithm);
+
+        if let Some(owner) =
+            nautilus_common::actor::registry::actor_registration(&exec_algorithm_id.inner())
+        {
+            clock.borrow_mut().bind_actor_registration(owner);
+        }
 
         // Register the {id}.execute endpoint so the order manager can
         // route TradingCommands to this algorithm via msgbus::send_any
@@ -1617,6 +1637,7 @@ impl Trader {
             })?;
         }
 
+        cache.borrow().complete_bootstrap_component_load();
         Ok(())
     }
 
@@ -1865,7 +1886,7 @@ mod tests {
             trading_cmd_queue_is_empty,
         },
     };
-    use nautilus_core::UUID4;
+    use nautilus_core::{DurationNanos, UUID4};
     use nautilus_data::engine::{DataEngine, config::DataEngineConfig};
     use nautilus_execution::engine::{ExecutionEngine, config::ExecutionEngineConfig};
     use nautilus_model::{
@@ -3308,7 +3329,8 @@ mod tests {
         trader.stop_components().unwrap();
 
         let clock = trader.get_component_clocks().into_iter().next().unwrap();
-        let dispatched = dispatch_component_time_events(&clock, UnixNanos::from(1_000_000));
+        let due = clock.borrow().timestamp_ns() + DurationNanos::from_millis(1);
+        let dispatched = dispatch_component_time_events(&clock, due);
         let strategy = get_actor_unchecked::<TimerRoutingStrategy>(&strategy_id.inner());
 
         assert_eq!(dispatched, 1);
@@ -3336,7 +3358,8 @@ mod tests {
         let (strategy_id, client_order_id) = register_gtd_timer(&mut trader, &cache, trader_id);
 
         let clock = trader.get_component_clocks().into_iter().next().unwrap();
-        let dispatched = dispatch_component_time_events(&clock, UnixNanos::from(1_000_000));
+        let due = clock.borrow().timestamp_ns() + DurationNanos::from_millis(1);
+        let dispatched = dispatch_component_time_events(&clock, due);
         let mut strategy = get_actor_unchecked::<TimerRoutingStrategy>(&strategy_id.inner());
         let strategy_state = (
             strategy.time_events,
@@ -3371,7 +3394,8 @@ mod tests {
         trader.stop_components().unwrap();
 
         let clock = trader.get_component_clocks().into_iter().next().unwrap();
-        let dispatched = dispatch_component_time_events(&clock, UnixNanos::from(1_000_000));
+        let due = clock.borrow().timestamp_ns() + DurationNanos::from_millis(1);
+        let dispatched = dispatch_component_time_events(&clock, due);
         let mut strategy = get_actor_unchecked::<TimerRoutingStrategy>(&strategy_id.inner());
         let strategy_state = (
             strategy.time_events,
@@ -3422,6 +3446,12 @@ mod tests {
             manage_gtd_expiry: true,
             ..Default::default()
         });
+        trader.add_strategy(strategy).unwrap();
+        trader.start_components().unwrap();
+        let expires_at = get_actor_unchecked::<TimerRoutingStrategy>(&strategy_id.inner())
+            .clock()
+            .timestamp_ns()
+            + DurationNanos::from_millis(1);
         let client_order_id = ClientOrderId::from("O-GTD-001");
         let order = OrderTestBuilder::new(OrderType::Limit)
             .trader_id(trader_id)
@@ -3431,11 +3461,9 @@ mod tests {
             .quantity(Quantity::from(1))
             .price(Price::from("1.00"))
             .time_in_force(TimeInForce::Gtd)
-            .expire_time(UnixNanos::from(1_000_000))
+            .expire_time(expires_at)
             .build();
 
-        trader.add_strategy(strategy).unwrap();
-        trader.start_components().unwrap();
         cache_accepted_order(cache, &order);
         get_actor_unchecked::<TimerRoutingStrategy>(&strategy_id.inner())
             .set_gtd_expiry(&order)

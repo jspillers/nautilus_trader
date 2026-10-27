@@ -17,6 +17,7 @@
 //!
 //! Provides methods to load, query, and update cached data such as instruments, orders, and prices.
 
+pub mod bootstrap;
 pub mod config;
 pub mod database;
 pub mod fifo;
@@ -119,6 +120,7 @@ pub struct Cache {
     instrument_revision: u64,
     index: CacheIndex,
     database: Option<Box<dyn CacheDatabaseAdapter>>,
+    bootstrap_loads: RefCell<Option<bootstrap::BootstrapLoads>>,
     general: AHashMap<String, Bytes>,
     currencies: AHashMap<Ustr, Currency>,
     instruments: AHashMap<InstrumentId, InstrumentAny>,
@@ -229,6 +231,7 @@ impl Cache {
             config,
             index: CacheIndex::default(),
             database,
+            bootstrap_loads: RefCell::new(None),
             general: AHashMap::new(),
             currencies: AHashMap::new(),
             instruments: AHashMap::new(),
@@ -455,6 +458,49 @@ impl Cache {
             .and_then(|db| db.persistence_health())
     }
 
+    /// Enables bounded observations of actual bootstrap database reads.
+    ///
+    /// The caller supplies the registered inventory before native loading starts. No reads
+    /// are issued by this diagnostic, and loaded payloads are never copied into the report.
+    pub fn begin_bootstrap_load_capture(&self, actor_ids: Vec<String>, strategy_ids: Vec<String>) {
+        *self.bootstrap_loads.borrow_mut() = Some(bootstrap::BootstrapLoads {
+            actor_ids,
+            strategy_ids,
+            reads: Vec::new(),
+            cache_rebuilt: false,
+            cache_integrity: None,
+            component_states_loaded: false,
+            overflowed: false,
+        });
+    }
+
+    /// Returns the actual bounded bootstrap observations without reading backing storage.
+    #[must_use]
+    pub fn bootstrap_loads(&self) -> Option<bootstrap::BootstrapLoads> {
+        self.bootstrap_loads.borrow().clone()
+    }
+
+    /// Finishes the observation without loading or retaining any payload state.
+    #[must_use]
+    pub fn finish_bootstrap_load_capture(&self) -> Option<bootstrap::BootstrapLoads> {
+        self.bootstrap_loads.borrow_mut().take()
+    }
+
+    /// Records completion of the native cache rebuild and integrity check.
+    pub fn complete_bootstrap_cache_load(&self, integrity: bool) {
+        if let Some(report) = self.bootstrap_loads.borrow_mut().as_mut() {
+            report.cache_rebuilt = true;
+            report.cache_integrity = Some(integrity);
+        }
+    }
+
+    /// Records completion of the actual full registered component-state load pass.
+    pub fn complete_bootstrap_component_load(&self) {
+        if let Some(report) = self.bootstrap_loads.borrow_mut().as_mut() {
+            report.component_states_loaded = true;
+        }
+    }
+
     /// Sets the cache database adapter for persistence.
     ///
     /// This allows setting or replacing the database adapter after cache construction.
@@ -473,7 +519,20 @@ impl Cache {
     /// Returns an error if loading general cache data fails.
     pub fn cache_general(&mut self) -> anyhow::Result<()> {
         self.general = match &mut self.database {
-            Some(db) => db.load()?,
+            Some(db) => {
+                let result = db.load();
+                bootstrap::record(
+                    &self.bootstrap_loads,
+                    bootstrap::BootstrapLoadReadKind::General,
+                    None,
+                    result.is_ok(),
+                    result
+                        .as_ref()
+                        .map(|value| [("entries".to_string(), value.len())].into_iter().collect())
+                        .unwrap_or_default(),
+                );
+                result?
+            }
             None => AHashMap::new(),
         };
 
@@ -498,7 +557,37 @@ impl Cache {
         self.bump_book_revision();
         self.bump_instrument_revision();
         let cache_map = match &self.database {
-            Some(db) => db.load_all().await?,
+            Some(db) => {
+                let result = db.load_all().await;
+                bootstrap::record(
+                    &self.bootstrap_loads,
+                    bootstrap::BootstrapLoadReadKind::CacheAll,
+                    None,
+                    result.is_ok(),
+                    result
+                        .as_ref()
+                        .map(|value| {
+                            [
+                                ("currencies".to_string(), value.currencies.len()),
+                                ("instruments".to_string(), value.instruments.len()),
+                                (
+                                    "instrument_closes".to_string(),
+                                    value.instrument_closes.len(),
+                                ),
+                                ("synthetics".to_string(), value.synthetics.len()),
+                                ("accounts".to_string(), value.accounts.len()),
+                                ("orders".to_string(), value.orders.len()),
+                                ("positions".to_string(), value.positions.len()),
+                                ("greeks".to_string(), value.greeks.len()),
+                                ("yield_curves".to_string(), value.yield_curves.len()),
+                            ]
+                            .into_iter()
+                            .collect()
+                        })
+                        .unwrap_or_default(),
+                );
+                result?
+            }
             None => CacheMap::default(),
         };
 
@@ -523,9 +612,31 @@ impl Cache {
             .collect();
 
         if let Some(db) = &self.database {
-            let order_position = db.load_index_order_position()?;
+            let result = db.load_index_order_position();
+            bootstrap::record(
+                &self.bootstrap_loads,
+                bootstrap::BootstrapLoadReadKind::IndexOrderPosition,
+                None,
+                result.is_ok(),
+                result
+                    .as_ref()
+                    .map(|value| [("entries".to_string(), value.len())].into_iter().collect())
+                    .unwrap_or_default(),
+            );
+            let order_position = result?;
             self.index.order_position = self.sanitize_order_position_index(order_position);
-            self.index.order_client = db.load_index_order_client()?;
+            let result = db.load_index_order_client();
+            bootstrap::record(
+                &self.bootstrap_loads,
+                bootstrap::BootstrapLoadReadKind::IndexOrderClient,
+                None,
+                result.is_ok(),
+                result
+                    .as_ref()
+                    .map(|value| [("entries".to_string(), value.len())].into_iter().collect())
+                    .unwrap_or_default(),
+            );
+            self.index.order_client = result?;
         }
 
         self.cache_position_oms()?;
@@ -676,7 +787,20 @@ impl Cache {
 
     fn cache_position_oms(&mut self) -> anyhow::Result<()> {
         let persisted = match &self.database {
-            Some(database) => database.load()?,
+            Some(database) => {
+                let result = database.load();
+                bootstrap::record(
+                    &self.bootstrap_loads,
+                    bootstrap::BootstrapLoadReadKind::PositionOmsGeneral,
+                    None,
+                    result.is_ok(),
+                    result
+                        .as_ref()
+                        .map(|value| [("entries".to_string(), value.len())].into_iter().collect())
+                        .unwrap_or_default(),
+                );
+                result?
+            }
             None => self.general.clone(),
         };
 
@@ -943,7 +1067,20 @@ impl Cache {
     ) -> anyhow::Result<Option<IndexMap<String, Vec<u8>>>> {
         self.database
             .as_ref()
-            .map(|database| database.load_actor(actor_id))
+            .map(|database| {
+                let result = database.load_actor(actor_id);
+                bootstrap::record(
+                    &self.bootstrap_loads,
+                    bootstrap::BootstrapLoadReadKind::ActorState,
+                    Some(actor_id.to_string()),
+                    result.is_ok(),
+                    result
+                        .as_ref()
+                        .map(|value| [("entries".to_string(), value.len())].into_iter().collect())
+                        .unwrap_or_default(),
+                );
+                result
+            })
             .transpose()
             .map(|state| state.map(Self::decode_component_state))
     }
@@ -961,7 +1098,20 @@ impl Cache {
     ) -> anyhow::Result<Option<IndexMap<String, Vec<u8>>>> {
         self.database
             .as_ref()
-            .map(|database| database.load_strategy(strategy_id))
+            .map(|database| {
+                let result = database.load_strategy(strategy_id);
+                bootstrap::record(
+                    &self.bootstrap_loads,
+                    bootstrap::BootstrapLoadReadKind::StrategyState,
+                    Some(strategy_id.to_string()),
+                    result.is_ok(),
+                    result
+                        .as_ref()
+                        .map(|value| [("entries".to_string(), value.len())].into_iter().collect())
+                        .unwrap_or_default(),
+                );
+                result
+            })
             .transpose()
             .map(|state| state.map(Self::decode_component_state))
     }

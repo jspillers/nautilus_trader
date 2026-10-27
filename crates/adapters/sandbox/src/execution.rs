@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
-    clock::Clock,
+    clock::{Clock, ExecutionClockLease},
     factories::OrderEventFactory,
     live::try_get_exec_event_sender,
     messages::{
@@ -728,6 +728,16 @@ impl SandboxExecutionClient {
 
 #[async_trait(?Send)]
 impl ExecutionClient for SandboxExecutionClient {
+    fn bind_clock_registration(&mut self, registration: ExecutionClockLease) -> bool {
+        self.clock
+            .borrow_mut()
+            .bind_execution_registration(registration)
+    }
+
+    fn recorded_clock(&self) -> Option<Rc<RefCell<dyn Clock>>> {
+        Some(self.clock.clone())
+    }
+
     fn is_connected(&self) -> bool {
         self.core.borrow().is_connected()
     }

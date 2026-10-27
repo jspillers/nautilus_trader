@@ -130,7 +130,7 @@ impl TargetedOrderQuery {
 }
 
 /// Targeted status query result with fills and coverage completeness.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub(crate) struct TargetedOrderReportResult {
     pub(super) client_order_id: ClientOrderId,
     pub(super) client_id: Option<ClientId>,
@@ -140,7 +140,7 @@ pub(crate) struct TargetedOrderReportResult {
 }
 
 /// Order status report paired with its source execution client.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub(crate) struct SourcedOrderStatusReport {
     pub client_id: ClientId,
     pub report: OrderStatusReport,

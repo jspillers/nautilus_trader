@@ -95,8 +95,8 @@ pub use hash::{EntryHash, compute_entry_hash};
 pub use headers::Headers;
 pub use kernel::{
     BootError, EventStoreLifecycle, EventStoreLifecycleOptions, EventStoreSession, HaltSignal,
-    KernelError, RecoveredRun, RecoveryOutcome, build_run_id, open_run, open_run_with_options,
-    recover_predecessors,
+    KernelError, RecordedOriginSource, RecordedRunOrigin, RecordedRunOriginWitness, RecoveredRun,
+    RecoveryOutcome, build_run_id, open_run, open_run_with_options, recover_predecessors,
 };
 pub use manifest::{RunId, RunManifest, RunStatus};
 pub use markers::{

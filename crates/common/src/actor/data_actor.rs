@@ -3087,7 +3087,9 @@ where
             }
         });
 
-        clock.borrow_mut().register_default_handler(callback);
+        clock
+            .borrow_mut()
+            .register_default_handler(callback.with_native_target(actor_id));
 
         self.initialize()
     }

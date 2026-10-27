@@ -93,7 +93,6 @@ use anyhow::Context;
 use nautilus_common::{
     actor::{self, Actor, DataActor, DataActorNative},
     cache::database::{CacheDatabaseAdapter, CacheDatabaseFactory},
-    clients::ExecutionClient,
     component::Component,
     enums::{Environment, LogColor},
     live::{dispatch::DispatchMessage, dst},
@@ -105,7 +104,10 @@ use nautilus_common::{
         system::{QueueStateChanged, ReconnectSocket, SocketStateChange, SocketStateChanged},
     },
     msgbus::{self, BusMessage, MessagingSwitchboard},
-    runner::{SystemChannel, TimeEventMessage, TradingCommandMessage},
+    runner::{
+        SystemChannel, TimeEventMessage, TradingCommandMessage,
+        recorded::{RecordedChannel, RuntimeDispatchScope},
+    },
 };
 use nautilus_core::{
     UUID4,
@@ -132,9 +134,7 @@ use crate::{
     dispatch::drain_callbacks,
     execution::{
         client::LiveExecutionClient,
-        manager::{
-            ExecutionManager, ExecutionManagerConfig, TargetedOrderQuery, TargetedOrderReportResult,
-        },
+        manager::{ExecutionManager, ExecutionManagerConfig, TargetedOrderReportResult},
     },
     runner::{AsyncRunner, AsyncRunnerChannels, PendingRunnerEvent},
     socket::{SocketReconnectLookup, SocketReconnectRegistry},
@@ -149,6 +149,8 @@ pub mod plugin;
 mod metrics;
 mod queue;
 mod reconciliation;
+mod recorded;
+pub use recorded::{RecordedRunnerConfig, RecordedRunnerInput, RecordedRunnerInputKind};
 mod state;
 mod strategy_settlement;
 
@@ -209,6 +211,7 @@ pub struct LiveNode {
     stream_processors: Vec<StreamProcessor>,
     shutdown_deadline: Option<dst::time::Instant>,
     strategy_settlements: strategy_settlement::PendingStrategySettlements,
+    recorded: Option<recorded::RecordedRunnerState>,
     #[cfg(feature = "plugin")]
     plugins: plugin::NodePlugins,
     _thread_owner: Rc<()>,
@@ -251,6 +254,7 @@ impl LiveNode {
             stream_processors: Vec::new(),
             shutdown_deadline: None,
             strategy_settlements: strategy_settlement::PendingStrategySettlements::default(),
+            recorded: None,
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
             _thread_owner: thread_owner,
@@ -332,6 +336,7 @@ impl LiveNode {
             stream_processors: Vec::new(),
             shutdown_deadline: None,
             strategy_settlements: strategy_settlement::PendingStrategySettlements::default(),
+            recorded: None,
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
             _thread_owner: thread_owner,
@@ -701,6 +706,13 @@ impl LiveNode {
     }
 
     fn process_system_command(&self, command: SystemCommand) {
+        let _recorded = RuntimeDispatchScope::enter(|| {
+            nautilus_common::runner::recorded::describe_unsupported(
+                RecordedChannel::SystemCommands,
+                "system command",
+            )
+        });
+
         match command {
             SystemCommand::ReconnectSocket(command) => {
                 self.process_socket_reconnect(command);
@@ -758,6 +770,13 @@ impl LiveNode {
     }
 
     fn process_system_event(&self, event: SystemEvent) {
+        let _recorded = RuntimeDispatchScope::enter(|| {
+            nautilus_common::runner::recorded::describe_unsupported(
+                RecordedChannel::SystemEvents,
+                "system event",
+            )
+        });
+
         match event {
             SystemEvent::SocketState(change) => self.publish_socket_state_change(change),
         }
@@ -1092,6 +1111,11 @@ impl LiveNode {
     /// Returns an error if the node fails to start, encounters a runtime error, or shuts down
     /// with retained submissions unresolved at the end of `delay_post_stop`.
     pub async fn run_with_mode(&mut self, mode: NodeRunMode) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.recorded.is_none(),
+            "Recorded runner already owns this node"
+        );
+
         if self.state().is_running() {
             anyhow::bail!("Already running");
         }
@@ -1665,49 +1689,11 @@ impl LiveNode {
                 }, if open_order_report_task.is_some() => {
                     let maintenance_start = dst::time::Instant::now();
 
+                    let _recorded = RuntimeDispatchScope::enter(|| recorded::maintenance::describe_open_outcome(&result));
                     drop(open_order_report_task.take());
 
-                    match result {
-                        ReportTaskOutcome::Completed(result) => {
-                            let client_refs = self
-                                .exec_clients
-                                .iter()
-                                .map(|client| client as &dyn ExecutionClient)
-                                .collect::<Vec<_>>();
-                            let reconciliation = self.exec_manager.reconcile_open_order_reports(
-                                &result.check,
-                                result.reports,
-                                &result.queried_clients,
-                                &result.failed_clients,
-                                &client_refs,
-                            );
-                            self.process_reconciliation_events(&reconciliation.events);
-                            if !reconciliation.targeted_queries.is_empty() {
-                                if is_shutting_down {
-                                    let planned_client_order_ids = reconciliation
-                                        .targeted_queries
-                                        .iter()
-                                        .map(TargetedOrderQuery::client_order_id)
-                                        .collect::<Vec<_>>();
-                                    self.cleanup_cancelled_report_tasks(
-                                        &planned_client_order_ids,
-                                    );
-                                } else {
-                                    targeted_order_report_task = Some(
-                                        self.start_targeted_order_report_check(
-                                            reconciliation.targeted_queries,
-                                        ),
-                                    );
-                                }
-                            }
-                        }
-                        ReportTaskOutcome::TimedOut => {
-                            self.cleanup_cancelled_report_tasks(&[]);
-                            log::warn!(
-                                "Open-order report collection expired after {:?}",
-                                self.config.timeout_reconciliation,
-                            );
-                        }
+                    if let Some(task) = self.apply_open_order_report_outcome(result, is_shutting_down) {
+                        targeted_order_report_task = Some(task);
                     }
                     record_runner_maintenance(&metrics, maintenance_start, metrics_start);
                 }
@@ -1723,28 +1709,9 @@ impl LiveNode {
                         .as_ref()
                         .map(|task| task.planned_client_order_ids.clone())
                         .unwrap_or_default();
+                    let _recorded = RuntimeDispatchScope::enter(|| recorded::maintenance::describe_targeted_outcome(&result));
                     drop(targeted_order_report_task.take());
-
-                    match result {
-                        ReportTaskOutcome::Completed(result) => {
-                            let client_refs = self
-                                .exec_clients
-                                .iter()
-                                .map(|client| client as &dyn ExecutionClient)
-                                .collect::<Vec<_>>();
-                            let events = self
-                                .exec_manager
-                                .reconcile_targeted_order_reports(result, &client_refs);
-                            self.process_reconciliation_events(&events);
-                        }
-                        ReportTaskOutcome::TimedOut => {
-                            self.cleanup_cancelled_report_tasks(&planned_client_order_ids);
-                            log::warn!(
-                                "Targeted order report collection expired after {:?}",
-                                self.config.timeout_reconciliation,
-                            );
-                        }
-                    }
+                    self.apply_targeted_order_report_outcome(result, &planned_client_order_ids);
                     record_runner_maintenance(&metrics, maintenance_start, metrics_start);
                 }
                 result = async {
@@ -1755,33 +1722,37 @@ impl LiveNode {
                 }, if position_report_task.is_some() => {
                     let maintenance_start = dst::time::Instant::now();
 
+                    let _recorded = RuntimeDispatchScope::enter(|| recorded::maintenance::describe_position_outcome(&result));
                     drop(position_report_task.take());
-
-                    match result {
-                        ReportTaskOutcome::Completed(PositionReportTaskResult::Positions(result)) => {
-                            if is_shutting_down {
-                                self.cleanup_cancelled_report_tasks(&[]);
-                            } else {
-                                position_report_task = self.handle_position_report_result(result);
-                            }
-                        }
-                        ReportTaskOutcome::Completed(PositionReportTaskResult::Fills(result)) => {
-                            self.handle_position_fill_report_result(result);
-                        }
-                        ReportTaskOutcome::TimedOut => {
-                            self.cleanup_cancelled_report_tasks(&[]);
-                            log::warn!(
-                                "Position report collection expired after {:?}",
-                                self.config.timeout_reconciliation,
-                            );
-                        }
-                    }
+                    position_report_task = self.apply_position_report_outcome(result, is_shutting_down);
                     record_runner_maintenance(&metrics, maintenance_start, metrics_start);
                 }
 
                 // Maintenance dispatcher (before event processing to avoid
                 // starvation). See module docs for design rationale.
                 _ = maintenance_timer.tick(), if is_running => {
+                    let now = dst::time::Instant::now();
+                    let actions = recorded::maintenance::MaintenanceActions {
+                        reconciliation: (recon_enabled && now >= recon_next).then(|| reconciliation::ReconciliationDue {
+                            inflight: reconciliation::reconciliation_check_due(now, last_inflight_check, inflight_interval),
+                            open: reconciliation::reconciliation_check_due(now, last_open_check, open_interval),
+                            position: reconciliation::reconciliation_check_due(now, last_position_check, position_interval),
+                            order: if last_position_check < last_open_check {
+                                reconciliation::ReconciliationOrder::PositionFirst
+                            } else {
+                                reconciliation::ReconciliationOrder::OpenFirst
+                            },
+                        }),
+                        purge: recorded::maintenance::PurgeActions {
+                            orders: now >= purge_orders_next,
+                            positions: now >= purge_positions_next,
+                            accounts: now >= purge_account_next,
+                        },
+                        audit_books: now >= own_books_next,
+                        prune_fills: now >= prune_fills_next,
+                        queue_monitor: queue_monitor.is_some(),
+                    };
+                    let _recorded = RuntimeDispatchScope::enter(|| actions.describe());
                     let maintenance_start = dst::time::Instant::now();
                     metrics.publish_queue_depths(
                         RunnerChannelQueueDepths::from_receivers(
@@ -1799,9 +1770,9 @@ impl LiveNode {
                         self.publish_queue_state_transitions(&transitions);
                     }
 
-                    let mut now = dst::time::Instant::now();
+                    let mut now = now;
 
-                    if recon_enabled && now >= recon_next {
+                    if actions.reconciliation.is_some() {
                         let recon_intervals = ReconciliationCheckIntervals {
                             inflight: inflight_interval,
                             open: open_interval,
@@ -1826,27 +1797,27 @@ impl LiveNode {
                         recon_next = now + recon_interval;
                     }
 
-                    if now >= purge_orders_next {
+                    if actions.purge.orders {
                         self.exec_manager.purge_closed_orders();
                         purge_orders_next = now + purge_orders_interval;
                     }
 
-                    if now >= purge_positions_next {
+                    if actions.purge.positions {
                         self.exec_manager.purge_closed_positions();
                         purge_positions_next = now + purge_positions_interval;
                     }
 
-                    if now >= purge_account_next {
+                    if actions.purge.accounts {
                         self.exec_manager.purge_account_events();
                         purge_account_next = now + purge_account_interval;
                     }
 
-                    if now >= own_books_next {
+                    if actions.audit_books {
                         self.kernel.cache().borrow_mut().audit_own_order_books();
                         own_books_next = now + own_books_interval;
                     }
 
-                    if now >= prune_fills_next {
+                    if actions.prune_fills {
                         self.exec_manager.prune_recent_fills_cache(60.0);
                         self.exec_manager.prune_processed_fills();
                         self.exec_manager.prune_order_local_activity();
@@ -2188,6 +2159,10 @@ impl LiveNode {
     }
 
     fn process_external_msgbus_message(&self, message: &BusMessage) {
+        let _recorded = RuntimeDispatchScope::enter(|| {
+            nautilus_common::runner::recorded::describe_external(message)
+        });
+
         if self.stream_processors.is_empty() {
             Self::republish_external_msgbus_message(message);
             return;
@@ -2264,6 +2239,10 @@ impl LiveNode {
     }
 
     fn process_exec_event(&mut self, event: ExecutionEvent) {
+        let _recorded = RuntimeDispatchScope::enter(|| {
+            nautilus_common::runner::recorded::describe_execution_event(&event)
+        });
+
         if let ExecutionEvent::StrategySettlement(marker) = event {
             self.finish_strategy_settlement(marker, false);
             return;
@@ -2397,7 +2376,10 @@ impl LiveNode {
         receivers: Option<&mut RunnerReceivers<'_>>,
     ) -> anyhow::Result<bool> {
         match self.handle.try_set_running() {
-            RunningTransition::Entered => Ok(true),
+            RunningTransition::Entered => {
+                self.capture_recorded_started();
+                Ok(true)
+            }
             RunningTransition::StopRequested => {
                 self.abort_started_trader("Stop signal received during startup", receivers)
                     .await?;
@@ -3493,6 +3475,7 @@ mod tests {
             self, CallbackDispatchError, DataActor, DataActorCore, data_actor::DataActorConfig,
         },
         cache::Cache,
+        clients::ExecutionClient,
         clock::{Clock, VirtualClock},
         enums::SerializationEncoding,
         live::{

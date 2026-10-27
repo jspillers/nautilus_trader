@@ -20,6 +20,8 @@
 //! support virtual and live clock implementations.
 
 mod api;
+mod registration;
+pub use registration::{ExecutionClockLease, ExecutionClockRegistration};
 #[path = "virtual.rs"]
 mod virtual_clock;
 
@@ -39,7 +41,13 @@ use nautilus_core::{
 use ustr::Ustr;
 pub use virtual_clock::VirtualClock; // Re-export
 
-use crate::timer::{TimeEvent, TimeEventCallback, TimeEventHandler, Timer};
+use crate::{
+    actor::registry::ActorRegistration,
+    timer::{
+        RecordedTimeEventDispatch, TimeEvent, TimeEventCallback, TimeEventHandler, Timer,
+        TimerBinding,
+    },
+};
 
 /// Provides time access, timer scheduling, and callback registration.
 ///
@@ -70,6 +78,39 @@ pub trait Clock: Debug + Any {
 
     /// Returns whether an active timer named `name` exists.
     fn timer_exists(&self, name: &Ustr) -> bool;
+
+    /// Associates this component clock with its existing native actor registration.
+    /// Custom clocks remain unsupported for recorded native callback routing.
+    fn bind_actor_registration(&mut self, _owner: ActorRegistration) -> bool {
+        false
+    }
+
+    /// Returns the native component registration which owns this clock, when supported.
+    fn actor_registration(&self) -> Option<ActorRegistration> {
+        None
+    }
+
+    /// Associates an exclusively owned client clock with its native registration lease.
+    fn bind_execution_registration(&mut self, _owner: ExecutionClockLease) -> bool {
+        false
+    }
+
+    /// Returns the current execution-client clock lease, when supported.
+    fn execution_registration(&self) -> Option<ExecutionClockLease> {
+        None
+    }
+
+    /// Resolves one recorded native timer firing without advancing other timers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported clocks or an unbound, stale or mismatched registration.
+    fn recorded_time_event(
+        &mut self,
+        _dispatch: &RecordedTimeEventDispatch,
+    ) -> anyhow::Result<TimeEventHandler> {
+        anyhow::bail!("Recorded timer dispatch is unsupported by this Clock")
+    }
 
     /// Registers the callback used when a timer has no named callback.
     fn register_default_handler(&mut self, callback: TimeEventCallback);
@@ -284,8 +325,19 @@ fn duration_to_nanos(duration: Duration) -> anyhow::Result<DurationNanos> {
 /// `VirtualClock` and `LiveClock`.
 #[derive(Debug, Default)]
 pub struct CallbackRegistry {
-    default_callback: Option<TimeEventCallback>,
-    callbacks: AHashMap<Ustr, TimeEventCallback>,
+    default_callback: Option<RegisteredCallback>,
+    callbacks: AHashMap<Ustr, RegisteredCallback>,
+    owner: Option<ActorRegistration>,
+    execution_owner: Option<ExecutionClockLease>,
+    callback_generation: u64,
+    timer_generation: u64,
+    timer_bindings: AHashMap<Ustr, u64>,
+}
+
+#[derive(Clone, Debug)]
+struct RegisteredCallback {
+    callback: TimeEventCallback,
+    generation: u64,
 }
 
 impl CallbackRegistry {
@@ -296,8 +348,19 @@ impl CallbackRegistry {
     }
 
     /// Registers the callback used when no callback exists for a timer name.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the checked callback generation is exhausted.
     pub fn register_default_handler(&mut self, callback: TimeEventCallback) {
-        self.default_callback = Some(callback);
+        self.callback_generation = self
+            .callback_generation
+            .checked_add(1)
+            .expect("Clock callback generation exhausted");
+        self.default_callback = Some(RegisteredCallback {
+            callback,
+            generation: self.callback_generation,
+        });
     }
 
     /// Removes the default callback, preserving all named callbacks.
@@ -306,8 +369,96 @@ impl CallbackRegistry {
     }
 
     /// Registers a callback for `name`, replacing any existing callback for that name.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the checked callback generation is exhausted.
     pub fn register_callback(&mut self, name: Ustr, callback: TimeEventCallback) {
-        self.callbacks.insert(name, callback);
+        self.callback_generation = self
+            .callback_generation
+            .checked_add(1)
+            .expect("Clock callback generation exhausted");
+        self.callbacks.insert(
+            name,
+            RegisteredCallback {
+                callback,
+                generation: self.callback_generation,
+            },
+        );
+    }
+
+    /// Binds routing metadata to the native registry incarnation which owns this clock.
+    pub fn bind_actor_registration(&mut self, owner: ActorRegistration) {
+        self.owner = Some(owner);
+    }
+
+    pub(crate) fn bind_execution_registration(&mut self, owner: ExecutionClockLease) -> bool {
+        if self.owner.is_some() {
+            return false;
+        }
+        self.execution_owner = Some(owner);
+        true
+    }
+
+    pub(crate) fn execution_registration(&self) -> Option<ExecutionClockLease> {
+        self.execution_owner.clone()
+    }
+
+    pub(crate) const fn actor_registration(&self) -> Option<ActorRegistration> {
+        self.owner
+    }
+
+    pub(crate) fn next_timer_binding(&mut self, name: Ustr) -> anyhow::Result<()> {
+        self.timer_generation = self
+            .timer_generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Clock timer generation exhausted"))?;
+        self.timer_bindings.insert(name, self.timer_generation);
+        Ok(())
+    }
+
+    pub(crate) fn recorded_handler(
+        &self,
+        dispatch: &RecordedTimeEventDispatch,
+    ) -> anyhow::Result<TimeEventHandler> {
+        anyhow::ensure!(
+            dispatch.has_current_native_owner(),
+            "Recorded callback has no supported current native owner"
+        );
+        let callback = self
+            .get_callback(&dispatch.event.name)
+            .ok_or_else(|| anyhow::anyhow!("Recorded callback registration is absent"))?;
+        let actual = callback
+            .binding()
+            .ok_or_else(|| anyhow::anyhow!("Runtime callback has no native routing metadata"))?;
+        let owner_matches = match (dispatch.binding.owner, actual.owner) {
+            (Some(source), Some(runtime)) => {
+                source.actor_id == runtime.actor_id
+                    && source.generation == runtime.generation
+                    && crate::actor::registry::actor_registration(&runtime.actor_id)
+                        == Some(runtime)
+            }
+            (None, None) => dispatch
+                .binding
+                .execution_owner
+                .zip(actual.execution_owner)
+                .is_some_and(|(source, runtime)| {
+                    source.client_id == runtime.client_id
+                        && source.generation == runtime.generation
+                        && self.execution_owner.as_ref().is_some_and(|lease| {
+                            lease.is_active() && lease.registration() == runtime
+                        })
+                }),
+            _ => false,
+        };
+        anyhow::ensure!(
+            owner_matches
+                && actual.target == dispatch.binding.target
+                && actual.callback_generation == dispatch.binding.callback_generation
+                && actual.timer_generation == dispatch.binding.timer_generation,
+            "Recorded callback or timer registration changed"
+        );
+        Ok(TimeEventHandler::new(dispatch.event.clone(), callback))
     }
 
     /// Returns whether a named or default callback is available for `name`.
@@ -319,10 +470,30 @@ impl CallbackRegistry {
     /// Returns the callback for `name`, falling back to the default callback.
     #[must_use]
     pub fn get_callback(&self, name: &Ustr) -> Option<TimeEventCallback> {
-        self.callbacks
+        let entry = self
+            .callbacks
             .get(name)
-            .cloned()
-            .or_else(|| self.default_callback.clone())
+            .or(self.default_callback.as_ref())?;
+        let target = entry.callback.binding().and_then(|binding| binding.target);
+        if self.owner.is_none() && target.is_none() && self.execution_owner.is_none() {
+            return Some(entry.callback.clone());
+        }
+        let binding = TimerBinding {
+            target,
+            owner: self.owner,
+            execution_owner: self
+                .execution_owner
+                .as_ref()
+                .map(ExecutionClockLease::registration),
+            callback_generation: entry.generation,
+            timer_generation: self.timer_bindings.get(name).copied(),
+        };
+        Some(
+            entry
+                .callback
+                .clone()
+                .with_runtime_binding(binding, self.execution_owner.clone()),
+        )
     }
 
     /// Creates a handler for `event` using its named callback or the default callback.

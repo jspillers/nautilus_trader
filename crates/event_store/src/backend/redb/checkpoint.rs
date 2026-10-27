@@ -393,6 +393,7 @@ impl RedbBackend {
         let backend = Self {
             base_dir: PathBuf::new(),
             cache_size_bytes: super::DEFAULT_CACHE_SIZE_BYTES,
+            exclusive_create: false,
             state: Some(RunState {
                 db: RunDatabase::ReadOnly(db),
                 manifest,

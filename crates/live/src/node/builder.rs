@@ -335,6 +335,13 @@ impl LiveNodeBuilder {
         self
     }
 
+    /// Supplies a native clock factory, preserving its component-clock initialization policy.
+    #[must_use]
+    pub fn with_native_clock_factory(mut self, factory: ClockFactory) -> Self {
+        self.clock_factory = Some(factory);
+        self
+    }
+
     /// Set the cache configuration.
     #[must_use]
     pub fn with_cache_config(mut self, config: CacheConfig) -> Self {
@@ -737,7 +744,20 @@ impl LiveNodeBuilder {
                         kernel.clock(),
                     ),
                     ExecutionClientFactoryEntry::Simulated(factory) => {
-                        factory.create(self.config.trader_id, name, config.as_ref(), kernel.cache())
+                        let clock = self
+                            .clock_factory
+                            .clone()
+                            .unwrap_or_else(|| {
+                                ClockFactory::for_environment(self.config.environment)
+                            })
+                            .create_component_clock();
+                        factory.create_with_clock(
+                            self.config.trader_id,
+                            name,
+                            config.as_ref(),
+                            kernel.cache(),
+                            clock,
+                        )
                     }
                 })?;
 

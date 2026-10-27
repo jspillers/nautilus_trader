@@ -131,6 +131,13 @@ impl LiveTimer {
 
         log::trace!("Creating timer '{name}'");
 
+        // A senderless Python timer has no native owner-thread dispatch boundary.
+        // Preserve its callable behavior without claiming recorded routing support.
+        let callback = if sender.is_none() {
+            callback.into_unbound().0
+        } else {
+            callback
+        };
         let owner_callback = if sender.is_some() {
             if callback.is_local() {
                 OwnerCallback::Registered {
@@ -138,7 +145,7 @@ impl LiveTimer {
                     callback,
                 }
             } else {
-                OwnerCallback::Direct(TimeEventMessageFactory::new(&callback))
+                OwnerCallback::Direct(Box::new(TimeEventMessageFactory::new(&callback)))
             }
         } else {
             OwnerCallback::Senderless(callback)
@@ -203,6 +210,9 @@ impl LiveTimer {
             match callback {
                 #[cfg(feature = "python")]
                 TimeEventCallback::Python(_) => {}
+                TimeEventCallback::Bound { .. } => {
+                    unreachable!("Senderless native binding is stripped")
+                }
                 TimeEventCallback::Rust(_) | TimeEventCallback::RustLocal(_) => {
                     panic!("timer event sender was unset for Rust callback system");
                 }
@@ -246,6 +256,9 @@ impl LiveTimer {
                 #[cfg(feature = "python")]
                 TimeEventCallback::Python(callback) => {
                     WorkerDispatch::SenderlessPython(callback.clone())
+                }
+                TimeEventCallback::Bound { .. } => {
+                    unreachable!("Senderless native binding is stripped")
                 }
                 TimeEventCallback::Rust(_) | TimeEventCallback::RustLocal(_) => {
                     unreachable!("senderless Rust callback rejected at start")
@@ -563,7 +576,7 @@ impl TimerTaskState {
 
 #[derive(Debug)]
 enum OwnerCallback {
-    Direct(TimeEventMessageFactory),
+    Direct(Box<TimeEventMessageFactory>),
     /// The callback is retained owner-side so a restarted timer (cancel or
     /// natural expiry closed the token) can register a fresh token.
     Registered {
@@ -575,7 +588,7 @@ enum OwnerCallback {
 
 #[derive(Clone, Debug)]
 enum WorkerDispatch {
-    Direct(TimeEventMessageFactory),
+    Direct(Box<TimeEventMessageFactory>),
     Registered(TimeEventCallbackToken),
     #[cfg(feature = "python")]
     SenderlessPython(Arc<crate::timer::PythonTimeEventCallback>),

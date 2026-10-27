@@ -26,6 +26,7 @@ use nautilus_common::{
         StrategySettlementResult,
     },
     msgbus,
+    runner::recorded::RuntimeDispatchScope,
 };
 use nautilus_core::UUID4;
 
@@ -83,6 +84,9 @@ impl LiveNode {
         marker: StrategySettlementMarker,
         eligible: bool,
     ) {
+        let _recorded = RuntimeDispatchScope::enter(|| {
+            nautilus_common::runner::recorded::describe_strategy_settlement(&marker)
+        });
         let same_registration = self.strategy_settlements.complete(&marker.query);
         let identity_matches = marker.native_instance_id == self.instance_id()
             && marker.query.expected_instance_id == self.instance_id()

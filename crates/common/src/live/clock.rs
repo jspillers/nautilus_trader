@@ -129,8 +129,28 @@ impl Clock for LiveClock {
             .is_some_and(|timer| !timer.is_expired())
     }
 
+    fn bind_actor_registration(
+        &mut self,
+        owner: crate::actor::registry::ActorRegistration,
+    ) -> bool {
+        self.callbacks.bind_actor_registration(owner);
+        true
+    }
+
     fn register_default_handler(&mut self, handler: TimeEventCallback) {
         self.callbacks.register_default_handler(handler);
+    }
+
+    fn actor_registration(&self) -> Option<crate::actor::registry::ActorRegistration> {
+        self.callbacks.actor_registration()
+    }
+
+    fn bind_execution_registration(&mut self, owner: crate::clock::ExecutionClockLease) -> bool {
+        self.callbacks.bind_execution_registration(owner)
+    }
+
+    fn execution_registration(&self) -> Option<crate::clock::ExecutionClockLease> {
+        self.callbacks.execution_registration()
     }
 
     fn cancel_default_handler(&mut self) {
@@ -158,15 +178,15 @@ impl Clock for LiveClock {
         )?;
 
         self.replace_existing_timer_if_needed(&name);
+        self.callbacks.next_timer_binding(name)?;
 
-        let callback = if let Some(callback) = callback {
-            self.callbacks.register_callback(name, callback.clone());
-            callback
-        } else {
-            self.callbacks
-                .get_callback(&name)
-                .expect("Callback should exist")
-        };
+        if let Some(callback) = callback {
+            self.callbacks.register_callback(name, callback);
+        }
+        let callback = self
+            .callbacks
+            .get_callback(&name)
+            .expect("Callback should exist");
 
         // Safe to calculate interval now that we've ensured alert_time_ns >= ts_now
         let interval_ns = create_valid_interval(alert_time_ns - ts_now);
@@ -219,15 +239,15 @@ impl Clock for LiveClock {
         )?;
 
         self.replace_existing_timer_if_needed(&name);
+        self.callbacks.next_timer_binding(name)?;
 
-        let callback = if let Some(callback) = callback {
-            self.callbacks.register_callback(name, callback.clone());
-            callback
-        } else {
-            self.callbacks
-                .get_callback(&name)
-                .expect("Callback should exist")
-        };
+        if let Some(callback) = callback {
+            self.callbacks.register_callback(name, callback);
+        }
+        let callback = self
+            .callbacks
+            .get_callback(&name)
+            .expect("Callback should exist");
 
         let interval_ns = create_valid_interval(interval_ns);
         let sender = self.resolve_time_event_sender();

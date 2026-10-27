@@ -32,6 +32,7 @@ use std::{
 use async_trait::async_trait;
 use nautilus_common::{
     clients::{ExecutionClient, ExecutionReportTask},
+    clock::{Clock, ExecutionClockLease},
     live::dst::task::JoinHandle,
     messages::execution::{
         BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
@@ -285,6 +286,15 @@ impl Drop for ReportTaskGuard {
 
 #[async_trait(?Send)]
 impl ExecutionClient for LiveExecutionClient {
+    fn bind_clock_registration(&mut self, registration: ExecutionClockLease) -> bool {
+        self.client
+            .try_borrow_mut()
+            .is_ok_and(|mut client| client.bind_clock_registration(registration))
+    }
+
+    fn recorded_clock(&self) -> Option<Rc<RefCell<dyn Clock>>> {
+        self.client.borrow().recorded_clock()
+    }
     fn is_connected(&self) -> bool {
         self.client.borrow().is_connected()
     }

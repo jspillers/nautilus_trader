@@ -53,6 +53,15 @@ pub trait DataClient {
     /// Returns the optional venue this client is associated with.
     fn venue(&self) -> Option<Venue>;
 
+    /// Returns whether this client admits exclusively explicit recorded inputs.
+    ///
+    /// Opt-in clients may initialize immutable instruments and native subscriptions,
+    /// but must not start network ingress, background producers or independent timers
+    /// during recorded execution. Ordinary live adapters remain unsupported by default.
+    fn supports_recorded_inputs(&self) -> bool {
+        false
+    }
+
     /// Starts the data client.
     ///
     /// # Errors

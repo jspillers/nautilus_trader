@@ -15,7 +15,7 @@
 
 //! Execution client trait definition.
 
-use std::{fmt::Debug, future::Future, pin::Pin};
+use std::{cell::RefCell, fmt::Debug, future::Future, pin::Pin, rc::Rc};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -107,6 +107,19 @@ pub trait ExecutionClient {
     fn venue(&self) -> Venue;
     fn oms_type(&self) -> OmsType;
     fn get_account(&self) -> Option<AccountAny>;
+
+    /// Binds an exclusive native client clock to its owning registry lease.
+    fn bind_clock_registration(
+        &mut self,
+        _registration: crate::clock::ExecutionClockLease,
+    ) -> bool {
+        false
+    }
+
+    /// Returns an exclusively owned clock supported for recorded native execution.
+    fn recorded_clock(&self) -> Option<Rc<RefCell<dyn crate::clock::Clock>>> {
+        None
+    }
 
     /// Returns whether this client's existing strategy-owned work is quiescent.
     ///

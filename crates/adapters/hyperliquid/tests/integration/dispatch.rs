@@ -179,6 +179,7 @@ fn assert_event_types(events: &[ExecutionEvent], expected: &[&str]) {
             ExecutionEvent::OrderCanceledBatch(_) => "OrderCanceledBatch",
             ExecutionEvent::Report(_) => "Report",
             ExecutionEvent::Account(_) => "Account",
+            ExecutionEvent::StrategySettlement(_) => "StrategySettlement",
         })
         .collect();
     assert_eq!(

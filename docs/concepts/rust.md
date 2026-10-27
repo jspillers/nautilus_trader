@@ -580,6 +580,112 @@ matching live-node boundary cannot certify settlement. Unsupported results and m
 replies must remain unqualified. The result is native typed Rust data; this API adds no
 dedicated external result decoder or Python facade.
 
+## Recorded native PAPER inputs
+
+`LiveNode` can capture optional `RuntimeDispatch` and `RuntimeDispatchComplete`
+witnesses at its existing owner-thread queue boundaries. Enable capture with
+`enable_runtime_dispatch_capture` before startup. The default EventStore registry
+encodes these facts and `TimeEventDispatch`, which preserves the actual native
+component or execution-client registration and callback/timer lease generations.
+Raw `TimeEvent` payloads remain unchanged. An absent completion denotes an open
+dispatch; it is not a completed input boundary.
+
+The recorded mode keeps the same LiveNode, DataEngine, RiskEngine, ExecutionEngine,
+Sandbox client, account calculations, native callback queue and execution queues.
+Construct the same complete cold-genesis PAPER composition with a native
+`ClockFactory::for_environment(Environment::Backtest)` through the builder's
+`with_native_clock_factory`. Every execution clock must be a native VirtualClock
+with its current execution-client registration. Every data client must explicitly
+support `DataClient::supports_recorded_inputs`; its default is false. Opt-in data
+clients may initialize immutable instruments and subscriptions but must not start
+network ingress, background producers or independent timers. Live external bus
+input, installed cache backing, preexisting financial cache state, external bus
+egress and cache/event-store restoration are rejected before connection. A fresh
+native event store may capture the derived offline run.
+
+`begin_recorded` validates original startup dispatches through Running, including
+the native instance, component and execution-client inventory. `process_recorded`
+accepts one original observation sequence and owner-dispatch time separately from
+its unchanged payload timestamps. Original normalized data enter the DataEngine.
+An original external `BusMessage` uses `RecordedRunnerInputKind::External` and the
+same live-node decoder, including its original encoding and topic. Any DataEvent
+produced by that decoder is recomputed queued work, not another original input.
+Callers must declare which native ingress their source used and inject each
+original input once. Arbitrary custom messages and external financial events or
+commands are outside this input scope.
+
+Timer inputs resolve native callback leases; they do not autonomously fire other
+timers. A queued execution event or command is consumed only from the recomputed
+native FIFO front after matching its channel, ordinal, routing and economics.
+Captured financial outputs are never executable inputs. A mismatched front remains
+owned by the runner without dispatch, and an admitted failure fails the offline run.
+Unsupported channels and stale or absent registrations fail closed.
+
+Maintenance input retains the due decisions made by the original native
+monotonic timer. Ordinary and recorded execution share the native due-check
+executor and reconciliation application. The recorded node retains the actual
+native report futures and polls recomputed work at the original completion turn.
+Pending or expired report futures, failed report collection and queue-monitor
+maintenance remain unsupported. Bulk client reports are correlated as unordered
+collections after omitting generated identities; their actual native application
+order is unchanged. Financial and ownership output comparison remains required.
+The regression runs beyond two seconds with inflight, open-order and position
+checks enabled, and requires actual report completions.
+
+A complete input inventory may explicitly exclude timers belonging to recreated
+nonfinancial source producers or measurement Actors. Their original normalized
+outputs must instead enter once through the native data boundary. Financial
+Strategies, execution clients and the configured native Controller cannot be timer
+exclusions. Read H0/H1 state before `end_recorded`, which uses ordinary native
+shutdown without advancing virtual time; shutdown hooks may produce residual work.
+
+Queue correlation omits generated timestamps and opaque execution IDs from the
+semantic witness only. Original and regenerated messages retain their complete
+identities in the native journal. A caller must compare actual generated financial
+and ownership outputs and retain those differences; this is not a promise of
+identical live wall-clock reads, UUIDs or generic replay of unsupported adapters.
+Qualification is specific to the complete captured composition, strategies,
+account/fee/latency models and supported input forms. The native regression uses
+live changing-price arrivals, enabled risk denials, calculated cash with fees,
+queued fill descendants, and peer timer progress before comparing a recorded run.
+
+### Observing actual persistent bootstrap
+
+A source node may select `enable_bootstrap_load_capture` while Idle after all
+startup components have registered. The native `BootstrapLoadWitness` is emitted
+at Running and contains buffered observations of actual database reads before
+the journal opened. Counts cover general data, every `CacheMap` field, both order
+indexes, the separate position-OMS read, and every registered Actor/Strategy
+state read. Successful cache rebuild/integrity and the complete component-state
+load pass are reported explicitly. No extra read or payload copy is used to
+infer emptiness.
+
+`BootstrapLoadWitness::is_complete_empty` accepts only the exact successful empty
+read inventory, native backing with cache/component load and save enabled, no
+flush, unchanged startup inventory and no parent run. Missing, failed, skipped,
+nonempty or incomplete observations cannot establish this cold source boundary.
+The witness is source evidence, not an executable input or a state snapshot.
+
+### Keeping signed source identity offline
+
+Signed session controls may bind the original native run ID. A caller can verify
+an immutable native prefix with `RecordedRunOrigin::from_prefix(path,
+expected_sha256)` and pass it through
+`EventStoreLifecycleOptions::with_recorded_origin`. This verifies native prefix,
+table and run integrity plus the whole-file SHA-256; it does not establish input
+closure or economic replay by itself.
+
+The lifecycle admits an origin only during native recorded startup under
+Sandbox and VirtualClock, with the same native instance and no parent. Derived
+boot refuses a nonempty destination directory without running predecessor
+recovery. Native redb uses exclusive file creation, so collisions cannot replace
+an existing source or output. The journal retains the original logical run ID;
+its actual constructed build/configuration identity remains in its manifest.
+`EventStoreLifecycle::recorded_origin` returns the separate typed relation between
+the verified source, actual constructed manifest identity and canonical new
+artifact path. Original signed inputs and source files are never rewritten.
+Ordinary startup and low-level event-store open cannot bypass this admission.
+
 ## Related guides
 
 - [Python](python.md) - Python ownership, runtime, and public API boundaries.

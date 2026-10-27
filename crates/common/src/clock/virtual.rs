@@ -257,8 +257,28 @@ impl Clock for VirtualClock {
             .is_some_and(|timer| !timer.is_expired())
     }
 
+    fn bind_actor_registration(
+        &mut self,
+        owner: crate::actor::registry::ActorRegistration,
+    ) -> bool {
+        self.callbacks.bind_actor_registration(owner);
+        true
+    }
+
     fn register_default_handler(&mut self, callback: TimeEventCallback) {
         self.callbacks.register_default_handler(callback);
+    }
+
+    fn actor_registration(&self) -> Option<crate::actor::registry::ActorRegistration> {
+        self.callbacks.actor_registration()
+    }
+
+    fn bind_execution_registration(&mut self, owner: super::ExecutionClockLease) -> bool {
+        self.callbacks.bind_execution_registration(owner)
+    }
+
+    fn execution_registration(&self) -> Option<super::ExecutionClockLease> {
+        self.callbacks.execution_registration()
     }
 
     fn cancel_default_handler(&mut self) {
@@ -286,6 +306,7 @@ impl Clock for VirtualClock {
         )?;
 
         self.replace_existing_timer_if_needed(&name);
+        self.callbacks.next_timer_binding(name)?;
 
         if let Some(callback) = callback {
             self.callbacks.register_callback(name, callback);
@@ -335,6 +356,7 @@ impl Clock for VirtualClock {
         )?;
 
         self.replace_existing_timer_if_needed(&name);
+        self.callbacks.next_timer_binding(name)?;
 
         if let Some(callback) = callback {
             self.callbacks.register_callback(name, callback);
@@ -352,6 +374,24 @@ impl Clock for VirtualClock {
         self.insert_timer(timer);
 
         Ok(())
+    }
+
+    fn recorded_time_event(
+        &mut self,
+        dispatch: &crate::timer::RecordedTimeEventDispatch,
+    ) -> anyhow::Result<TimeEventHandler> {
+        let handler = self.callbacks.recorded_handler(dispatch)?;
+        let timer = self
+            .timers
+            .get_mut(&dispatch.event.name)
+            .ok_or_else(|| anyhow::anyhow!("Recorded timer is absent or cancelled"))?;
+        anyhow::ensure!(!timer.is_expired(), "Recorded timer is expired");
+        anyhow::ensure!(
+            timer.next().is_some(),
+            "Recorded timer has no remaining firing"
+        );
+        self.compact_timer_queue();
+        Ok(handler)
     }
 
     fn next_time_ns(&self, name: &str) -> Option<UnixNanos> {
