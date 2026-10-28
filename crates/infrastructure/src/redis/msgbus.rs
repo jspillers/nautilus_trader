@@ -1614,6 +1614,30 @@ mod tests {
         assert!(received.try_recv().is_err());
     }
 
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_heartbeat_task() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx = super::super::publisher::PublishSender::new(tx, None, Vec::new());
+        let mut rx = super::super::publisher::PublishReceiver::from(rx);
+        let signal = Arc::new(AtomicBool::new(false));
+
+        // Start the heartbeat task with a short interval
+        let handle = tokio::spawn(run_heartbeat(1, signal.clone(), tx));
+
+        let heartbeat = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Stop the heartbeat task
+        signal.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        // Ensure heartbeats were sent
+        assert_eq!(heartbeat.topic, HEARTBEAT_TOPIC);
+    }
+
     fn backing_with_stream_receiver(
         stream_rx: tokio::sync::mpsc::Receiver<BusMessage>,
     ) -> RedisMessageBusBacking {
@@ -2447,49 +2471,8 @@ mod serial_tests {
         MessageBusBacking::close(&mut db);
     }
 
-    #[rstest]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_heartbeat_task() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<BusMessage>();
-        let signal = Arc::new(AtomicBool::new(false));
-
-        // Start the heartbeat task with a short interval
-        let handle = tokio::spawn(run_heartbeat(1, signal.clone(), tx, None));
-
-        let heartbeat = receive_unbounded_bus_message(&mut rx, Duration::from_secs(2)).await;
-
-        // Stop the heartbeat task
-        signal.store(true, Ordering::Relaxed);
-        handle.await.unwrap();
-
-        // Ensure heartbeats were sent
-        assert_eq!(heartbeat.topic, HEARTBEAT_TOPIC);
-    }
-
     async fn receive_bus_message(
         rx: &mut tokio::sync::mpsc::Receiver<BusMessage>,
-        timeout: Duration,
-    ) -> BusMessage {
-        let mut received = None;
-
-        wait_until_async(
-            || {
-                if received.is_none() {
-                    received = rx.try_recv().ok();
-                }
-
-                let has_received = received.is_some();
-                async move { has_received }
-            },
-            timeout,
-        )
-        .await;
-
-        received.unwrap()
-    }
-
-    async fn receive_unbounded_bus_message(
-        rx: &mut tokio::sync::mpsc::UnboundedReceiver<BusMessage>,
         timeout: Duration,
     ) -> BusMessage {
         let mut received = None;
