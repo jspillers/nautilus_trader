@@ -33,6 +33,7 @@ struct QueueEvidence {
     enqueued: Vec<QuoteTick>,
     delivered: Vec<QuoteTick>,
     timer_quotes: Vec<Option<QuoteTick>>,
+    timer_events: Vec<TimeEvent>,
 }
 
 #[derive(Debug)]
@@ -68,6 +69,7 @@ impl DataActor for QueueProbe {
             .borrow_mut()
             .timer_quotes
             .push(self.cache_ref().quote(&IDS[0].into()).copied());
+        self.evidence.borrow_mut().timer_events.push(event.clone());
         Ok(())
     }
 
@@ -275,8 +277,10 @@ enum QueueCase {
     UnexpectedTimer,
     DirectData,
     StaleTimer,
+    StaleOwner,
     WrongTimerOrdinal,
-    FutureTimer,
+    FutureScheduledTimer,
+    FutureInitTimer,
 }
 
 #[rstest]
@@ -287,8 +291,10 @@ enum QueueCase {
 #[case::unexpected_timer(QueueCase::UnexpectedTimer)]
 #[case::direct_data(QueueCase::DirectData)]
 #[case::stale_timer(QueueCase::StaleTimer)]
+#[case::stale_owner(QueueCase::StaleOwner)]
 #[case::wrong_timer_ordinal(QueueCase::WrongTimerOrdinal)]
-#[case::future_timer(QueueCase::FutureTimer)]
+#[case::future_scheduled_timer(QueueCase::FutureScheduledTimer)]
+#[case::future_init_timer(QueueCase::FutureInitTimer)]
 fn recorded_timer_preserves_recomputed_data_and_strict_native_guards(
     #[case] case: QueueCase,
 ) -> anyhow::Result<()> {
@@ -320,7 +326,8 @@ fn recorded_timer_preserves_recomputed_data_and_strict_native_guards(
                 anyhow::ensure!(evidence.borrow().enqueued == vec![quote("first")?]);
             }
 
-            if matches!(case, QueueCase::Legal | QueueCase::ReorderedFront) {
+            let legal = matches!(case, QueueCase::Legal | QueueCase::FutureScheduledTimer);
+            if legal || matches!(case, QueueCase::ReorderedFront) {
                 let message = external("second")?;
                 input(
                     &mut node,
@@ -355,8 +362,21 @@ fn recorded_timer_preserves_recomputed_data_and_strict_native_guards(
                         dispatch.binding.timer_generation = Some(999);
                     }
 
-                    if matches!(case, QueueCase::FutureTimer) {
+                    if matches!(case, QueueCase::StaleOwner) {
+                        dispatch.actual_owner.as_mut().unwrap().generation += 1;
+                    }
+
+                    if matches!(case, QueueCase::FutureScheduledTimer) {
                         dispatch.event.ts_event = 11.into();
+                    }
+
+                    if matches!(case, QueueCase::FutureInitTimer) {
+                        dispatch.event.ts_init = 11.into();
+                    }
+                    let expected_event = dispatch.event.clone();
+                    if matches!(case, QueueCase::FutureScheduledTimer) {
+                        anyhow::ensure!(expected_event.ts_event > UnixNanos::from(10));
+                        anyhow::ensure!(expected_event.ts_init <= UnixNanos::from(10));
                     }
                     let mut witness = timer.witness;
                     if matches!(case, QueueCase::WrongTimerOrdinal) {
@@ -374,22 +394,26 @@ fn recorded_timer_preserves_recomputed_data_and_strict_native_guards(
                         case,
                         QueueCase::UnexpectedTimer
                             | QueueCase::StaleTimer
+                            | QueueCase::StaleOwner
                             | QueueCase::WrongTimerOrdinal
-                            | QueueCase::FutureTimer
+                            | QueueCase::FutureInitTimer
                     ) {
                         let e = result.unwrap_err();
                         let expected = match case {
                             QueueCase::UnexpectedTimer => "Unexpected live timer is queued",
                             QueueCase::StaleTimer => "timer registration changed",
+                            QueueCase::StaleOwner => "dispatch clock is invalid",
                             QueueCase::WrongTimerOrdinal => "ordinal or capability is unsupported",
-                            QueueCase::FutureTimer => "dispatch clock is invalid",
+                            QueueCase::FutureInitTimer => "dispatch clock is invalid",
                             _ => unreachable!(),
                         };
                         anyhow::ensure!(e.to_string().contains(expected));
                         anyhow::ensure!(evidence.borrow().timer_quotes.is_empty());
+                        anyhow::ensure!(evidence.borrow().timer_events.is_empty());
                     } else {
                         result?;
                         anyhow::ensure!(evidence.borrow().timer_quotes == vec![None]);
+                        anyhow::ensure!(evidence.borrow().timer_events == vec![expected_event]);
                         anyhow::ensure!(evidence.borrow().delivered.is_empty());
                         let mut expected = if matches!(case, QueueCase::ReorderedFront) {
                             quote("second")?
@@ -408,7 +432,7 @@ fn recorded_timer_preserves_recomputed_data_and_strict_native_guards(
                             RecordedRunnerInputKind::Dispatch,
                         );
 
-                        if matches!(case, QueueCase::Legal) {
+                        if legal {
                             result?;
                             anyhow::ensure!(evidence.borrow().delivered == vec![quote("first")?]);
                             input(
@@ -434,7 +458,7 @@ fn recorded_timer_preserves_recomputed_data_and_strict_native_guards(
                 }
             }
 
-            if !matches!(case, QueueCase::Legal) {
+            if !legal {
                 anyhow::ensure!(evidence.borrow().delivered.is_empty());
                 anyhow::ensure!(node.kernel().cache.borrow().quote(&IDS[0].into()).is_none());
             }

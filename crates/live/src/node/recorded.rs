@@ -459,9 +459,10 @@ impl LiveNode {
                         .recorded_time_empty(),
                     "Unexpected live timer is queued during recorded timer execution"
                 );
+
+                // Scheduled deadlines are payload facts, not prior native clock observations
                 anyhow::ensure!(
                     dispatch.has_current_native_owner()
-                        && dispatch.event.ts_event <= input.observed_at
                         && dispatch.event.ts_init <= input.observed_at,
                     "Source callback lease or dispatch clock is invalid"
                 );
