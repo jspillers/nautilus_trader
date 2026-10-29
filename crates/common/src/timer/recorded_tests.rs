@@ -128,7 +128,11 @@ fn recorded_timer_resolves_original_payload_and_fresh_registration_uuid() {
 #[case("owner")]
 #[case("actual")]
 #[case("unbound")]
-fn recorded_timer_rejects_binding_mismatch_without_consuming(#[case] mismatch: &str) {
+#[case("unknown")]
+fn recorded_timer_rejects_binding_mismatch_without_consuming(
+    #[case] mismatch: &str,
+    #[values(false, true)] cancelled: bool,
+) {
     let (registered, calls) = owner("recorded-mismatch");
     let mut clock = clock(registered);
     let mut dispatch = dispatch(&clock, registered);
@@ -138,11 +142,20 @@ fn recorded_timer_rejects_binding_mismatch_without_consuming(#[case] mismatch: &
         "owner" => dispatch.binding.owner.as_mut().unwrap().generation += 1,
         "actual" => dispatch.actual_owner.as_mut().unwrap().registration_id = UUID4::new(),
         "unbound" => dispatch.binding.target = None,
+        "unknown" => dispatch.event.name = "never-armed".into(),
         _ => unreachable!(),
     }
+
+    if cancelled {
+        clock.cancel_timer("recorded");
+    }
+
     assert!(clock.recorded_time_event(&dispatch).is_err());
     assert!(calls.borrow().is_empty());
-    assert_eq!(clock.next_time_ns("recorded"), Some(10.into()));
+    assert_eq!(
+        clock.next_time_ns("recorded"),
+        (!cancelled).then_some(10.into())
+    );
     deregister_actor(&registered.actor_id);
 }
 
@@ -172,12 +185,11 @@ fn queued_native_callback_witness_preserves_lease_and_actual_replacement() {
 }
 
 #[rstest]
-fn recorded_timer_rejects_cancelled_and_replaced_native_timer() {
+fn recorded_timer_rejects_replaced_native_timer() {
     let (registered, calls) = owner("recorded-timer-replaced");
     let mut clock = clock(registered);
     let dispatch = dispatch(&clock, registered);
     clock.cancel_timer("recorded");
-    assert!(clock.recorded_time_event(&dispatch).is_err());
     clock
         .set_timer_ns(
             "recorded",
@@ -191,6 +203,37 @@ fn recorded_timer_rejects_cancelled_and_replaced_native_timer() {
         .unwrap();
     assert!(clock.recorded_time_event(&dispatch).is_err());
     assert!(calls.borrow().is_empty());
+    deregister_actor(&registered.actor_id);
+}
+
+#[rstest]
+fn recorded_timer_resolves_expired_registration_without_rearming() {
+    let (registered, calls) = owner("recorded-expired");
+    let mut clock = clock(registered);
+    clock
+        .set_time_alert_ns("expired", 10.into(), None, None)
+        .unwrap();
+    let events = clock.advance_time(10.into(), true);
+    let handler = clock
+        .match_handlers(events)
+        .into_iter()
+        .find(|handler| handler.event.name.as_str() == "expired")
+        .unwrap();
+    let queued = TimeEventMessage::new(handler.event, handler.callback);
+    let tap = Rc::new(Tap::default());
+    msgbus::set_bus_tap(tap.clone());
+    assert!(queued.dispatch());
+    msgbus::clear_bus_tap();
+    let dispatch = tap.0.borrow()[0].clone();
+    assert!(dispatch.has_current_native_owner());
+    assert!(!clock.timer_exists(&"expired".into()));
+    let before = clock.timestamp_ns();
+    clock.recorded_time_event(&dispatch).unwrap().run();
+    assert_eq!(calls.borrow().len(), 2);
+    assert_eq!(calls.borrow()[0], calls.borrow()[1]);
+    assert_eq!(clock.timestamp_ns(), before);
+    assert!(!clock.timer_exists(&"expired".into()));
+    assert_eq!(clock.next_time_ns("recorded"), Some(20.into()));
     deregister_actor(&registered.actor_id);
 }
 

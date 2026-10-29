@@ -100,7 +100,10 @@ pub trait Clock: Debug + Any {
         None
     }
 
-    /// Resolves one recorded native timer firing without advancing other timers.
+    /// Resolves one attested native callback dispatch without advancing other timers.
+    ///
+    /// Cancellation or expiry does not revoke an already acquired live callback lease.
+    /// The exact native owner, callback and timer registration must still match.
     ///
     /// # Errors
     ///

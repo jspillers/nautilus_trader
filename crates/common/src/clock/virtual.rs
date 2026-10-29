@@ -381,15 +381,18 @@ impl Clock for VirtualClock {
         dispatch: &crate::timer::RecordedTimeEventDispatch,
     ) -> anyhow::Result<TimeEventHandler> {
         let handler = self.callbacks.recorded_handler(dispatch)?;
-        let timer = self
-            .timers
-            .get_mut(&dispatch.event.name)
-            .ok_or_else(|| anyhow::anyhow!("Recorded timer is absent or cancelled"))?;
-        anyhow::ensure!(!timer.is_expired(), "Recorded timer is expired");
-        anyhow::ensure!(
-            timer.next().is_some(),
-            "Recorded timer has no remaining firing"
-        );
+
+        // A live callback lease may already be queued at cancellation or expiry,
+        // preserve the witnessed callback after exact native registration checks.
+        if let Some(timer) = self.timers.get_mut(&dispatch.event.name)
+            && !timer.is_expired()
+        {
+            anyhow::ensure!(
+                timer.next().is_some(),
+                "Recorded timer has no remaining firing"
+            );
+        }
+
         self.compact_timer_queue();
         Ok(handler)
     }
