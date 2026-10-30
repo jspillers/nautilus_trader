@@ -83,11 +83,22 @@ pub trait Component {
     /// Returns the current state of the component.
     fn state(&self) -> ComponentState;
 
+    /// Returns a native witness of accepted lifecycle transitions, when supported.
+    ///
+    /// A supported revision never resets within this component incarnation. It
+    /// advances before a lifecycle hook runs, including when that hook fails.
+    /// Custom components default to unsupported and must not infer this value
+    /// from their current state or a sampled event count.
+    fn lifecycle_revision(&self) -> Option<u64> {
+        None
+    }
+
     /// Transition the component with the state trigger.
     ///
     /// # Errors
     ///
-    /// Returns an error if the `trigger` is an invalid transition from the current state.
+    /// Returns an error if the `trigger` is an invalid transition from the current state
+    /// or a supported lifecycle revision cannot advance without overflowing.
     fn transition_state(&mut self, trigger: ComponentTrigger) -> anyhow::Result<()>;
 
     /// Returns whether the component is ready.
@@ -613,6 +624,37 @@ pub fn component_state(id: &Ustr) -> anyhow::Result<ComponentState> {
     }
 }
 
+/// Returns the optional native lifecycle revision of a component in the global registry.
+///
+/// # Errors
+///
+/// - Returns an error if the component is not found.
+/// - Returns an error if the component is already borrowed.
+pub fn component_lifecycle_revision(id: &Ustr) -> anyhow::Result<Option<u64>> {
+    let component_ref = with_component_registry(|registry| {
+        let component_ref = registry
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Component '{id}' not found in global registry"))?;
+
+        if !registry.try_borrow(*id) {
+            anyhow::bail!(
+                "Component '{id}' is already mutably borrowed. \
+                 This would create aliasing mutable references (undefined behavior)."
+            );
+        }
+
+        Ok::<_, anyhow::Error>(component_ref)
+    })?;
+
+    let _guard = BorrowGuard::new(*id);
+
+    // SAFETY: Borrow tracking ensures there is no concurrent mutable lifecycle access.
+    unsafe {
+        let component = &*component_ref.get();
+        Ok(component.lifecycle_revision())
+    }
+}
+
 /// Safely calls `stop()` on a component in the global registry.
 ///
 /// # Errors
@@ -915,6 +957,23 @@ mod tests {
 
     static NO_PANIC: AtomicBool = AtomicBool::new(false);
     static DO_PANIC: AtomicBool = AtomicBool::new(true);
+
+    #[rstest]
+    fn test_component_lifecycle_revision_custom_unsupported_and_borrow_checked() {
+        clear_component_registry();
+        let id = Ustr::from("custom-revision");
+        assert!(component_lifecycle_revision(&id).is_err());
+        let component = TestComponent::new("custom-revision", &NO_PANIC);
+        assert_eq!(component.lifecycle_revision(), None);
+        with_component_registry(|registry| {
+            registry.insert(id, Rc::new(UnsafeCell::new(component)));
+        });
+        assert_eq!(component_lifecycle_revision(&id).unwrap(), None);
+        with_component_registry(|registry| assert!(registry.try_borrow(id)));
+        assert!(component_lifecycle_revision(&id).is_err());
+        with_component_registry(|registry| registry.release_borrow(&id));
+        assert_eq!(component_lifecycle_revision(&id).unwrap(), None);
+    }
 
     #[rstest]
     fn test_component_borrow_tracking_prevents_double_borrow() {

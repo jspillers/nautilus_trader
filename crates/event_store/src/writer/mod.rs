@@ -27,6 +27,9 @@
 
 pub mod halt;
 
+#[cfg(not(madsim))]
+mod budget;
+
 // `batcher` carries thread-loop routines gated out under cfg(madsim) since the
 // synchronous path bypasses the channel and the run loop, but `build_append_entry`
 // is reused in both paths so the module stays compiled either way.
@@ -59,6 +62,10 @@ pub const DEFAULT_HALT_THRESHOLD: Duration = Duration::from_millis(250);
 pub struct WriterConfig {
     /// Capacity of the bounded `sync_channel` between submit and the writer thread.
     pub channel_capacity: usize,
+    /// Optional accounted bytes held by queued messages and uncommitted batches.
+    pub max_pending_bytes: Option<usize>,
+    /// Optional accounted batch size which forces a commit before count/latency limits.
+    pub max_batch_bytes: Option<usize>,
     /// Maximum entries collected before a commit is forced.
     pub max_batch_entries: usize,
     /// Maximum time a batch may accumulate before a commit is forced.
@@ -74,12 +81,28 @@ impl Default for WriterConfig {
     fn default() -> Self {
         Self {
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            max_pending_bytes: None,
+            max_batch_bytes: None,
             max_batch_entries: DEFAULT_MAX_BATCH_ENTRIES,
             max_batch_latency: DEFAULT_MAX_BATCH_LATENCY,
             halt_threshold: DEFAULT_HALT_THRESHOLD,
             nonblocking_submit: false,
         }
     }
+}
+
+/// Accounted pending memory, including entries currently awaiting durable append.
+///
+/// These counters exclude the backend cache, fixed channel allocation and transient
+/// backend encoding buffers. Accounting is enabled only with a configured byte ceiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriterBufferStats {
+    /// Current accounted bytes awaiting durable acknowledgement.
+    pub pending_bytes: usize,
+    /// Highest accounted pending byte usage observed by this writer.
+    pub peak_pending_bytes: usize,
+    /// Configured byte ceiling, or `None` when byte accounting is disabled.
+    pub max_pending_bytes: Option<usize>,
 }
 
 /// An unsealed entry handed to [`EventStoreWriter::submit`].
@@ -129,6 +152,14 @@ pub enum SubmitError {
     /// Nonblocking submission found the bounded queue full and signaled halt.
     #[error("nonblocking event store queue is full")]
     QueueFull,
+    /// Nonblocking submission exhausted its accounted pending-memory budget.
+    #[error("event store pending byte budget is full: limit={limit}, required={required}")]
+    PendingBytesFull {
+        /// Configured accounted-byte ceiling.
+        limit: usize,
+        /// Accounted bytes required by the rejected message.
+        required: usize,
+    },
     /// The writer is shut down or the writer thread has exited.
     #[error("writer is closed")]
     Closed,
@@ -147,6 +178,7 @@ pub enum SubmitError {
 mod imp {
     use std::{
         fmt::Debug,
+        path::PathBuf,
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicU64, Ordering},
@@ -160,7 +192,8 @@ mod imp {
 
     use super::{
         EntryDraft, SnapshotAnchor, SubmitError, WriterConfig,
-        batcher::{self, HaltSink, WriterMessage},
+        batcher::{self, BudgetedMessage, HaltSink, WriterMessage},
+        budget::PendingBudget,
         halt::{self, HaltCallback, HaltReason},
     };
     use crate::{backend::EventStore, error::EventStoreError};
@@ -170,12 +203,15 @@ mod imp {
 
     /// The dedicated event store writer.
     pub struct EventStoreWriter {
-        tx: Option<SyncSender<WriterMessage>>,
+        tx: Option<SyncSender<BudgetedMessage>>,
+        budget: Arc<PendingBudget>,
         handle: Option<JoinHandle<()>>,
         high_watermark: Arc<AtomicU64>,
         halt: HaltCallback,
         halt_threshold: Duration,
         nonblocking_submit: bool,
+        shutdown_drain: AtomicBool,
+        checkpoint_active: Arc<AtomicBool>,
         // Shared with the writer thread so any halt fire latches it exactly once;
         // subsequent submits return Closed instead of re-entering the retry loop.
         halted: Arc<AtomicBool>,
@@ -217,7 +253,8 @@ mod imp {
             let halted = Arc::new(AtomicBool::new(false));
             // Zero capacity is a rendezvous channel: a commit stall longer than
             // the halt threshold would fail-stop instead of being absorbed.
-            let (tx, rx) = mpsc::sync_channel::<WriterMessage>(config.channel_capacity.max(1));
+            let (tx, rx) = mpsc::sync_channel::<BudgetedMessage>(config.channel_capacity.max(1));
+            let budget = Arc::new(PendingBudget::new(config.max_pending_bytes));
 
             let watermark_for_thread = Arc::clone(&high_watermark);
             let halt_for_thread = Arc::clone(&halt);
@@ -242,11 +279,14 @@ mod imp {
 
             Ok(Self {
                 tx: Some(tx),
+                budget,
                 handle: Some(handle),
                 high_watermark,
                 halt,
                 halt_threshold,
                 nonblocking_submit,
+                shutdown_drain: AtomicBool::new(false),
+                checkpoint_active: Arc::new(AtomicBool::new(false)),
                 halted,
                 clock,
             })
@@ -290,6 +330,9 @@ mod imp {
                     threshold: self.halt_threshold,
                 }),
                 Err(EnqueueFailure::Full) => Err(SubmitError::QueueFull),
+                Err(EnqueueFailure::Bytes { limit, required }) => {
+                    Err(SubmitError::PendingBytesFull { limit, required })
+                }
                 Err(EnqueueFailure::Closed) => Err(SubmitError::Closed),
             }
         }
@@ -341,6 +384,11 @@ mod imp {
                             self.halt_threshold,
                         )));
                     }
+                    EnqueueFailure::Bytes { limit, required } => {
+                        return Err(EventStoreError::Backend(format!(
+                            "event store pending byte budget is full: limit={limit}, required={required}"
+                        )));
+                    }
                     EnqueueFailure::Full => {
                         return Err(EventStoreError::Backend(
                             "nonblocking event store queue is full".to_string(),
@@ -366,10 +414,93 @@ mod imp {
             }
         }
 
+        /// Starts one optional immutable-prefix export without waiting on the node owner thread.
+        ///
+        /// The existing writer channel establishes the durable boundary. A single owned export
+        /// worker performs native reads and writes; dropping its ticket requests cancellation.
+        /// Optional admission pressure returns `Busy` without invoking capture's halt callback.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error for invalid limits, active export, a full/closed writer queue or a
+        /// worker-spawn failure. Acceptance is not publication or replay qualification.
+        pub fn start_prefix_checkpoint(
+            &self,
+            destination: impl Into<PathBuf>,
+            limits: crate::checkpoint::CheckpointLimits,
+        ) -> Result<crate::checkpoint::CheckpointJob, crate::checkpoint::CheckpointError> {
+            use crate::checkpoint::{CheckpointError, spawn_export};
+            limits.validate()?;
+
+            if self.halted.load(Ordering::Acquire) {
+                return Err(CheckpointError::Source(EventStoreError::Closed));
+            }
+
+            if self
+                .checkpoint_active
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(CheckpointError::Busy);
+            }
+            let admitted = (|| {
+                let tx = self
+                    .tx
+                    .as_ref()
+                    .ok_or(CheckpointError::Source(EventStoreError::Closed))?;
+                let started = Instant::now();
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let (ack, frozen) = mpsc::sync_channel(1);
+                let message = WriterMessage::FreezePrefix {
+                    ack,
+                    cancelled: cancelled.clone(),
+                };
+                let bytes = message.accounted_bytes();
+                let reservation = self
+                    .budget
+                    .reserve(bytes)
+                    .map_err(|()| CheckpointError::Busy)?;
+                tx.try_send(BudgetedMessage {
+                    message,
+                    reservation,
+                    bytes,
+                })
+                .map_err(|e| match e {
+                    TrySendError::Full(_) => CheckpointError::Busy,
+                    TrySendError::Disconnected(_) => {
+                        CheckpointError::Source(EventStoreError::Closed)
+                    }
+                })?;
+                spawn_export(
+                    frozen,
+                    destination.into(),
+                    limits,
+                    cancelled,
+                    self.checkpoint_active.clone(),
+                    started,
+                )
+            })();
+
+            if admitted.is_err() {
+                self.checkpoint_active.store(false, Ordering::Release);
+            }
+            admitted
+        }
+
         /// Returns whether captures and snapshot callbacks must avoid waiting for disk.
         #[must_use]
         pub fn nonblocking_submit(&self) -> bool {
-            self.nonblocking_submit
+            self.nonblocking_submit && !self.shutdown_drain.load(Ordering::Acquire)
+        }
+
+        /// Selects bounded writer backpressure for residual capture after trading stops.
+        ///
+        /// This irreversible lifecycle transition is only for an owner which has stopped
+        /// the trader and closed external ingress before draining its remaining events,
+        /// the existing queue, disk writer, halt threshold and durable acknowledgements
+        /// remain authoritative, and an already halted run cannot be rearmed.
+        pub fn begin_shutdown_drain(&self) {
+            self.shutdown_drain.store(true, Ordering::Release);
         }
 
         /// Queues an ordered snapshot anchor without awaiting its durable acknowledgement.
@@ -403,11 +534,63 @@ mod imp {
 
         fn enqueue_with_backpressure(
             &self,
-            tx: &SyncSender<WriterMessage>,
-            mut pending: WriterMessage,
+            tx: &SyncSender<BudgetedMessage>,
+            pending: WriterMessage,
             start: Instant,
         ) -> Result<(), EnqueueFailure> {
-            if self.nonblocking_submit {
+            self.enqueue_with_mode(tx, pending, start, self.nonblocking_submit())
+        }
+
+        fn enqueue_with_mode(
+            &self,
+            tx: &SyncSender<BudgetedMessage>,
+            mut message: WriterMessage,
+            start: Instant,
+            nonblocking: bool,
+        ) -> Result<(), EnqueueFailure> {
+            let bytes = message.accounted_bytes();
+            let reservation = loop {
+                if self.halted.load(Ordering::Acquire) {
+                    return Err(EnqueueFailure::Closed);
+                }
+                let elapsed = start.elapsed();
+                if !nonblocking && elapsed >= self.halt_threshold {
+                    self.signal_backpressure_stall(elapsed);
+                    return Err(EnqueueFailure::Stalled(elapsed));
+                }
+
+                if let Ok(reservation) = self.budget.reserve(bytes) {
+                    break reservation;
+                }
+
+                if nonblocking {
+                    let limit = self.budget.stats().max_pending_bytes.unwrap_or_default();
+                    halt::fire_once(
+                        &self.halt,
+                        &self.halted,
+                        HaltReason::PendingBytesFull {
+                            limit,
+                            required: bytes,
+                        },
+                    );
+                    return Err(EnqueueFailure::Bytes {
+                        limit,
+                        required: bytes,
+                    });
+                }
+                thread::sleep(SUBMIT_RETRY_INTERVAL);
+            };
+
+            if reservation.is_some() {
+                message.compact_payload();
+            }
+            let mut pending = BudgetedMessage {
+                message,
+                reservation,
+                bytes,
+            };
+
+            if nonblocking {
                 return match tx.try_send(pending) {
                     Ok(()) => Ok(()),
                     Err(TrySendError::Full(_)) => {
@@ -417,19 +600,12 @@ mod imp {
                     Err(TrySendError::Disconnected(_)) => Err(EnqueueFailure::Closed),
                 };
             }
-            // Check elapsed before each try_send (including after a sleep) so that a
-            // stall which exceeds the threshold fires halt even when the next attempt
-            // would have succeeded. The first iteration's elapsed is ~0, so it falls
-            // through to try_send.
+
             loop {
-                // A halt latched while this submit waited is terminal: refuse the
-                // entry instead of accepting one the doomed writer thread would drop.
                 if self.halted.load(Ordering::Acquire) {
                     return Err(EnqueueFailure::Closed);
                 }
-
                 let elapsed = start.elapsed();
-
                 if elapsed >= self.halt_threshold {
                     self.signal_backpressure_stall(elapsed);
                     return Err(EnqueueFailure::Stalled(elapsed));
@@ -444,6 +620,12 @@ mod imp {
                     Err(TrySendError::Disconnected(_)) => return Err(EnqueueFailure::Closed),
                 }
             }
+        }
+
+        /// Returns byte reservations still held by the queue or durable append.
+        #[must_use]
+        pub fn buffer_stats(&self) -> super::WriterBufferStats {
+            self.budget.stats()
         }
 
         fn signal_backpressure_stall(&self, stalled_for: Duration) {
@@ -473,9 +655,41 @@ mod imp {
                 .ok_or_else(|| EventStoreError::Backend("writer already closed".to_string()))?;
 
             let (ack_tx, ack_rx) = mpsc::sync_channel::<Result<u64, EventStoreError>>(1);
-            tx.send(WriterMessage::Close {
+            let mut message = WriterMessage::Close {
                 run_ended,
                 ack: ack_tx,
+            };
+            let bytes = message.accounted_bytes();
+
+            if self
+                .budget
+                .stats()
+                .max_pending_bytes
+                .is_some_and(|limit| bytes > limit)
+            {
+                return Err(EventStoreError::Backend(
+                    "terminal entry exceeds pending byte budget".to_string(),
+                ));
+            }
+            // Close already waits for durable drain without the live submit deadline.
+            // Preserve that lifecycle contract while keeping the terminal payload bounded.
+            let reservation = loop {
+                match self.budget.reserve(bytes) {
+                    Ok(reservation) => break reservation,
+                    Err(()) if self.halted.load(Ordering::Acquire) => {
+                        return Err(EventStoreError::Closed);
+                    }
+                    Err(()) => thread::sleep(SUBMIT_RETRY_INTERVAL),
+                }
+            };
+
+            if reservation.is_some() {
+                message.compact_payload();
+            }
+            tx.send(BudgetedMessage {
+                message,
+                reservation,
+                bytes,
             })
             .map_err(|_| EventStoreError::Backend("writer thread disconnected".to_string()))?;
             // Drop the producer so the writer's recv loop will see Disconnected after it
@@ -497,6 +711,7 @@ mod imp {
 
     enum EnqueueFailure {
         Full,
+        Bytes { limit: usize, required: usize },
         Stalled(Duration),
         Closed,
     }
@@ -659,6 +874,37 @@ mod imp {
                 }
             }
         }
+
+        /// Rejects asynchronous export in deterministic synchronous simulation.
+        ///
+        /// # Errors
+        ///
+        /// Always returns an explicit unsupported error; simulation does not spawn export workers.
+        pub fn start_prefix_checkpoint(
+            &self,
+            _destination: impl Into<std::path::PathBuf>,
+            _limits: crate::checkpoint::CheckpointLimits,
+        ) -> Result<crate::checkpoint::CheckpointJob, crate::checkpoint::CheckpointError> {
+            Err(crate::checkpoint::CheckpointError::Source(
+                EventStoreError::Backend(
+                    "asynchronous prefix export is unavailable under deterministic simulation"
+                        .to_string(),
+                ),
+            ))
+        }
+
+        /// Returns empty usage because deterministic simulation has no writer queue.
+        #[must_use]
+        pub fn buffer_stats(&self) -> super::WriterBufferStats {
+            super::WriterBufferStats {
+                pending_bytes: 0,
+                peak_pending_bytes: 0,
+                max_pending_bytes: None,
+            }
+        }
+
+        /// Leaves deterministic synchronous simulation unchanged during shutdown.
+        pub fn begin_shutdown_drain(&self) {}
 
         /// Simulation keeps deterministic synchronous commits without a background queue.
         #[must_use]
@@ -864,15 +1110,15 @@ mod tests {
 
     /// `EventStore` wrapper that blocks `append_batch` until a release flag flips.
     #[derive(Debug)]
-    struct BlockingBackend {
-        inner: Arc<Mutex<MemoryBackend>>,
+    struct BlockingBackend<B: EventStore> {
+        inner: Arc<Mutex<B>>,
         gate: Arc<(Mutex<bool>, parking_lot::Condvar)>,
         appends_seen: Arc<AtomicUsize>,
     }
 
-    impl BlockingBackend {
+    impl<B: EventStore> BlockingBackend<B> {
         fn new(
-            inner: Arc<Mutex<MemoryBackend>>,
+            inner: Arc<Mutex<B>>,
             gate: Arc<(Mutex<bool>, parking_lot::Condvar)>,
             appends_seen: Arc<AtomicUsize>,
         ) -> Self {
@@ -884,7 +1130,7 @@ mod tests {
         }
     }
 
-    impl EventStore for BlockingBackend {
+    impl<B: EventStore> EventStore for BlockingBackend<B> {
         fn open_run(&mut self, _: RunManifest) -> Result<(), EventStoreError> {
             unreachable!("test wrapper does not forward open_run")
         }
@@ -939,6 +1185,365 @@ mod tests {
         fn high_watermark(&self) -> Result<u64, EventStoreError> {
             self.inner.lock().high_watermark()
         }
+    }
+
+    #[rstest]
+    #[case::original_kalshi(1024, 178, false)]
+    #[case::bounded_kalshi(10000, 178, true)]
+    #[case::original_polymarket(1024, 422, false)]
+    #[case::bounded_polymarket(10000, 422, true)]
+    fn nonblocking_rollover_burst_with_stalled_durable_backend(
+        #[case] capacity: usize,
+        #[case] payload_bytes: usize,
+        #[case] expected_pass: bool,
+    ) {
+        use crate::backend::RedbBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let mut redb = RedbBackend::new(dir.path());
+        redb.open_run(manifest("burst-native-redb")).unwrap();
+        let inner = Arc::new(Mutex::new(redb));
+        let gate = Arc::new((Mutex::new(false), parking_lot::Condvar::new()));
+        let appends = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let reasons = Arc::clone(&captured);
+
+        let writer = EventStoreWriter::spawn(
+            Box::new(BlockingBackend::new(
+                Arc::clone(&inner),
+                Arc::clone(&gate),
+                Arc::clone(&appends),
+            )),
+            get_atomic_clock_static(),
+            Arc::new(move |reason| reasons.lock().push(reason)),
+            WriterConfig {
+                channel_capacity: capacity,
+                max_pending_bytes: Some(32 * 1024 * 1024),
+                max_batch_bytes: Some(1024 * 1024),
+                nonblocking_submit: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for i in 0..100 {
+            writer.submit(entry_draft(i)).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while appends.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let writer_blocked = appends.load(Ordering::SeqCst) != 0;
+        let started = Instant::now();
+        let mut accepted = 0;
+
+        for i in 0..1284 {
+            let mut draft = entry_draft(100 + i);
+            let size = if i % 256 == 255 { 70701 } else { payload_bytes };
+            draft.payload = Bytes::from(vec![0x42; size]);
+
+            if writer.submit(draft).is_err() {
+                break;
+            }
+            accepted += 1;
+        }
+        let submit_elapsed = started.elapsed();
+        let blocked_stats = writer.buffer_stats();
+        *gate.0.lock() = true;
+        gate.1.notify_all();
+        assert!(writer_blocked, "durable backend was never stalled");
+        assert!(
+            submit_elapsed < Duration::from_millis(250),
+            "submit waited for backend: {submit_elapsed:?}"
+        );
+        assert!(blocked_stats.pending_bytes > 0);
+        assert!(blocked_stats.peak_pending_bytes <= 32 * 1024 * 1024);
+
+        if expected_pass {
+            assert_eq!(accepted, 1284);
+            assert!(captured.lock().is_empty());
+            let committed = writer.close(run_ended_draft()).unwrap();
+            assert_eq!(committed, 1385);
+            let backend = inner.lock();
+            assert_eq!(backend.manifest().unwrap().status, RunStatus::Ended);
+            let rows = backend
+                .scan_range(1, committed, ScanDirection::Forward)
+                .unwrap();
+            assert_eq!(rows.len(), 1385);
+            assert_eq!(rows[100].payload.len(), payload_bytes);
+        } else {
+            assert!(accepted < 1284);
+            assert!(matches!(
+                captured.lock().as_slice(),
+                [HaltReason::QueueFull]
+            ));
+            drop(writer);
+            assert_eq!(inner.lock().manifest().unwrap().status, RunStatus::Running);
+        }
+    }
+
+    #[rstest]
+    fn pending_byte_budget_is_held_through_durable_append() {
+        let inner = Arc::new(Mutex::new(MemoryBackend::new()));
+        inner.lock().open_run(manifest("byte-budget")).unwrap();
+        let gate = Arc::new((Mutex::new(false), parking_lot::Condvar::new()));
+        let appends = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let reasons = Arc::clone(&captured);
+
+        let writer = EventStoreWriter::spawn(
+            Box::new(BlockingBackend::new(
+                inner,
+                Arc::clone(&gate),
+                Arc::clone(&appends),
+            )),
+            get_atomic_clock_static(),
+            Arc::new(move |reason| reasons.lock().push(reason)),
+            WriterConfig {
+                channel_capacity: 10000,
+                max_pending_bytes: Some(64 * 1024),
+                max_batch_entries: 1,
+                nonblocking_submit: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut large = entry_draft(1);
+        large.payload = Bytes::from(vec![0x42; 32 * 1024]);
+        writer.submit(large.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while appends.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let held = writer.buffer_stats();
+        let rejected = writer.submit(large);
+        *gate.0.lock() = true;
+        gate.1.notify_all();
+        assert!(held.pending_bytes >= 32 * 1024);
+        assert!(held.peak_pending_bytes <= 64 * 1024);
+        assert!(matches!(
+            rejected,
+            Err(SubmitError::PendingBytesFull { .. })
+        ));
+        assert!(matches!(
+            captured.lock().as_slice(),
+            [HaltReason::PendingBytesFull { .. }]
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while writer.buffer_stats().pending_bytes != 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(writer.buffer_stats().pending_bytes, 0);
+    }
+
+    #[rstest]
+    fn byte_batch_flush_precedes_long_latency_and_count_limits() {
+        let (backend, inner) = SharedMemory::new();
+        inner.lock().open_run(manifest("byte-flush")).unwrap();
+
+        let writer = EventStoreWriter::spawn(
+            Box::new(backend),
+            get_atomic_clock_static(),
+            noop_halt(),
+            WriterConfig {
+                max_pending_bytes: Some(32 * 1024),
+                max_batch_bytes: Some(1500),
+                max_batch_entries: 100,
+                max_batch_latency: Duration::from_secs(30),
+                nonblocking_submit: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut first = entry_draft(1);
+        first.payload = Bytes::from(vec![0x42; 1024]);
+        writer.submit(first.clone()).unwrap();
+        writer.submit(first).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while writer.high_watermark() == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            writer.high_watermark() >= 1,
+            "byte threshold did not flush early"
+        );
+        assert_eq!(writer.close(run_ended_draft()).unwrap(), 3);
+        assert_eq!(inner.lock().manifest().unwrap().status, RunStatus::Ended);
+    }
+
+    #[rstest]
+    fn bounded_payload_does_not_retain_a_large_bytes_slice() {
+        let (backend, inner) = SharedMemory::new();
+        inner.lock().open_run(manifest("compact-payload")).unwrap();
+
+        let writer = EventStoreWriter::spawn(
+            Box::new(backend),
+            get_atomic_clock_static(),
+            noop_halt(),
+            WriterConfig {
+                max_pending_bytes: Some(4096),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let backing = Bytes::from(vec![0x42; 1024 * 1024]);
+        let mut draft = entry_draft(1);
+        draft.payload = backing.slice(0..4);
+        writer.submit(draft).unwrap();
+        writer.close(run_ended_draft()).unwrap();
+        let row = inner.lock().scan_seq(1).unwrap().unwrap();
+        assert_ne!(row.payload.as_ptr(), backing.as_ptr());
+        assert_eq!(row.payload.as_ref(), &[0x42; 4]);
+    }
+
+    #[rstest]
+    fn byte_reservations_release_after_disk_failure_and_queued_messages_drop() {
+        let gate = Arc::new((Mutex::new(false), parking_lot::Condvar::new()));
+        let appends = Arc::new(AtomicUsize::new(0));
+        let reasons = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&reasons);
+
+        let writer = EventStoreWriter::spawn(
+            Box::new(GatedDiskFailureBackend {
+                gate: Arc::clone(&gate),
+                appends_seen: Arc::clone(&appends),
+            }),
+            get_atomic_clock_static(),
+            Arc::new(move |reason| captured.lock().push(reason)),
+            WriterConfig {
+                max_pending_bytes: Some(64 * 1024),
+                max_batch_entries: 1,
+                nonblocking_submit: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        for i in 0..4 {
+            let mut draft = entry_draft(i);
+            draft.payload = Bytes::from(vec![0x42; 8192]);
+            writer.submit(draft).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while appends.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let held = writer.buffer_stats();
+        *gate.0.lock() = true;
+        gate.1.notify_all();
+        assert!(held.pending_bytes >= 4 * 8192);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while writer.buffer_stats().pending_bytes != 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(writer.buffer_stats().pending_bytes, 0);
+        assert_eq!(writer.high_watermark(), 0);
+        assert!(matches!(
+            reasons.lock().as_slice(),
+            [HaltReason::BackendDisk(_)]
+        ));
+        assert!(matches!(
+            writer.submit(entry_draft(10)),
+            Err(SubmitError::Closed)
+        ));
+    }
+
+    #[rstest]
+    fn continuously_ready_receiver_still_flushes_elapsed_batch_deadline() {
+        use std::sync::{atomic::AtomicBool, mpsc};
+
+        use super::batcher::{BudgetedMessage, HaltSink, WriterMessage};
+        let inner = Arc::new(Mutex::new(MemoryBackend::new()));
+        inner.lock().open_run(manifest("busy-time-flush")).unwrap();
+        let appends = Arc::new(AtomicUsize::new(0));
+        let backend = BlockingBackend::new(
+            Arc::clone(&inner),
+            Arc::new((Mutex::new(true), parking_lot::Condvar::new())),
+            Arc::clone(&appends),
+        );
+        let (tx, rx) = mpsc::sync_channel(101);
+        for i in 0..100 {
+            tx.send(BudgetedMessage {
+                message: WriterMessage::Entry {
+                    draft: entry_draft(i),
+                    ts_publish: UnixNanos::from(i),
+                },
+                reservation: None,
+                bytes: 1024,
+            })
+            .unwrap();
+        }
+        let (ack, receipt) = mpsc::sync_channel(1);
+        tx.send(BudgetedMessage {
+            message: WriterMessage::Close {
+                run_ended: run_ended_draft(),
+                ack,
+            },
+            reservation: None,
+            bytes: 1024,
+        })
+        .unwrap();
+        drop(tx);
+        super::batcher::run(
+            Box::new(backend),
+            rx,
+            WriterConfig {
+                max_batch_entries: 100,
+                max_batch_latency: Duration::ZERO,
+                ..Default::default()
+            },
+            HaltSink::new(noop_halt(), Arc::new(AtomicBool::new(false))),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            get_atomic_clock_static(),
+        );
+        assert_eq!(receipt.recv().unwrap().unwrap(), 101);
+        assert_eq!(appends.load(Ordering::SeqCst), 101);
+        assert_eq!(inner.lock().manifest().unwrap().status, RunStatus::Ended);
+    }
+
+    #[rstest]
+    fn close_preserves_durable_drain_wait_beyond_live_submit_deadline() {
+        let inner = Arc::new(Mutex::new(MemoryBackend::new()));
+        inner.lock().open_run(manifest("close-slow-disk")).unwrap();
+        let gate = Arc::new((Mutex::new(false), parking_lot::Condvar::new()));
+        let appends = Arc::new(AtomicUsize::new(0));
+        let reasons = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&reasons);
+
+        let writer = EventStoreWriter::spawn(
+            Box::new(BlockingBackend::new(
+                Arc::clone(&inner),
+                Arc::clone(&gate),
+                Arc::clone(&appends),
+            )),
+            get_atomic_clock_static(),
+            Arc::new(move |reason| captured.lock().push(reason)),
+            WriterConfig {
+                channel_capacity: 1,
+                max_pending_bytes: Some(4096),
+                max_batch_entries: 1,
+                halt_threshold: Duration::from_millis(10),
+                nonblocking_submit: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.submit(entry_draft(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while appends.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        writer.submit(entry_draft(2)).unwrap();
+        let release_gate = Arc::clone(&gate);
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            *release_gate.0.lock() = true;
+            release_gate.1.notify_all();
+        });
+        let result = writer.close(run_ended_draft());
+        release.join().unwrap();
+        assert_eq!(result.unwrap(), 3);
+        assert!(reasons.lock().is_empty());
+        assert_eq!(inner.lock().manifest().unwrap().status, RunStatus::Ended);
     }
 
     /// `EventStore` wrapper that returns `EventStoreError::Disk` for every append.
@@ -1161,6 +1766,8 @@ mod tests {
         );
 
         let config = WriterConfig {
+            max_pending_bytes: None,
+            max_batch_bytes: None,
             channel_capacity: 16,
             max_batch_entries: 2,
             max_batch_latency: Duration::from_secs(30),
@@ -1308,6 +1915,93 @@ mod tests {
     }
 
     #[rstest]
+    #[case::writer_recovers(true)]
+    #[case::writer_remains_stalled(false)]
+    fn shutdown_drain_uses_bounded_native_backpressure(
+        #[case] release: bool,
+        captured_halt: (HaltCallback, Arc<Mutex<Vec<HaltReason>>>),
+    ) {
+        let (halt, captured) = captured_halt;
+        let inner = Arc::new(Mutex::new(MemoryBackend::new()));
+        inner
+            .lock()
+            .open_run(manifest("shutdown-drain"))
+            .expect("open");
+        let gate = Arc::new((Mutex::new(false), parking_lot::Condvar::new()));
+        let appends_seen = Arc::new(AtomicUsize::new(0));
+        let backend = BlockingBackend::new(
+            Arc::clone(&inner),
+            Arc::clone(&gate),
+            Arc::clone(&appends_seen),
+        );
+        let writer = Arc::new(
+            EventStoreWriter::spawn(
+                Box::new(backend),
+                get_atomic_clock_static(),
+                halt,
+                WriterConfig {
+                    channel_capacity: 1,
+                    max_batch_entries: 1,
+                    nonblocking_submit: true,
+                    halt_threshold: Duration::from_millis(100),
+                    ..Default::default()
+                },
+            )
+            .expect("spawn"),
+        );
+        writer.submit(entry_draft(10)).expect("first");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while appends_seen.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let blocked = appends_seen.load(Ordering::SeqCst) > 0;
+        writer.submit(entry_draft(11)).expect("fills bounded queue");
+        assert!(writer.nonblocking_submit());
+        writer.begin_shutdown_drain();
+        assert!(!writer.nonblocking_submit());
+        let pending = Arc::clone(&writer);
+        let (done, completion) = std::sync::mpsc::channel();
+        let task = std::thread::spawn(move || {
+            done.send(pending.submit(entry_draft(12))).unwrap();
+        });
+        let early = completion.recv_timeout(Duration::from_millis(20));
+
+        if release {
+            *gate.0.lock() = true;
+            gate.1.notify_all();
+        }
+        let result = completion
+            .recv_timeout(Duration::from_secs(2))
+            .expect("bounded submit completes");
+        *gate.0.lock() = true;
+        gate.1.notify_all();
+        task.join().unwrap();
+        assert!(blocked, "backend did not reach gate");
+        assert!(
+            matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "must wait for writer, not discard tail"
+        );
+
+        if release {
+            result.expect("progress allows residual event");
+            let final_hwm = Arc::try_unwrap(writer)
+                .expect("sole owner")
+                .close(run_ended_draft())
+                .expect("seal");
+            assert_eq!(final_hwm, 4);
+            assert!(captured.lock().is_empty());
+        } else {
+            assert!(matches!(result, Err(SubmitError::HaltSignaled { .. })));
+            writer.begin_shutdown_drain();
+            assert!(
+                matches!(writer.submit(entry_draft(13)), Err(SubmitError::Closed)),
+                "transition must not rearm a halted writer"
+            );
+            assert_backpressure_stall(captured.lock().first(), Duration::from_millis(100));
+        }
+    }
+
+    #[rstest]
     fn submit_signals_halt_when_stalled_past_threshold(
         captured_halt: (HaltCallback, Arc<Mutex<Vec<HaltReason>>>),
     ) {
@@ -1328,6 +2022,8 @@ mod tests {
 
         let halt_threshold = Duration::from_millis(50);
         let config = WriterConfig {
+            max_pending_bytes: None,
+            max_batch_bytes: None,
             channel_capacity: 1,
             max_batch_entries: 1,
             max_batch_latency: Duration::from_millis(1),
@@ -1353,7 +2049,9 @@ mod tests {
 
         match stalled {
             SubmitError::HaltSignaled { .. } => {}
-            SubmitError::Closed | SubmitError::QueueFull => panic!("expected HaltSignaled"),
+            SubmitError::Closed | SubmitError::QueueFull | SubmitError::PendingBytesFull { .. } => {
+                panic!("expected HaltSignaled")
+            }
         }
         let captured_reasons = captured.lock();
         assert_eq!(
@@ -1373,7 +2071,9 @@ mod tests {
 
         match post_halt {
             SubmitError::Closed => {}
-            SubmitError::HaltSignaled { .. } | SubmitError::QueueFull => {
+            SubmitError::HaltSignaled { .. }
+            | SubmitError::QueueFull
+            | SubmitError::PendingBytesFull { .. } => {
                 panic!("expected Closed after halt, was HaltSignaled")
             }
         }
@@ -1407,6 +2107,8 @@ mod tests {
 
         let halt_threshold = Duration::from_millis(50);
         let config = WriterConfig {
+            max_pending_bytes: None,
+            max_batch_bytes: None,
             channel_capacity: 1,
             max_batch_entries: 1,
             max_batch_latency: Duration::from_millis(1),
@@ -1478,6 +2180,8 @@ mod tests {
         );
 
         let config = WriterConfig {
+            max_pending_bytes: None,
+            max_batch_bytes: None,
             channel_capacity: 0,
             max_batch_entries: 1,
             max_batch_latency: Duration::from_millis(1),
@@ -1593,6 +2297,8 @@ mod tests {
         );
 
         let config = WriterConfig {
+            max_pending_bytes: None,
+            max_batch_bytes: None,
             channel_capacity: 1,
             max_batch_entries: 1,
             max_batch_latency: Duration::from_millis(1),
@@ -1682,6 +2388,8 @@ mod tests {
             get_atomic_clock_static(),
             halt,
             WriterConfig {
+                max_pending_bytes: None,
+                max_batch_bytes: None,
                 channel_capacity: 2,
                 max_batch_entries: 1,
                 max_batch_latency: Duration::from_millis(1),
@@ -1717,7 +2425,9 @@ mod tests {
 
         match post_halt {
             SubmitError::Closed => {}
-            SubmitError::HaltSignaled { .. } | SubmitError::QueueFull => {
+            SubmitError::HaltSignaled { .. }
+            | SubmitError::QueueFull
+            | SubmitError::PendingBytesFull { .. } => {
                 panic!("expected Closed after anchor halt, was HaltSignaled")
             }
         }
@@ -1757,6 +2467,8 @@ mod tests {
             get_atomic_clock_static(),
             halt,
             WriterConfig {
+                max_pending_bytes: None,
+                max_batch_bytes: None,
                 channel_capacity: 1,
                 max_batch_entries: 1,
                 max_batch_latency: Duration::from_secs(30),
@@ -1802,7 +2514,9 @@ mod tests {
 
         match post_halt {
             SubmitError::Closed => {}
-            SubmitError::HaltSignaled { .. } | SubmitError::QueueFull => {
+            SubmitError::HaltSignaled { .. }
+            | SubmitError::QueueFull
+            | SubmitError::PendingBytesFull { .. } => {
                 panic!("expected Closed after anchor halt, was HaltSignaled")
             }
         }
@@ -1828,6 +2542,8 @@ mod tests {
             get_atomic_clock_static(),
             halt,
             WriterConfig {
+                max_pending_bytes: None,
+                max_batch_bytes: None,
                 channel_capacity: 4,
                 max_batch_entries: 1,
                 max_batch_latency: Duration::from_millis(1),
@@ -1891,6 +2607,8 @@ mod tests {
             get_atomic_clock_static(),
             halt,
             WriterConfig {
+                max_pending_bytes: None,
+                max_batch_bytes: None,
                 channel_capacity: 32,
                 max_batch_entries: 100,
                 max_batch_latency: Duration::from_millis(20),

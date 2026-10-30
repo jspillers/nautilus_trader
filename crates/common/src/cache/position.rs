@@ -105,6 +105,7 @@ impl Cache {
     ///
     /// Returns an error if serializing or storing the position snapshot fails.
     pub fn snapshot_position(&mut self, position: &Position) -> anyhow::Result<()> {
+        self.bump_financial_revision();
         let (blob_ref, snapshot) = self.build_position_snapshot(position);
 
         let encoded = if self.database.is_some() {
@@ -129,6 +130,7 @@ impl Cache {
         &mut self,
         position: &Position,
     ) -> anyhow::Result<CacheSnapshotRef> {
+        self.bump_financial_revision();
         let (blob_ref, snapshot) = self.build_position_snapshot(position);
         let encoded = self.persist_position_snapshot(&blob_ref, &snapshot)?;
 
@@ -162,6 +164,7 @@ impl Cache {
         position: &Position,
         closed_cycles_pnl: Option<Money>,
     ) {
+        self.bump_financial_revision();
         self.position_snapshots.remove(&position.id);
         self.bump_position_snapshot_revision(position.id);
 
@@ -264,6 +267,7 @@ impl Cache {
     /// snapshot frames, conflicts with an existing frame, or does not decode to the expected
     /// position snapshot.
     pub fn restore_snapshot_blob(&mut self, blob_ref: &str, blob: Bytes) -> anyhow::Result<()> {
+        self.bump_financial_revision();
         let (position_id, snapshot_index) = parse_position_snapshot_blob_ref(blob_ref)?;
         let restored = decode_position_snapshot_blob(&position_id, blob.as_ref())?;
 

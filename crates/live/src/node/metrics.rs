@@ -348,11 +348,11 @@ impl RunnerMetrics {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RunnerChannelQueueDepths {
-    time_events: usize,
-    exec_events: usize,
-    exec_commands: usize,
-    data_events: usize,
-    data_commands: usize,
+    pub(super) time_events: usize,
+    pub(super) exec_events: usize,
+    pub(super) exec_commands: usize,
+    pub(super) data_events: usize,
+    pub(super) data_commands: usize,
 }
 
 impl RunnerChannelQueueDepths {
@@ -550,6 +550,39 @@ mod tests {
         assert_eq!(delta.dispatch_busy_ns, 120);
     }
 
+    fn observe_monitor(
+        monitor: &mut QueueMonitor,
+        snapshot: RunnerMetricsSnapshot,
+    ) -> Vec<QueueStateTransition> {
+        let mut transitions = Vec::new();
+
+        for (channel, depth) in [
+            (SystemChannel::TimeEvents, snapshot.time_events.queue_depth),
+            (SystemChannel::ExecEvents, snapshot.exec_events.queue_depth),
+            (
+                SystemChannel::ExecCommands,
+                snapshot.exec_commands.queue_depth,
+            ),
+            (SystemChannel::DataEvents, snapshot.data_events.queue_depth),
+            (
+                SystemChannel::DataCommands,
+                snapshot.data_commands.queue_depth,
+            ),
+        ] {
+            if let Some(event) = monitor.observe_queue_depth(channel, depth, || snapshot) {
+                transitions.push(event);
+            }
+        }
+        transitions.extend(monitor.evaluate(snapshot));
+        transitions.sort_by_key(|event| {
+            (
+                super::super::queue::system_channel_index(event.channel),
+                event.condition == QueueCondition::Slow,
+            )
+        });
+        transitions
+    }
+
     #[rstest]
     fn test_queue_monitor_uses_successive_snapshot_delta_and_crossing_values() {
         let previous = with_queue_depths(
@@ -562,7 +595,7 @@ mod tests {
             [10, 0, 0, 0, 0],
         );
 
-        let transitions = monitor.evaluate(snapshot);
+        let transitions = observe_monitor(&mut monitor, snapshot);
 
         assert_eq!(
             transitions,
@@ -602,10 +635,10 @@ mod tests {
             [5, 0, 0, 0, 0],
         );
 
-        assert_eq!(monitor.evaluate(triggered).len(), 2);
-        assert!(monitor.evaluate(between).is_empty());
+        assert_eq!(observe_monitor(&mut monitor, triggered).len(), 2);
+        assert!(observe_monitor(&mut monitor, between).is_empty());
         assert_eq!(
-            monitor.evaluate(cleared),
+            observe_monitor(&mut monitor, cleared),
             vec![
                 QueueStateTransition {
                     channel: SystemChannel::TimeEvents,
@@ -634,7 +667,7 @@ mod tests {
         let cleared = runner_snapshot([2, 0, 0, 0, 0], [150, 0, 0, 0, 0], 0, 0, 300);
 
         assert_eq!(
-            monitor.evaluate(triggered),
+            observe_monitor(&mut monitor, triggered),
             vec![QueueStateTransition {
                 channel: SystemChannel::TimeEvents,
                 condition: QueueCondition::Slow,
@@ -643,9 +676,9 @@ mod tests {
                 mean_dispatch_ns: 100,
             }]
         );
-        assert!(monitor.evaluate(idle).is_empty());
+        assert!(observe_monitor(&mut monitor, idle).is_empty());
         assert_eq!(
-            monitor.evaluate(cleared),
+            observe_monitor(&mut monitor, cleared),
             vec![QueueStateTransition {
                 channel: SystemChannel::TimeEvents,
                 condition: QueueCondition::Slow,
@@ -673,9 +706,9 @@ mod tests {
             [5, 0, 0, 0, 0],
         );
 
-        assert_eq!(monitor.evaluate(triggered).len(), 2);
+        assert_eq!(observe_monitor(&mut monitor, triggered).len(), 2);
         assert_eq!(
-            monitor.evaluate(slow_cleared),
+            observe_monitor(&mut monitor, slow_cleared),
             vec![QueueStateTransition {
                 channel: SystemChannel::TimeEvents,
                 condition: QueueCondition::Slow,
@@ -685,7 +718,7 @@ mod tests {
             }]
         );
         assert_eq!(
-            monitor.evaluate(backlog_cleared),
+            observe_monitor(&mut monitor, backlog_cleared),
             vec![QueueStateTransition {
                 channel: SystemChannel::TimeEvents,
                 condition: QueueCondition::Backlogged,
@@ -710,15 +743,14 @@ mod tests {
         );
 
         assert_eq!(
-            monitor
-                .evaluate(first)
+            observe_monitor(&mut monitor, first)
                 .iter()
                 .map(|transition| transition.channel)
                 .collect::<Vec<_>>(),
             vec![SystemChannel::DataEvents, SystemChannel::DataEvents]
         );
         assert_eq!(
-            monitor.evaluate(second),
+            observe_monitor(&mut monitor, second),
             vec![
                 QueueStateTransition {
                     channel: SystemChannel::ExecEvents,

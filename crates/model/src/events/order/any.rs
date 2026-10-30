@@ -57,6 +57,30 @@ pub enum OrderEventAny {
 }
 
 impl OrderEventAny {
+    /// Returns the immutable event identity without cloning or allocating.
+    #[must_use]
+    pub fn id(&self) -> nautilus_core::UUID4 {
+        match self {
+            Self::Initialized(event) => event.id(),
+            Self::Denied(event) => event.id(),
+            Self::Emulated(event) => event.id(),
+            Self::Released(event) => event.id(),
+            Self::Submitted(event) => event.id(),
+            Self::Accepted(event) => event.id(),
+            Self::Rejected(event) => event.id(),
+            Self::Canceled(event) => event.id(),
+            Self::Expired(event) => event.id(),
+            Self::Triggered(event) => event.id(),
+            Self::PendingUpdate(event) => event.id(),
+            Self::PendingCancel(event) => event.id(),
+            Self::ModifyRejected(event) => event.id(),
+            Self::CancelRejected(event) => event.id(),
+            Self::Updated(event) => event.id(),
+            Self::Filled(event) => event.id(),
+            Self::FillVoided(event) => event.id(),
+        }
+    }
+
     #[must_use]
     pub fn into_boxed(self) -> Box<dyn OrderEvent> {
         match self {

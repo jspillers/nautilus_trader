@@ -22,7 +22,7 @@
 //! the native path instead, so [`Trader::add_py_execution_algorithm_instance`] retains its wrapper
 //! directly and is the only place that has to.
 
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, str::FromStr};
 
 use nautilus_common::{
     actor::{DataActorNative, data_actor::ImportableActorConfig},
@@ -34,8 +34,12 @@ use nautilus_common::{
         wrappers::retain_python_wrapper,
     },
 };
-use nautilus_model::identifiers::{
-    ActorId, ComponentId, ExecAlgorithmId, StrategyId, normalize_order_id_tag,
+use nautilus_execution::engine::ExecutionEngine;
+use nautilus_model::{
+    enums::OmsType,
+    identifiers::{
+        ActorId, ComponentId, ExecAlgorithmId, InstrumentId, StrategyId, normalize_order_id_tag,
+    },
 };
 use nautilus_trading::{
     ImportableControllerConfig, ImportableStrategyConfig,
@@ -45,11 +49,15 @@ use nautilus_trading::{
     },
 };
 use pyo3::{
+    exceptions::PyAttributeError,
     prelude::*,
     types::{PyDict, PyModule},
 };
 
-use crate::{registration::ensure_unique_order_id_tag, trader::Trader};
+use crate::{
+    registration::{StrategyRegistration, ensure_unique_order_id_tag},
+    trader::Trader,
+};
 
 impl Trader {
     /// Adds an importable Python actor to the trader.
@@ -156,13 +164,54 @@ impl Trader {
         &mut self,
         config: &ImportableStrategyConfig,
     ) -> anyhow::Result<StrategyId> {
+        self.add_strategy_from_importable_config_checked(config, None, None)
+            .map(|registration| registration.strategy_id)
+    }
+
+    pub(crate) fn add_strategy_from_importable_config_checked(
+        &mut self,
+        config: &ImportableStrategyConfig,
+        expected_id: Option<StrategyId>,
+        execution_engine: Option<&Rc<RefCell<ExecutionEngine>>>,
+    ) -> anyhow::Result<StrategyRegistration> {
         // Checked before importing and constructing the Python class so a rejected addition never
         // runs user constructor code
         self.validate_actor_or_strategy_registration()?;
 
         let python_strategy = create_python_strategy(config)?;
 
-        self.add_python_strategy_instance(&python_strategy)
+        let strategy_id = self.prepare_python_strategy_instance(&python_strategy)?;
+
+        if let Some(expected) = expected_id {
+            anyhow::ensure!(
+                expected == strategy_id,
+                "Native strategy identity mismatch: expected '{expected}', prepared '{strategy_id}'"
+            );
+        }
+        let (oms_type, claims) = python_strategy_registration_settings(&python_strategy)?;
+        let actual_id = Python::attach(|py| -> anyhow::Result<StrategyId> {
+            Ok(python_strategy
+                .bind(py)
+                .extract::<PyRef<PyStrategy>>()
+                .map_err(Into::<PyErr>::into)
+                .map_err(|e| anyhow::anyhow!("Failed to read prepared PyStrategy identity: {e}"))?
+                .strategy_id())
+        })?;
+        anyhow::ensure!(
+            actual_id == strategy_id,
+            "Prepared Python strategy identity changed before registration"
+        );
+        self.register_strategy_configuration(
+            strategy_id,
+            oms_type,
+            &claims,
+            execution_engine,
+            |trader| {
+                trader
+                    .commit_python_strategy_instance(&python_strategy)
+                    .map(|_| ())
+            },
+        )
     }
 
     /// Adds a constructed Python strategy instance to the trader.
@@ -452,36 +501,6 @@ impl Trader {
             Ok(())
         })
     }
-
-    /// Rejects a component ID this trader already tracks, whatever kind registered it.
-    ///
-    /// Duplicate adds are otherwise checked only within a kind, so an actor sharing an ID with a
-    /// live strategy would overwrite that strategy's clock, registry entries, and wrapper, and a
-    /// rollback would then remove state the attempt did not create. The lifecycle collections are
-    /// checked alongside the clocks because a component registered externally and tracked through
-    /// `add_*_id_for_lifecycle` has no trader-owned clock.
-    fn ensure_component_id_available(&self, component_id: ComponentId) -> anyhow::Result<()> {
-        let id = component_id.inner();
-        let tracked = self.clocks.contains_key(&component_id)
-            || self.actor_ids.iter().any(|actor_id| actor_id.inner() == id)
-            || self
-                .strategy_ids
-                .iter()
-                .any(|strategy_id| strategy_id.inner() == id)
-            || self
-                .exec_algorithm_ids
-                .iter()
-                .any(|exec_algorithm_id| exec_algorithm_id.inner() == id);
-
-        if tracked {
-            anyhow::bail!(
-                "Component {component_id} is already registered with trader {}",
-                self.trader_id
-            );
-        }
-
-        Ok(())
-    }
 }
 
 fn create_python_actor(config: &ImportableActorConfig) -> anyhow::Result<(Py<PyAny>, ActorId)> {
@@ -502,6 +521,58 @@ fn create_python_actor(config: &ImportableActorConfig) -> anyhow::Result<(Py<PyA
         let actor_id = prepare_python_actor(&python_actor, config_instance.as_ref())?;
 
         Ok((python_actor.unbind(), actor_id))
+    })
+}
+
+fn registration_config_attr<'py>(
+    object: &Bound<'py, PyAny>,
+    name: &str,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    match object.getattr(name) {
+        Ok(value) => Ok((!value.is_none()).then_some(value)),
+        Err(e) if e.is_instance_of::<PyAttributeError>(object.py()) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn python_strategy_registration_settings(
+    strategy: &Py<PyAny>,
+) -> anyhow::Result<(Option<OmsType>, Vec<InstrumentId>)> {
+    Python::attach(|py| {
+        let bound = strategy.bind(py);
+        let config = registration_config_attr(bound, "config")?;
+        let mut strategy = bound
+            .extract::<PyRefMut<PyStrategy>>()
+            .map_err(|e| anyhow::anyhow!("Failed to extract PyStrategy: {e}"))?;
+        let mut oms_type = None;
+
+        if let Some(config) = config {
+            if let Some(value) = registration_config_attr(&config, "oms_type")? {
+                oms_type = Some(if let Ok(value) = value.extract::<OmsType>() {
+                    value
+                } else {
+                    OmsType::from_str(&value.extract::<String>()?)?
+                });
+            }
+
+            if let Some(value) = registration_config_attr(&config, "external_order_instrument_ids")?
+            {
+                let claims = if let Ok(claims) = value.extract::<Vec<InstrumentId>>() {
+                    claims
+                } else {
+                    value
+                        .extract::<Vec<String>>()?
+                        .into_iter()
+                        .map(|id| InstrumentId::from_str(&id))
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                strategy.set_external_order_instrument_ids(Some(claims));
+            }
+        }
+        Ok((
+            oms_type,
+            strategy.external_order_instrument_ids().unwrap_or_default(),
+        ))
     })
 }
 

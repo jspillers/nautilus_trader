@@ -17,6 +17,7 @@
 //!
 //! Provides methods to load, query, and update cached data such as instruments, orders, and prices.
 
+pub mod bootstrap;
 pub mod config;
 pub mod database;
 pub mod fifo;
@@ -56,11 +57,11 @@ pub use error::{
     OrderLookupError, OwnOrderBookLookupError, POSITION_NOT_FOUND, PositionLookupError,
     SYNTHETIC_INSTRUMENT_NOT_FOUND, SyntheticInstrumentLookupError, VenueOrderIdOwnershipError,
 };
-use filter::{FilterSources, intersect_pair_or_many};
+use filter::{FilterSets, FilterSources, intersect_pair_or_many};
 use index::CacheIndex;
 use indexmap::IndexMap;
 use nautilus_core::{
-    DurationNanos, SharedCell, UnixNanos,
+    DurationNanos, SharedCell, UUID4, UnixNanos,
     correctness::{
         check_key_not_in_map, check_predicate_false, check_slice_not_empty, check_valid_string_utf8,
     },
@@ -98,6 +99,7 @@ pub use position::CacheSnapshotRef;
 use position::PositionSnapshotFrame;
 pub use refs::{AccountRef, AccountRefMut, OrderRef, OrderRefMut, PositionRef, PositionRefMut};
 use rust_decimal::Decimal;
+use smallvec::SmallVec;
 use ustr::Ustr;
 pub use view::CacheView; // Re-export
 
@@ -110,8 +112,15 @@ use crate::xrate::get_exchange_rate;
 )]
 pub struct Cache {
     config: CacheConfig,
+    instance_id: UUID4,
+    financial_revision: u64,
+    execution_revision: u64,
+    order_fill_revision: u64,
+    book_revision: u64,
+    instrument_revision: u64,
     index: CacheIndex,
     database: Option<Box<dyn CacheDatabaseAdapter>>,
+    bootstrap_loads: RefCell<Option<bootstrap::BootstrapLoads>>,
     general: AHashMap<String, Bytes>,
     currencies: AHashMap<Ustr, Currency>,
     instruments: AHashMap<InstrumentId, InstrumentAny>,
@@ -222,6 +231,7 @@ impl Cache {
             config,
             index: CacheIndex::default(),
             database,
+            bootstrap_loads: RefCell::new(None),
             general: AHashMap::new(),
             currencies: AHashMap::new(),
             instruments: AHashMap::new(),
@@ -250,6 +260,12 @@ impl Cache {
             order_lists: AHashMap::new(),
             positions: AHashMap::new(),
             position_snapshots: AHashMap::new(),
+            instance_id: UUID4::new(),
+            financial_revision: 0,
+            execution_revision: 0,
+            order_fill_revision: 0,
+            book_revision: 0,
+            instrument_revision: 0,
             position_snapshot_revisions: AHashMap::new(),
             #[cfg(feature = "defi")]
             defi: crate::defi::cache::DefiCache::default(),
@@ -442,6 +458,49 @@ impl Cache {
             .and_then(|db| db.persistence_health())
     }
 
+    /// Enables bounded observations of actual bootstrap database reads.
+    ///
+    /// The caller supplies the registered inventory before native loading starts. No reads
+    /// are issued by this diagnostic, and loaded payloads are never copied into the report.
+    pub fn begin_bootstrap_load_capture(&self, actor_ids: Vec<String>, strategy_ids: Vec<String>) {
+        *self.bootstrap_loads.borrow_mut() = Some(bootstrap::BootstrapLoads {
+            actor_ids,
+            strategy_ids,
+            reads: Vec::new(),
+            cache_rebuilt: false,
+            cache_integrity: None,
+            component_states_loaded: false,
+            overflowed: false,
+        });
+    }
+
+    /// Returns the actual bounded bootstrap observations without reading backing storage.
+    #[must_use]
+    pub fn bootstrap_loads(&self) -> Option<bootstrap::BootstrapLoads> {
+        self.bootstrap_loads.borrow().clone()
+    }
+
+    /// Finishes the observation without loading or retaining any payload state.
+    #[must_use]
+    pub fn finish_bootstrap_load_capture(&self) -> Option<bootstrap::BootstrapLoads> {
+        self.bootstrap_loads.borrow_mut().take()
+    }
+
+    /// Records completion of the native cache rebuild and integrity check.
+    pub fn complete_bootstrap_cache_load(&self, integrity: bool) {
+        if let Some(report) = self.bootstrap_loads.borrow_mut().as_mut() {
+            report.cache_rebuilt = true;
+            report.cache_integrity = Some(integrity);
+        }
+    }
+
+    /// Records completion of the actual full registered component-state load pass.
+    pub fn complete_bootstrap_component_load(&self) {
+        if let Some(report) = self.bootstrap_loads.borrow_mut().as_mut() {
+            report.component_states_loaded = true;
+        }
+    }
+
     /// Sets the cache database adapter for persistence.
     ///
     /// This allows setting or replacing the database adapter after cache construction.
@@ -460,7 +519,20 @@ impl Cache {
     /// Returns an error if loading general cache data fails.
     pub fn cache_general(&mut self) -> anyhow::Result<()> {
         self.general = match &mut self.database {
-            Some(db) => db.load()?,
+            Some(db) => {
+                let result = db.load();
+                bootstrap::record(
+                    &self.bootstrap_loads,
+                    bootstrap::BootstrapLoadReadKind::General,
+                    None,
+                    result.is_ok(),
+                    result
+                        .as_ref()
+                        .map(|value| [("entries".to_string(), value.len())].into_iter().collect())
+                        .unwrap_or_default(),
+                );
+                result?
+            }
             None => AHashMap::new(),
         };
 
@@ -480,8 +552,42 @@ impl Cache {
     ///
     /// Returns an error if loading cache data fails.
     pub async fn cache_all(&mut self) -> anyhow::Result<()> {
+        self.bump_order_fill_revision();
+        self.bump_financial_revision();
+        self.bump_book_revision();
+        self.bump_instrument_revision();
         let cache_map = match &self.database {
-            Some(db) => db.load_all().await?,
+            Some(db) => {
+                let result = db.load_all().await;
+                bootstrap::record(
+                    &self.bootstrap_loads,
+                    bootstrap::BootstrapLoadReadKind::CacheAll,
+                    None,
+                    result.is_ok(),
+                    result
+                        .as_ref()
+                        .map(|value| {
+                            [
+                                ("currencies".to_string(), value.currencies.len()),
+                                ("instruments".to_string(), value.instruments.len()),
+                                (
+                                    "instrument_closes".to_string(),
+                                    value.instrument_closes.len(),
+                                ),
+                                ("synthetics".to_string(), value.synthetics.len()),
+                                ("accounts".to_string(), value.accounts.len()),
+                                ("orders".to_string(), value.orders.len()),
+                                ("positions".to_string(), value.positions.len()),
+                                ("greeks".to_string(), value.greeks.len()),
+                                ("yield_curves".to_string(), value.yield_curves.len()),
+                            ]
+                            .into_iter()
+                            .collect()
+                        })
+                        .unwrap_or_default(),
+                );
+                result?
+            }
             None => CacheMap::default(),
         };
 
@@ -506,9 +612,31 @@ impl Cache {
             .collect();
 
         if let Some(db) = &self.database {
-            let order_position = db.load_index_order_position()?;
+            let result = db.load_index_order_position();
+            bootstrap::record(
+                &self.bootstrap_loads,
+                bootstrap::BootstrapLoadReadKind::IndexOrderPosition,
+                None,
+                result.is_ok(),
+                result
+                    .as_ref()
+                    .map(|value| [("entries".to_string(), value.len())].into_iter().collect())
+                    .unwrap_or_default(),
+            );
+            let order_position = result?;
             self.index.order_position = self.sanitize_order_position_index(order_position);
-            self.index.order_client = db.load_index_order_client()?;
+            let result = db.load_index_order_client();
+            bootstrap::record(
+                &self.bootstrap_loads,
+                bootstrap::BootstrapLoadReadKind::IndexOrderClient,
+                None,
+                result.is_ok(),
+                result
+                    .as_ref()
+                    .map(|value| [("entries".to_string(), value.len())].into_iter().collect())
+                    .unwrap_or_default(),
+            );
+            self.index.order_client = result?;
         }
 
         self.cache_position_oms()?;
@@ -537,6 +665,7 @@ impl Cache {
     ///
     /// Returns an error if loading instruments cache fails.
     pub async fn cache_instruments(&mut self) -> anyhow::Result<()> {
+        self.bump_instrument_revision();
         self.instruments = match &mut self.database {
             Some(db) => db.load_instruments().await?,
             None => AHashMap::new(),
@@ -593,6 +722,8 @@ impl Cache {
     ///
     /// Returns an error if loading orders cache fails.
     pub async fn cache_orders(&mut self) -> anyhow::Result<()> {
+        self.bump_order_fill_revision();
+        self.bump_financial_revision();
         self.orders = match &mut self.database {
             Some(db) => db
                 .load_orders()
@@ -638,6 +769,7 @@ impl Cache {
     ///
     /// Returns an error if loading positions cache fails.
     pub async fn cache_positions(&mut self) -> anyhow::Result<()> {
+        self.bump_financial_revision();
         self.positions = match &mut self.database {
             Some(db) => db
                 .load_positions()
@@ -655,7 +787,20 @@ impl Cache {
 
     fn cache_position_oms(&mut self) -> anyhow::Result<()> {
         let persisted = match &self.database {
-            Some(database) => database.load()?,
+            Some(database) => {
+                let result = database.load();
+                bootstrap::record(
+                    &self.bootstrap_loads,
+                    bootstrap::BootstrapLoadReadKind::PositionOmsGeneral,
+                    None,
+                    result.is_ok(),
+                    result
+                        .as_ref()
+                        .map(|value| [("entries".to_string(), value.len())].into_iter().collect())
+                        .unwrap_or_default(),
+                );
+                result?
+            }
             None => self.general.clone(),
         };
 
@@ -675,6 +820,8 @@ impl Cache {
 
     /// Clears the current cache index and re-build.
     pub fn build_index(&mut self) {
+        self.bump_order_fill_revision();
+        self.bump_financial_revision();
         log::debug!("Building index");
 
         // Index accounts
@@ -920,7 +1067,20 @@ impl Cache {
     ) -> anyhow::Result<Option<IndexMap<String, Vec<u8>>>> {
         self.database
             .as_ref()
-            .map(|database| database.load_actor(actor_id))
+            .map(|database| {
+                let result = database.load_actor(actor_id);
+                bootstrap::record(
+                    &self.bootstrap_loads,
+                    bootstrap::BootstrapLoadReadKind::ActorState,
+                    Some(actor_id.to_string()),
+                    result.is_ok(),
+                    result
+                        .as_ref()
+                        .map(|value| [("entries".to_string(), value.len())].into_iter().collect())
+                        .unwrap_or_default(),
+                );
+                result
+            })
             .transpose()
             .map(|state| state.map(Self::decode_component_state))
     }
@@ -938,7 +1098,20 @@ impl Cache {
     ) -> anyhow::Result<Option<IndexMap<String, Vec<u8>>>> {
         self.database
             .as_ref()
-            .map(|database| database.load_strategy(strategy_id))
+            .map(|database| {
+                let result = database.load_strategy(strategy_id);
+                bootstrap::record(
+                    &self.bootstrap_loads,
+                    bootstrap::BootstrapLoadReadKind::StrategyState,
+                    Some(strategy_id.to_string()),
+                    result.is_ok(),
+                    result
+                        .as_ref()
+                        .map(|value| [("entries".to_string(), value.len())].into_iter().collect())
+                        .unwrap_or_default(),
+                );
+                result
+            })
             .transpose()
             .map(|state| state.map(Self::decode_component_state))
     }
@@ -1539,6 +1712,8 @@ impl Cache {
     ///
     /// For safety, an order is prevented from being purged if it's open.
     pub fn purge_order(&mut self, client_order_id: ClientOrderId) {
+        self.bump_financial_revision();
+
         if self.purge_order_except_aliases(client_order_id) {
             self.index
                 .venue_order_ids
@@ -1784,6 +1959,7 @@ impl Cache {
     ///
     /// For safety, a position is prevented from being purged if it's open.
     pub fn purge_position(&mut self, position_id: PositionId) {
+        self.bump_financial_revision();
         // Snapshot the position so we can release the borrow before mutating indexes.
         let position = self
             .positions
@@ -1990,6 +2166,8 @@ impl Cache {
     /// This refuses to purge when associated orders or positions remain in
     /// non-terminal state.
     pub fn purge_instrument(&mut self, instrument_id: InstrumentId) {
+        self.bump_book_revision();
+        self.bump_instrument_revision();
         self.purge_instrument_inner(instrument_id, false);
     }
 
@@ -2002,6 +2180,8 @@ impl Cache {
     /// arriving later than the cleanup decision. During that window, the order objects may
     /// still exist even though `instrument_orders` is removed from the cache index.
     pub fn purge_instrument_skip_order_guard(&mut self, instrument_id: InstrumentId) {
+        self.bump_book_revision();
+        self.bump_instrument_revision();
         self.purge_instrument_inner(instrument_id, true);
     }
 
@@ -2036,6 +2216,7 @@ impl Cache {
 
     /// Clears the caches index.
     pub fn clear_index(&mut self) {
+        self.bump_financial_revision();
         self.index.clear();
         log::debug!("Cleared index");
     }
@@ -2048,6 +2229,10 @@ impl Cache {
     /// and execution client account, route, and external client registrations are retained so
     /// registered strategy and client routing remain configured across resets.
     pub fn reset(&mut self) {
+        self.bump_order_fill_revision();
+        self.bump_financial_revision();
+        self.bump_book_revision();
+        self.bump_instrument_revision();
         log::debug!("Resetting cache");
 
         self.general.clear();
@@ -2143,6 +2328,7 @@ impl Cache {
     ///
     /// Returns an error if persisting the order book to the backing database fails.
     pub fn add_order_book(&mut self, book: OrderBook) -> anyhow::Result<()> {
+        self.bump_book_revision();
         log::debug!("Adding `OrderBook` {}", book.instrument_id);
 
         if self.config.save_market_data
@@ -2578,6 +2764,7 @@ impl Cache {
     ///
     /// Returns an error if persisting the instrument to the backing database fails.
     pub fn add_instrument(&mut self, instrument: InstrumentAny) -> anyhow::Result<()> {
+        self.bump_instrument_revision();
         log::debug!("Adding `Instrument` {}", instrument.id());
 
         // Ensure currencies exist in cache - safe to call repeatedly as add_currency is idempotent
@@ -2746,6 +2933,19 @@ impl Cache {
         client_id: Option<ClientId>,
         replace_existing: bool,
     ) -> anyhow::Result<()> {
+        if self.orders.contains_key(&order.client_order_id())
+            || order.filled_qty().is_positive()
+            || (order.event_count() > 1
+                && order
+                    .events()
+                    .iter()
+                    .any(|event| matches!(event, OrderEventAny::Filled(_))))
+        {
+            self.bump_order_fill_revision();
+            self.bump_financial_revision();
+        } else {
+            self.bump_execution_revision();
+        }
         let instrument_id = order.instrument_id();
         let venue = instrument_id.venue;
         let client_order_id = order.client_order_id();
@@ -2881,6 +3081,8 @@ impl Cache {
         &mut self,
         claims: &[(ClientOrderId, ClientId)],
     ) -> anyhow::Result<()> {
+        self.bump_order_fill_revision();
+        self.bump_financial_revision();
         let mut requested = AHashMap::with_capacity(claims.len());
         let mut ordered_claims = Vec::with_capacity(claims.len());
 
@@ -2969,6 +3171,7 @@ impl Cache {
         client_order_id: &ClientOrderId,
         strategy_id: &StrategyId,
     ) -> anyhow::Result<()> {
+        self.bump_financial_revision();
         self.index_position_id_in_memory(position_id, venue, client_order_id, strategy_id);
         self.persist_position_id(position_id, client_order_id)
     }
@@ -3102,6 +3305,7 @@ impl Cache {
     /// serialization succeeds, the complete operation is committed to memory before persistence
     /// is attempted, so a persistence error leaves the cache internally consistent.
     pub fn add_position(&mut self, position: &Position, oms_type: OmsType) -> anyhow::Result<()> {
+        self.bump_financial_revision();
         self.add_position_inner(position.clone(), oms_type, true, false)
     }
 
@@ -3117,6 +3321,7 @@ impl Cache {
         position: &Position,
         oms_type: OmsType,
     ) -> anyhow::Result<()> {
+        self.bump_financial_revision();
         self.add_position_inner(position.clone(), oms_type, false, false)
     }
 
@@ -3137,6 +3342,7 @@ impl Cache {
         index_order: bool,
         carry_replay_state: bool,
     ) -> anyhow::Result<()> {
+        self.bump_financial_revision();
         self.add_position_inner(position.clone(), oms_type, index_order, carry_replay_state)
     }
 
@@ -3355,6 +3561,8 @@ impl Cache {
     /// canonical order is committed to memory before its indexes and database are refreshed, so a
     /// persistence error leaves the cache internally consistent.
     pub fn replace_order(&mut self, order: &OrderAny) -> anyhow::Result<()> {
+        self.bump_order_fill_revision();
+        self.bump_financial_revision();
         let client_order_id = order.client_order_id();
         if let Some(venue_order_id) = order.venue_order_id() {
             self.validate_venue_order_id_ownership(&client_order_id, &venue_order_id)?;
@@ -3379,6 +3587,15 @@ impl Cache {
     ///
     /// Returns an error if the order is not found or rejects the event.
     pub fn update_order(&mut self, event: &OrderEventAny) -> anyhow::Result<OrderAny> {
+        if matches!(
+            event,
+            OrderEventAny::Filled(_) | OrderEventAny::FillVoided(_)
+        ) {
+            self.bump_order_fill_revision();
+            self.bump_financial_revision();
+        } else {
+            self.bump_execution_revision();
+        }
         let event_client_order_id = event.client_order_id();
         let client_order_id = if self.order_exists(&event_client_order_id) {
             event_client_order_id
@@ -3500,6 +3717,7 @@ impl Cache {
 
     /// Updates the `order` as pending cancel locally.
     pub fn update_order_pending_cancel_local(&mut self, order: &OrderAny) {
+        self.bump_execution_revision();
         self.index
             .orders_pending_cancel
             .insert(order.client_order_id());
@@ -3515,6 +3733,7 @@ impl Cache {
     /// Returns an error if the position is not already held in the cache, or if updating the
     /// position in the database fails.
     pub fn update_position(&mut self, position: &Position) -> anyhow::Result<()> {
+        self.bump_financial_revision();
         let Some(position_cell) = self.positions.get(&position.id).cloned() else {
             anyhow::bail!("Cannot update position {}: not found in cache", position.id);
         };
@@ -3548,6 +3767,7 @@ impl Cache {
         position_id: PositionId,
         fill: &OrderFilled,
     ) -> anyhow::Result<Position> {
+        self.bump_financial_revision();
         let Some(position_cell) = self.positions.get(&position_id).cloned() else {
             anyhow::bail!("Cannot update position {position_id}: not found in cache");
         };
@@ -3583,6 +3803,7 @@ impl Cache {
         position_id: PositionId,
         close: InstrumentClose,
     ) -> anyhow::Result<Position> {
+        self.bump_financial_revision();
         let Some(position_cell) = self.positions.get(&position_id).cloned() else {
             anyhow::bail!("Cannot update position {position_id}: not found in cache");
         };
@@ -3654,7 +3875,7 @@ impl Cache {
         strategy_id: Option<&StrategyId>,
         account_id: Option<&AccountId>,
     ) -> FilterSources<'a, ClientOrderId> {
-        let mut sources: Vec<&AHashSet<ClientOrderId>> = Vec::with_capacity(4);
+        let mut sources: FilterSets<'_, ClientOrderId> = SmallVec::new();
 
         if let Some(venue) = venue {
             match self.index.venue_orders.get(venue) {
@@ -3698,7 +3919,7 @@ impl Cache {
         strategy_id: Option<&StrategyId>,
         account_id: Option<&AccountId>,
     ) -> FilterSources<'a, PositionId> {
-        let mut sources: Vec<&AHashSet<PositionId>> = Vec::with_capacity(4);
+        let mut sources: FilterSets<'_, PositionId> = SmallVec::new();
 
         if let Some(venue) = venue {
             match self.index.venue_positions.get(venue) {
@@ -3820,8 +4041,8 @@ impl Cache {
             FilterSources::Sets(mut sources) => {
                 sources.push(bucket);
                 sources.sort_unstable_by_key(|s| s.len());
-                let driver = sources[0];
-                let rest: Vec<&'a AHashSet<ClientOrderId>> = sources[1..].to_vec();
+                let driver = sources.remove(0);
+                let rest = sources;
                 Box::new(
                     driver
                         .iter()
@@ -3846,8 +4067,8 @@ impl Cache {
             FilterSources::Sets(mut sources) => {
                 sources.push(bucket);
                 sources.sort_unstable_by_key(|s| s.len());
-                let driver = sources[0];
-                let rest: Vec<&'a AHashSet<PositionId>> = sources[1..].to_vec();
+                let driver = sources.remove(0);
+                let rest = sources;
                 Box::new(
                     driver
                         .iter()
@@ -4584,6 +4805,103 @@ impl Cache {
 
     // -- ORDER QUERIES ---------------------------------------------------------------------------
 
+    /// Returns the identity of this in-memory cache instance.
+    ///
+    /// Derived readers pair this with a mutation revision to distinguish whole-cache
+    /// replacement from an unchanged revision. This identity is not persisted.
+    #[must_use]
+    pub fn instance_id(&self) -> UUID4 {
+        self.instance_id
+    }
+
+    /// Returns a conservative revision of native order/position lifecycle state.
+    ///
+    /// This includes unfilled order transitions, financial mutations and snapshots.
+    /// It never resets during the lifetime of this cache instance.
+    #[must_use]
+    pub fn execution_revision(&self) -> u64 {
+        self.execution_revision
+    }
+
+    fn bump_execution_revision(&mut self) {
+        self.execution_revision = self
+            .execution_revision
+            .checked_add(1)
+            .expect("Cache revision exhausted");
+    }
+
+    /// Returns the revision of mutations which may introduce or replace filled-order history.
+    ///
+    /// Fill events, history imports, replacement and exclusive order borrows advance
+    /// this conservative discovery token. Ordinary unfilled lifecycle events do not.
+    /// Readers still use `financial_revision` to detect other financial state changes.
+    #[must_use]
+    pub fn order_fill_revision(&self) -> u64 {
+        self.order_fill_revision
+    }
+
+    fn bump_order_fill_revision(&mut self) {
+        self.order_fill_revision = self
+            .order_fill_revision
+            .checked_add(1)
+            .expect("Cache revision exhausted");
+    }
+
+    /// Returns a conservative revision of native fill economics, positions and position snapshots.
+    ///
+    /// Ordinary unfilled order transitions do not affect financial reads; lifecycle
+    /// consumers use `execution_revision` instead.
+    ///
+    /// A write attempt or exclusive mutable borrow advances this value before mutation,
+    /// even when the operation later fails or does not change a value. Revisions never
+    /// reset during this cache's lifetime and are not persisted financial identities.
+    #[must_use]
+    pub fn financial_revision(&self) -> u64 {
+        self.financial_revision
+    }
+
+    fn bump_financial_revision(&mut self) {
+        self.bump_execution_revision();
+        self.financial_revision = self
+            .financial_revision
+            .checked_add(1)
+            .expect("Cache revision exhausted");
+    }
+
+    /// Returns a conservative revision of native order-book state.
+    ///
+    /// A write attempt or exclusive mutable borrow advances this value before mutation,
+    /// even when the operation later fails or does not change a value. Revisions never
+    /// reset during this cache's lifetime and are not persisted financial identities.
+    #[must_use]
+    pub fn book_revision(&self) -> u64 {
+        self.book_revision
+    }
+
+    fn bump_book_revision(&mut self) {
+        self.book_revision = self
+            .book_revision
+            .checked_add(1)
+            .expect("Cache revision exhausted");
+    }
+
+    /// Returns a conservative revision of native instrument definitions.
+    ///
+    /// A write attempt or exclusive mutable borrow advances this value before mutation,
+    /// even when the operation later fails or does not change a value. Revisions never
+    /// reset during this cache's lifetime and are not persisted financial identities.
+    #[must_use]
+    pub fn instrument_revision(&self) -> u64 {
+        self.instrument_revision
+    }
+
+    fn bump_instrument_revision(&mut self) {
+        self.instrument_revision = self
+            .instrument_revision
+            .checked_add(1)
+            .expect("Cache revision exhausted");
+    }
+
     /// Gets a borrow of the order with the `client_order_id` (if found).
     ///
     /// The returned [`OrderRef`] is tied to the cache borrow's scope and panics at runtime if
@@ -4645,6 +4963,8 @@ impl Cache {
     /// may re-enter the same order.
     #[must_use]
     pub fn order_mut(&mut self, client_order_id: &ClientOrderId) -> Option<OrderRefMut<'_>> {
+        self.bump_order_fill_revision();
+        self.bump_financial_revision();
         self.orders
             .get(client_order_id)
             .map(|order_cell| OrderRefMut::new(order_cell.borrow_mut()))
@@ -5411,6 +5731,7 @@ impl Cache {
     /// that may re-enter the same position.
     #[must_use]
     pub fn position_mut(&mut self, position_id: &PositionId) -> Option<PositionRefMut<'_>> {
+        self.bump_financial_revision();
         self.positions
             .get(position_id)
             .map(|position_cell| PositionRefMut::new(position_cell.borrow_mut()))
@@ -5873,6 +6194,7 @@ impl Cache {
     /// Gets a reference to the order book for the `instrument_id`.
     #[must_use]
     pub fn order_book_mut(&mut self, instrument_id: &InstrumentId) -> Option<&mut OrderBook> {
+        self.bump_book_revision();
         self.books.get_mut(instrument_id)
     }
 

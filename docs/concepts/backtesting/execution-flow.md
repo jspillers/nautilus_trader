@@ -168,6 +168,22 @@ does not stay `SUBMITTED` or pending forever; the sandbox generates no order sta
 nothing else would resolve it. A discarded `CancelAllOrders` is dropped, since the strategy marks
 no order `PENDING_CANCEL` for it and so there is no pending state to release.
 
+#### Rust per-order insertion latency
+
+Rust callers can set `StaticLatencyModel::with_post_only_insert_latency` to give post-only
+orders a different insertion-operation delay. The base latency is added once to both insertion
+paths. For example, a 40 ms base, 250 ms ordinary insertion operation and zero post-only insertion
+operation produce 290 ms ordinary arrivals and 40 ms post-only arrivals. Modification and
+cancellation delays are unchanged. Without the override, all orders retain the default delay.
+
+The sandbox and backtest exchange select the delay from each command's immutable
+`OrderInitialized` value using `LatencyModel::get_insert_latency_for_order`. Existing custom
+models inherit their ordinary insertion latency unless they override that method. Selection
+happens when the native queue receives each command; it does not depend on shared mutable order
+classification. An atomic order list uses the longest insertion delay among its members, so none
+of its orders executes before its own arrival time. Native clocks, deferred queues, matching,
+acknowledgements and cancellation ownership are unchanged.
+
 ### Shutdown semantics
 
 `BacktestEngine::end()` is separate from the `shutdown_on_error` configuration in [backtest APIs and

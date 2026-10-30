@@ -33,7 +33,8 @@ use nautilus_common::{
     logging::{CMD, EVT, RECV, SEND},
     messages::execution::{
         BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
-        QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+        QueryAccount, QueryOrder, QueryStrategySettlement, SubmitOrder, SubmitOrderList,
+        TradingCommand,
     },
     msgbus::{self, MessagingSwitchboard},
     timer::TimeEvent,
@@ -1279,6 +1280,33 @@ pub trait Strategy: DataActor {
 
         send_exec_command(TradingCommand::QueryAccount(command));
         Ok(())
+    }
+
+    /// Queries an online execution boundary through the native command FIFO.
+    ///
+    /// Returns its correlation ID. The caller subscribes to the native strategy
+    /// settlement topic before requesting, keeps admission paused, and separately
+    /// verifies its native ownership is flat. Unsupported or pending results do
+    /// not authorize retirement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strategy is not registered.
+    fn query_strategy_settlement(&mut self) -> anyhow::Result<UUID4>
+    where
+        Self: StrategyNative,
+    {
+        let core = StrategyNative::strategy_core_mut(self);
+        let command_id = UUID4::new();
+        let command = QueryStrategySettlement {
+            trader_id: registered_trader_id(core)?,
+            expected_instance_id: msgbus::get_message_bus().borrow().instance_id,
+            strategy_id: registered_strategy_id(core)?,
+            command_id,
+            ts_init: core.clock_mut().timestamp_ns(),
+        };
+        send_exec_command(TradingCommand::QueryStrategySettlement(command));
+        Ok(command_id)
     }
 
     /// Queries order state from the execution client.
@@ -6306,6 +6334,26 @@ mod tests {
         let err = Strategy::on_start(&mut strategy).unwrap_err().to_string();
 
         assert_eq!(err, "Strategy not registered: strategy_id is not set");
+    }
+
+    #[rstest]
+    fn test_native_strategy_inherits_nonresetting_lifecycle_revision() {
+        let mut strategy = create_test_strategy();
+        assert_eq!(strategy.lifecycle_revision(), Some(0));
+        register_strategy(&mut strategy);
+        strategy.start().unwrap();
+        Component::stop(&mut strategy).unwrap();
+        let stopped = strategy.lifecycle_revision().unwrap();
+        strategy.resume().unwrap();
+        Component::stop(&mut strategy).unwrap();
+        assert_eq!(strategy.state(), ComponentState::Stopped);
+        assert!(strategy.lifecycle_revision().unwrap() > stopped);
+        let stopped_again = strategy.lifecycle_revision().unwrap();
+        strategy.reset().unwrap();
+        strategy.start().unwrap();
+        Component::stop(&mut strategy).unwrap();
+        assert_eq!(strategy.state(), ComponentState::Stopped);
+        assert!(strategy.lifecycle_revision().unwrap() > stopped_again);
     }
 
     // -- QUERY TESTS ---------------------------------------------------------------------------------

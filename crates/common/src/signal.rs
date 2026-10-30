@@ -76,6 +76,10 @@ impl CustomDataTrait for Signal {
         Ok(serde_json::to_string(self)?)
     }
 
+    fn to_json_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(self)
+    }
+
     fn clone_arc(&self) -> Arc<dyn CustomDataTrait> {
         Arc::new(self.clone())
     }
@@ -174,5 +178,53 @@ mod tests {
         };
 
         assert!(!signal.eq_arc(&other));
+    }
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_direct_signal_value_preserves_prior_envelope_bytes(#[case] metadata: bool) {
+        use nautilus_model::data::{CustomData, DataType};
+        use serde_json::{Value, json};
+
+        for value in [
+            "",
+            "quotes \" and \\ and λ",
+            "{\"px\":\"0.1234567890123456789012345678\"}",
+        ] {
+            let signal = Signal::new(
+                "independent-quote-kalshi".into(),
+                value.into(),
+                u64::MAX.into(),
+                0.into(),
+            );
+            let payload: Value = serde_json::from_str(&signal.to_json().unwrap()).unwrap();
+            assert_eq!(signal.to_json_value().unwrap(), payload);
+            let info =
+                metadata.then(|| serde_json::from_value(json!({"note": "λ \"", "n": 7})).unwrap());
+            let id = metadata.then(|| "TEST.SIM".to_string());
+            let data_type = DataType::new("SignalIndependent-Quote-Kalshi", info, id);
+            let mut expected_type = json!({"type_name": data_type.type_name(), "metadata": {}});
+
+            if metadata {
+                expected_type["metadata"] =
+                    serde_json::to_value(data_type.metadata().unwrap()).unwrap();
+                expected_type["identifier"] = json!(data_type.identifier().unwrap());
+            }
+            let expected =
+                json!({"type": "Signal", "data_type": expected_type, "payload": payload});
+            let actual = CustomData::new(Arc::new(signal), data_type);
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            assert_eq!(
+                rmp_serde::to_vec(&actual).unwrap(),
+                rmp_serde::to_vec(&expected).unwrap()
+            );
+            assert_eq!(
+                rmp_serde::to_vec_named(&actual).unwrap(),
+                rmp_serde::to_vec_named(&expected).unwrap()
+            );
+        }
     }
 }

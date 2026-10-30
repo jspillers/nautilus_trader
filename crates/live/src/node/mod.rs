@@ -93,7 +93,6 @@ use anyhow::Context;
 use nautilus_common::{
     actor::{self, Actor, DataActor, DataActorNative},
     cache::database::{CacheDatabaseAdapter, CacheDatabaseFactory},
-    clients::ExecutionClient,
     component::Component,
     enums::{Environment, LogColor},
     live::{dispatch::DispatchMessage, dst},
@@ -105,7 +104,10 @@ use nautilus_common::{
         system::{QueueStateChanged, ReconnectSocket, SocketStateChange, SocketStateChanged},
     },
     msgbus::{self, BusMessage, MessagingSwitchboard},
-    runner::{SystemChannel, TimeEventMessage, TradingCommandMessage},
+    runner::{
+        SystemChannel, TimeEventMessage, TradingCommandMessage,
+        recorded::{RecordedChannel, RuntimeDispatchScope},
+    },
 };
 use nautilus_core::{
     UUID4,
@@ -132,9 +134,7 @@ use crate::{
     dispatch::drain_callbacks,
     execution::{
         client::LiveExecutionClient,
-        manager::{
-            ExecutionManager, ExecutionManagerConfig, TargetedOrderQuery, TargetedOrderReportResult,
-        },
+        manager::{ExecutionManager, ExecutionManagerConfig, TargetedOrderReportResult},
     },
     runner::{AsyncRunner, AsyncRunnerChannels, PendingRunnerEvent},
     socket::{SocketReconnectLookup, SocketReconnectRegistry},
@@ -149,7 +149,10 @@ pub mod plugin;
 mod metrics;
 mod queue;
 mod reconciliation;
+mod recorded;
+pub use recorded::{RecordedRunnerConfig, RecordedRunnerInput, RecordedRunnerInputKind};
 mod state;
+mod strategy_settlement;
 
 use builder::ExternalMessageBusIngress;
 pub use builder::LiveNodeBuilder;
@@ -207,6 +210,8 @@ pub struct LiveNode {
     external_msgbus: Option<ExternalMessageBusIngress>,
     stream_processors: Vec<StreamProcessor>,
     shutdown_deadline: Option<dst::time::Instant>,
+    strategy_settlements: strategy_settlement::PendingStrategySettlements,
+    recorded: Option<recorded::RecordedRunnerState>,
     #[cfg(feature = "plugin")]
     plugins: plugin::NodePlugins,
     _thread_owner: Rc<()>,
@@ -248,6 +253,8 @@ impl LiveNode {
             external_msgbus,
             stream_processors: Vec::new(),
             shutdown_deadline: None,
+            strategy_settlements: strategy_settlement::PendingStrategySettlements::default(),
+            recorded: None,
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
             _thread_owner: thread_owner,
@@ -328,6 +335,8 @@ impl LiveNode {
             external_msgbus: None,
             stream_processors: Vec::new(),
             shutdown_deadline: None,
+            strategy_settlements: strategy_settlement::PendingStrategySettlements::default(),
+            recorded: None,
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
             _thread_owner: thread_owner,
@@ -697,6 +706,13 @@ impl LiveNode {
     }
 
     fn process_system_command(&self, command: SystemCommand) {
+        let _recorded = RuntimeDispatchScope::enter(|| {
+            nautilus_common::runner::recorded::describe_unsupported(
+                RecordedChannel::SystemCommands,
+                "system command",
+            )
+        });
+
         match command {
             SystemCommand::ReconnectSocket(command) => {
                 self.process_socket_reconnect(command);
@@ -754,6 +770,13 @@ impl LiveNode {
     }
 
     fn process_system_event(&self, event: SystemEvent) {
+        let _recorded = RuntimeDispatchScope::enter(|| {
+            nautilus_common::runner::recorded::describe_unsupported(
+                RecordedChannel::SystemEvents,
+                "system event",
+            )
+        });
+
         match event {
             SystemEvent::SocketState(change) => self.publish_socket_state_change(change),
         }
@@ -1088,6 +1111,11 @@ impl LiveNode {
     /// Returns an error if the node fails to start, encounters a runtime error, or shuts down
     /// with retained submissions unresolved at the end of `delay_post_stop`.
     pub async fn run_with_mode(&mut self, mode: NodeRunMode) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.recorded.is_none(),
+            "Recorded runner already owns this node"
+        );
+
         if self.state().is_running() {
             anyhow::bail!("Already running");
         }
@@ -1590,6 +1618,29 @@ impl LiveNode {
                 }
             };
 
+            // Observe all native queues at every runner boundary, including after
+            // the final dispatch. Recovery needs no later input or timer.
+
+            if let Some(monitor) = queue_monitor.as_mut() {
+                let depths = RunnerChannelQueueDepths::from_receivers(
+                    &time_evt_rx,
+                    &exec_evt_rx,
+                    &exec_cmd_rx,
+                    &data_evt_rx,
+                    &data_cmd_rx,
+                );
+
+                for (channel, depth) in [
+                    (SystemChannel::TimeEvents, depths.time_events),
+                    (SystemChannel::ExecEvents, depths.exec_events),
+                    (SystemChannel::ExecCommands, depths.exec_commands),
+                    (SystemChannel::DataEvents, depths.data_events),
+                    (SystemChannel::DataCommands, depths.data_commands),
+                ] {
+                    self.observe_runner_queue_depth(monitor, channel, depth, &metrics);
+                }
+            }
+
             let shutdown_deadline = self.shutdown_deadline;
             let is_shutting_down = self.state() == NodeState::ShuttingDown;
             let is_running = self.state() == NodeState::Running;
@@ -1638,49 +1689,11 @@ impl LiveNode {
                 }, if open_order_report_task.is_some() => {
                     let maintenance_start = dst::time::Instant::now();
 
+                    let _recorded = RuntimeDispatchScope::enter(|| recorded::maintenance::describe_open_outcome(&result));
                     drop(open_order_report_task.take());
 
-                    match result {
-                        ReportTaskOutcome::Completed(result) => {
-                            let client_refs = self
-                                .exec_clients
-                                .iter()
-                                .map(|client| client as &dyn ExecutionClient)
-                                .collect::<Vec<_>>();
-                            let reconciliation = self.exec_manager.reconcile_open_order_reports(
-                                &result.check,
-                                result.reports,
-                                &result.queried_clients,
-                                &result.failed_clients,
-                                &client_refs,
-                            );
-                            self.process_reconciliation_events(&reconciliation.events);
-                            if !reconciliation.targeted_queries.is_empty() {
-                                if is_shutting_down {
-                                    let planned_client_order_ids = reconciliation
-                                        .targeted_queries
-                                        .iter()
-                                        .map(TargetedOrderQuery::client_order_id)
-                                        .collect::<Vec<_>>();
-                                    self.cleanup_cancelled_report_tasks(
-                                        &planned_client_order_ids,
-                                    );
-                                } else {
-                                    targeted_order_report_task = Some(
-                                        self.start_targeted_order_report_check(
-                                            reconciliation.targeted_queries,
-                                        ),
-                                    );
-                                }
-                            }
-                        }
-                        ReportTaskOutcome::TimedOut => {
-                            self.cleanup_cancelled_report_tasks(&[]);
-                            log::warn!(
-                                "Open-order report collection expired after {:?}",
-                                self.config.timeout_reconciliation,
-                            );
-                        }
+                    if let Some(task) = self.apply_open_order_report_outcome(result, is_shutting_down) {
+                        targeted_order_report_task = Some(task);
                     }
                     record_runner_maintenance(&metrics, maintenance_start, metrics_start);
                 }
@@ -1696,28 +1709,9 @@ impl LiveNode {
                         .as_ref()
                         .map(|task| task.planned_client_order_ids.clone())
                         .unwrap_or_default();
+                    let _recorded = RuntimeDispatchScope::enter(|| recorded::maintenance::describe_targeted_outcome(&result));
                     drop(targeted_order_report_task.take());
-
-                    match result {
-                        ReportTaskOutcome::Completed(result) => {
-                            let client_refs = self
-                                .exec_clients
-                                .iter()
-                                .map(|client| client as &dyn ExecutionClient)
-                                .collect::<Vec<_>>();
-                            let events = self
-                                .exec_manager
-                                .reconcile_targeted_order_reports(result, &client_refs);
-                            self.process_reconciliation_events(&events);
-                        }
-                        ReportTaskOutcome::TimedOut => {
-                            self.cleanup_cancelled_report_tasks(&planned_client_order_ids);
-                            log::warn!(
-                                "Targeted order report collection expired after {:?}",
-                                self.config.timeout_reconciliation,
-                            );
-                        }
-                    }
+                    self.apply_targeted_order_report_outcome(result, &planned_client_order_ids);
                     record_runner_maintenance(&metrics, maintenance_start, metrics_start);
                 }
                 result = async {
@@ -1728,33 +1722,37 @@ impl LiveNode {
                 }, if position_report_task.is_some() => {
                     let maintenance_start = dst::time::Instant::now();
 
+                    let _recorded = RuntimeDispatchScope::enter(|| recorded::maintenance::describe_position_outcome(&result));
                     drop(position_report_task.take());
-
-                    match result {
-                        ReportTaskOutcome::Completed(PositionReportTaskResult::Positions(result)) => {
-                            if is_shutting_down {
-                                self.cleanup_cancelled_report_tasks(&[]);
-                            } else {
-                                position_report_task = self.handle_position_report_result(result);
-                            }
-                        }
-                        ReportTaskOutcome::Completed(PositionReportTaskResult::Fills(result)) => {
-                            self.handle_position_fill_report_result(result);
-                        }
-                        ReportTaskOutcome::TimedOut => {
-                            self.cleanup_cancelled_report_tasks(&[]);
-                            log::warn!(
-                                "Position report collection expired after {:?}",
-                                self.config.timeout_reconciliation,
-                            );
-                        }
-                    }
+                    position_report_task = self.apply_position_report_outcome(result, is_shutting_down);
                     record_runner_maintenance(&metrics, maintenance_start, metrics_start);
                 }
 
                 // Maintenance dispatcher (before event processing to avoid
                 // starvation). See module docs for design rationale.
                 _ = maintenance_timer.tick(), if is_running => {
+                    let now = dst::time::Instant::now();
+                    let actions = recorded::maintenance::MaintenanceActions {
+                        reconciliation: (recon_enabled && now >= recon_next).then(|| reconciliation::ReconciliationDue {
+                            inflight: reconciliation::reconciliation_check_due(now, last_inflight_check, inflight_interval),
+                            open: reconciliation::reconciliation_check_due(now, last_open_check, open_interval),
+                            position: reconciliation::reconciliation_check_due(now, last_position_check, position_interval),
+                            order: if last_position_check < last_open_check {
+                                reconciliation::ReconciliationOrder::PositionFirst
+                            } else {
+                                reconciliation::ReconciliationOrder::OpenFirst
+                            },
+                        }),
+                        purge: recorded::maintenance::PurgeActions {
+                            orders: now >= purge_orders_next,
+                            positions: now >= purge_positions_next,
+                            accounts: now >= purge_account_next,
+                        },
+                        audit_books: now >= own_books_next,
+                        prune_fills: now >= prune_fills_next,
+                        queue_monitor: queue_monitor.is_some(),
+                    };
+                    let _recorded = RuntimeDispatchScope::enter(|| actions.describe());
                     let maintenance_start = dst::time::Instant::now();
                     metrics.publish_queue_depths(
                         RunnerChannelQueueDepths::from_receivers(
@@ -1772,9 +1770,9 @@ impl LiveNode {
                         self.publish_queue_state_transitions(&transitions);
                     }
 
-                    let mut now = dst::time::Instant::now();
+                    let mut now = now;
 
-                    if recon_enabled && now >= recon_next {
+                    if actions.reconciliation.is_some() {
                         let recon_intervals = ReconciliationCheckIntervals {
                             inflight: inflight_interval,
                             open: open_interval,
@@ -1799,27 +1797,27 @@ impl LiveNode {
                         recon_next = now + recon_interval;
                     }
 
-                    if now >= purge_orders_next {
+                    if actions.purge.orders {
                         self.exec_manager.purge_closed_orders();
                         purge_orders_next = now + purge_orders_interval;
                     }
 
-                    if now >= purge_positions_next {
+                    if actions.purge.positions {
                         self.exec_manager.purge_closed_positions();
                         purge_positions_next = now + purge_positions_interval;
                     }
 
-                    if now >= purge_account_next {
+                    if actions.purge.accounts {
                         self.exec_manager.purge_account_events();
                         purge_account_next = now + purge_account_interval;
                     }
 
-                    if now >= own_books_next {
+                    if actions.audit_books {
                         self.kernel.cache().borrow_mut().audit_own_order_books();
                         own_books_next = now + own_books_interval;
                     }
 
-                    if now >= prune_fills_next {
+                    if actions.prune_fills {
                         self.exec_manager.prune_recent_fills_cache(60.0);
                         self.exec_manager.prune_processed_fills();
                         self.exec_manager.prune_order_local_activity();
@@ -1834,6 +1832,11 @@ impl LiveNode {
                 // submit, etc.) is not delayed behind a market data backlog
                 // when the biased select polls receivers each iteration.
                 Some(handler) = time_evt_rx.recv() => {
+                    // Include the message just dequeued when waking on a burst.
+
+                    if let Some(monitor) = queue_monitor.as_mut() {
+                        self.observe_runner_queue_depth(monitor, SystemChannel::TimeEvents, time_evt_rx.len().saturating_add(1), &metrics);
+                    }
                     let dispatch_start = dst::time::Instant::now();
                     let dispatched = AsyncRunner::handle_time_event(handler);
 
@@ -1866,6 +1869,11 @@ impl LiveNode {
                     command.dispatch(|command| self.process_system_command(command));
                 }
                 Some(evt) = exec_evt_rx.recv() => {
+                    // Include the message just dequeued when waking on a burst.
+
+                    if let Some(monitor) = queue_monitor.as_mut() {
+                        self.observe_runner_queue_depth(monitor, SystemChannel::ExecEvents, exec_evt_rx.len().saturating_add(1), &metrics);
+                    }
                     let dispatch_start = dst::time::Instant::now();
 
                     if is_shutting_down {
@@ -1873,7 +1881,20 @@ impl LiveNode {
                         residual_events += 1;
                     }
 
-                    evt.dispatch(|evt| self.process_exec_event(evt));
+                    let settlement_eligible = is_running
+                        && exec_cmd_rx.is_empty()
+                        && exec_evt_rx.is_empty()
+                        && !callbacks_pending
+                        && open_order_report_task.is_none()
+                        && targeted_order_report_task.is_none()
+                        && position_report_task.is_none();
+                    evt.dispatch(|evt| {
+                        if let ExecutionEvent::StrategySettlement(marker) = evt {
+                            self.finish_strategy_settlement(marker, settlement_eligible);
+                        } else {
+                            self.process_exec_event(evt);
+                        }
+                    });
                     record_runner_dispatch(
                         &metrics,
                         SystemChannel::ExecEvents,
@@ -1882,6 +1903,11 @@ impl LiveNode {
                     );
                 }
                 Some(cmd) = exec_cmd_rx.recv() => {
+                    // Include the message just dequeued when waking on a burst.
+
+                    if let Some(monitor) = queue_monitor.as_mut() {
+                        self.observe_runner_queue_depth(monitor, SystemChannel::ExecCommands, exec_cmd_rx.len().saturating_add(1), &metrics);
+                    }
                     let dispatch_start = dst::time::Instant::now();
 
                     if is_shutting_down {
@@ -1922,6 +1948,11 @@ impl LiveNode {
                     );
                 }
                 Some(evt) = data_evt_rx.recv() => {
+                    // Include the message just dequeued when waking on a burst.
+
+                    if let Some(monitor) = queue_monitor.as_mut() {
+                        self.observe_runner_queue_depth(monitor, SystemChannel::DataEvents, data_evt_rx.len().saturating_add(1), &metrics);
+                    }
                     let dispatch_start = dst::time::Instant::now();
 
                     if is_shutting_down {
@@ -1937,6 +1968,11 @@ impl LiveNode {
                     );
                 }
                 Some(cmd) = data_cmd_rx.recv() => {
+                    // Include the message just dequeued when waking on a burst.
+
+                    if let Some(monitor) = queue_monitor.as_mut() {
+                        self.observe_runner_queue_depth(monitor, SystemChannel::DataCommands, data_cmd_rx.len().saturating_add(1), &metrics);
+                    }
                     let dispatch_start = dst::time::Instant::now();
 
                     if is_shutting_down {
@@ -1999,6 +2035,19 @@ impl LiveNode {
         log::info!("Event loop stopped");
 
         stop_result
+    }
+
+    fn observe_runner_queue_depth(
+        &self,
+        monitor: &mut QueueMonitor,
+        channel: SystemChannel,
+        depth: usize,
+        metrics: &RunnerMetrics,
+    ) {
+        if let Some(transition) = monitor.observe_queue_depth(channel, depth, || metrics.snapshot())
+        {
+            self.publish_queue_state_transitions(std::slice::from_ref(&transition));
+        }
     }
 
     fn publish_queue_state_transitions(&self, transitions: &[QueueStateTransition]) {
@@ -2110,6 +2159,10 @@ impl LiveNode {
     }
 
     fn process_external_msgbus_message(&self, message: &BusMessage) {
+        let _recorded = RuntimeDispatchScope::enter(|| {
+            nautilus_common::runner::recorded::describe_external(message)
+        });
+
         if self.stream_processors.is_empty() {
             Self::republish_external_msgbus_message(message);
             return;
@@ -2186,6 +2239,14 @@ impl LiveNode {
     }
 
     fn process_exec_event(&mut self, event: ExecutionEvent) {
+        let _recorded = RuntimeDispatchScope::enter(|| {
+            nautilus_common::runner::recorded::describe_execution_event(&event)
+        });
+
+        if let ExecutionEvent::StrategySettlement(marker) = event {
+            self.finish_strategy_settlement(marker, false);
+            return;
+        }
         let clear_closed_orders = matches!(
             &event,
             ExecutionEvent::Order(_) | ExecutionEvent::OrderCanceledBatch(_)
@@ -2315,7 +2376,10 @@ impl LiveNode {
         receivers: Option<&mut RunnerReceivers<'_>>,
     ) -> anyhow::Result<bool> {
         match self.handle.try_set_running() {
-            RunningTransition::Entered => Ok(true),
+            RunningTransition::Entered => {
+                self.capture_recorded_started();
+                Ok(true)
+            }
             RunningTransition::StopRequested => {
                 self.abort_started_trader("Stop signal received during startup", receivers)
                     .await?;
@@ -2679,7 +2743,7 @@ impl LiveNode {
                     order_ids.push(client_order_id);
                 }
             }
-            ExecutionEvent::Account(_) => {}
+            ExecutionEvent::Account(_) | ExecutionEvent::StrategySettlement(_) => {}
         }
 
         Some(order_ids)
@@ -2750,6 +2814,9 @@ impl LiveNode {
                 for child in &cancel.cancels {
                     self.exec_manager.register_inflight(child.client_order_id);
                 }
+            }
+            TradingCommand::QueryStrategySettlement(query) => {
+                self.strategy_settlements.begin(query);
             }
             _ => {}
         }
@@ -2900,7 +2967,7 @@ impl LiveNode {
     /// - The strategy configures one or more external order instrument IDs and the cache is already
     ///   borrowed.
     /// - The strategy configures an OMS type override and the execution engine is already borrowed.
-    pub fn add_strategy<T>(&mut self, mut strategy: T) -> anyhow::Result<()>
+    pub fn add_strategy<T>(&mut self, strategy: T) -> anyhow::Result<()>
     where
         T: Strategy + StrategyNative + DataActorNative + Component + Debug + 'static,
     {
@@ -2910,65 +2977,11 @@ impl LiveNode {
             );
         }
 
-        // Capture strategy-owned values before adding the strategy, which moves it
-        let strategy_id = self
-            .kernel
+        self.kernel
             .trader
-            .borrow()
-            .prepare_strategy_for_registration(&mut strategy)?;
-        let oms_type = StrategyNative::strategy_core(&strategy).config.oms_type;
-        let instrument_ids = strategy.external_order_instrument_ids().unwrap_or_default();
-
-        if !instrument_ids.is_empty() {
-            self.register_external_order_claims(strategy_id, &instrument_ids)?;
-        }
-
-        let mut exec_engine = match oms_type
-            .map(|_| {
-                self.kernel
-                    .exec_engine
-                    .try_borrow_mut()
-                    .map_err(|e| anyhow::anyhow!("Cannot register OMS type: {e}"))
-            })
-            .transpose()
-        {
-            Ok(exec_engine) => exec_engine,
-            Err(e) => {
-                if !instrument_ids.is_empty()
-                    && let Err(rollback_error) =
-                        self.rollback_external_order_claims(strategy_id, &instrument_ids)
-                {
-                    anyhow::bail!(
-                        "{e}; failed to roll back external order claims for {strategy_id}: {rollback_error}"
-                    );
-                }
-
-                return Err(e);
-            }
-        };
-
-        if let Err(add_error) = self.kernel.trader.borrow_mut().add_strategy(strategy) {
-            drop(exec_engine);
-
-            if !instrument_ids.is_empty()
-                && let Err(rollback_error) =
-                    self.rollback_external_order_claims(strategy_id, &instrument_ids)
-            {
-                anyhow::bail!(
-                    "Failed to add strategy {strategy_id}: {add_error}; failed to roll back external order claims: {rollback_error}"
-                );
-            }
-
-            return Err(add_error);
-        }
-
-        if let Some(exec_engine) = &mut exec_engine
-            && let Some(oms_type) = oms_type
-        {
-            exec_engine.register_oms_type(strategy_id, oms_type);
-        }
-
-        Ok(())
+            .borrow_mut()
+            .add_strategy_with_execution_engine(strategy, &self.kernel.exec_engine)
+            .map(|_| ())
     }
 
     /// Registers external order claims in the shared cache.
@@ -3018,6 +3031,7 @@ impl LiveNode {
         Ok(())
     }
 
+    #[cfg(feature = "python")]
     pub(crate) fn rollback_external_order_claims(
         &self,
         strategy_id: StrategyId,
@@ -3377,7 +3391,9 @@ impl PendingEvents {
             // Account events are safe to process immediately. Reports and orders need
             // ExecEngine access, which may conflict with the driven startup future's borrow.
             match event {
-                ExecutionEvent::Account(_) => AsyncRunner::handle_exec_event(event),
+                ExecutionEvent::Account(_) | ExecutionEvent::StrategySettlement(_) => {
+                    AsyncRunner::handle_exec_event(event);
+                }
                 ExecutionEvent::Report(report) => self.exec_reports.push(if rooted {
                     DispatchMessage::new(report, owner)
                 } else {
@@ -3459,6 +3475,7 @@ mod tests {
             self, CallbackDispatchError, DataActor, DataActorCore, data_actor::DataActorConfig,
         },
         cache::Cache,
+        clients::ExecutionClient,
         clock::{Clock, VirtualClock},
         enums::SerializationEncoding,
         live::{
@@ -4288,6 +4305,188 @@ mod tests {
         }
 
         node.stop().await.unwrap();
+        node.dispose();
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_run_queue_pressure_burst_overhead_and_tail_latency() {
+        use std::time::Instant;
+        let mut results = Vec::new();
+
+        for enabled in [false, true] {
+            let config = LiveNodeConfig {
+                trader_id: TraderId::from("QUEUE-BURST-001"),
+                queue_monitor: enabled.then_some(crate::config::QueueMonitorConfig {
+                    queue_depth_trigger: 100,
+                    queue_depth_clear: 10,
+                    mean_dispatch_ns_trigger: u64::MAX,
+                    mean_dispatch_ns_clear: 0,
+                }),
+                exec_engine: crate::config::LiveExecutionEngineConfig {
+                    reconciliation: false,
+                    ..Default::default()
+                },
+                delay_post_stop: Duration::ZERO,
+                ..Default::default()
+            };
+            let mut node = LiveNode::build("QueueBurstNode".to_string(), Some(config)).unwrap();
+            let handle = node.handle();
+            let edges = Rc::new(RefCell::new(Vec::new()));
+            let handler = ShareableMessageHandler::from_typed({
+                let edges = edges.clone();
+                move |event: &QueueStateChanged| {
+                    if event.channel == SystemChannel::DataEvents
+                        && event.condition == QueueCondition::Backlogged
+                    {
+                        let observed_ns = nautilus_core::time::get_atomic_clock_realtime()
+                            .get_time_ns()
+                            .as_u64();
+                        assert!(observed_ns >= event.ts_init.as_u64());
+                        edges.borrow_mut().push((
+                            event.state,
+                            Instant::now(),
+                            observed_ns - event.ts_init.as_u64(),
+                        ));
+                    }
+                }
+            });
+            msgbus::subscribe_any(
+                MessagingSwitchboard::queue_state_changed_pattern(None),
+                handler,
+                None,
+            );
+            let mut burst_ns = Vec::new();
+            let mut activation_ns = Vec::new();
+            let mut recovery_ns = Vec::new();
+            let mut publication_delivery_ns = Vec::new();
+            let start = tokio::time::Instant::now();
+            let drive = async {
+                wait_until_async(|| async { handle.is_running() }, Duration::from_secs(2)).await;
+
+                for batch in 0..200u64 {
+                    let edge_start = edges.borrow().len();
+                    let inputs = (0..128).map(|_| stub_data_event()).collect::<Vec<_>>();
+                    let began = Instant::now();
+
+                    for input in inputs {
+                        get_data_event_sender().send(input).unwrap();
+                    }
+                    // This is a workload completion barrier for the benchmark;
+                    // no polling participates in native readiness or publication.
+                    while handle.metrics_snapshot().data_events.dispatched < (batch + 1) * 128 {
+                        tokio::task::yield_now().await;
+                    }
+                    burst_ns.push(u64::try_from(began.elapsed().as_nanos()).unwrap());
+
+                    if enabled {
+                        let observations = edges.borrow();
+                        let current = &observations[edge_start..];
+                        assert_eq!(current.len(), 2);
+                        publication_delivery_ns.extend(current.iter().map(|event| event.2));
+                        assert_eq!(current[0].0, QueueState::Triggered);
+                        assert_eq!(current[1].0, QueueState::Cleared);
+                        activation_ns.push(
+                            u64::try_from(current[0].1.duration_since(began).as_nanos()).unwrap(),
+                        );
+                        recovery_ns.push(
+                            u64::try_from(current[1].1.duration_since(began).as_nanos()).unwrap(),
+                        );
+                    }
+                }
+                assert!(start.elapsed() < Duration::from_millis(100));
+                handle.stop();
+            };
+            let (result, ()) = tokio::join!(node.run(), drive);
+            result.unwrap();
+            let distribution = |mut samples: Vec<u64>| {
+                samples.sort_unstable();
+
+                if samples.is_empty() {
+                    return serde_json::Value::Null;
+                }
+                let n = samples.len();
+                serde_json::json!({"n":n,"median_ns":samples[n/2],"p95_ns":samples[(n-1)*95/100],"p99_ns":samples[(n-1)*99/100],"max_ns":samples[n-1]})
+            };
+            results.push(serde_json::json!({"monitor":enabled,"batch_size":128,"burst":distribution(burst_ns),"enqueue_to_native_activation_callback":distribution(activation_ns),"enqueue_to_native_recovery_callback":distribution(recovery_ns),"native_transition_publication_to_typed_callback":distribution(publication_delivery_ns)}));
+            node.dispose();
+        }
+        println!(
+            "NATIVE_QUEUE_BURST_MEASUREMENTS {}",
+            serde_json::json!({"scope":"200 native instrument bursts per arm; local debug wall clock, no physical WAN claim", "results":results})
+        );
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_run_backlog_trigger_and_recovery_need_no_maintenance_or_later_input() {
+        let config = LiveNodeConfig {
+            trader_id: TraderId::from("QUEUE-EDGE-001"),
+            queue_monitor: Some(crate::config::QueueMonitorConfig {
+                queue_depth_trigger: 100,
+                queue_depth_clear: 10,
+                mean_dispatch_ns_trigger: u64::MAX,
+                mean_dispatch_ns_clear: 0,
+            }),
+            exec_engine: crate::config::LiveExecutionEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            },
+            delay_post_stop: Duration::ZERO,
+            ..Default::default()
+        };
+        let mut node = LiveNode::build("QueueEdgeNode".to_string(), Some(config)).unwrap();
+        let handle = node.handle();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let start = tokio::time::Instant::now();
+        let handler = ShareableMessageHandler::from_typed({
+            let received = received.clone();
+            move |event: &QueueStateChanged| {
+                if event.channel == SystemChannel::DataEvents
+                    && event.condition == QueueCondition::Backlogged
+                {
+                    received.borrow_mut().push((event.clone(), start.elapsed()));
+                    tx.send(event.clone()).unwrap();
+                }
+            }
+        });
+        msgbus::subscribe_any(
+            MessagingSwitchboard::queue_state_changed_pattern(None),
+            handler,
+            None,
+        );
+        let drive = async move {
+            wait_until_async(|| async { handle.is_running() }, Duration::from_secs(2)).await;
+            // Wake an idle select with exactly the trigger depth. The dequeued
+            // message must not hide this crossing; no new message follows drain.
+
+            for _ in 0..100 {
+                get_data_event_sender().send(stub_data_event()).unwrap();
+            }
+            let triggered = rx.recv().await.unwrap();
+            let cleared = rx.recv().await.unwrap();
+            assert_eq!(triggered.state, QueueState::Triggered);
+            assert_eq!(triggered.queue_depth, 100);
+            assert_eq!(cleared.state, QueueState::Cleared);
+            assert_eq!(cleared.queue_depth, 10);
+            assert!(start.elapsed() < Duration::from_millis(100));
+            handle.stop();
+        };
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            let (result, ()) = tokio::join!(node.run(), drive);
+            result
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+        assert_eq!(received.borrow().len(), 2);
+        assert!(
+            received
+                .borrow()
+                .iter()
+                .all(|(_, at)| *at < Duration::from_millis(100))
+        );
         node.dispose();
     }
 

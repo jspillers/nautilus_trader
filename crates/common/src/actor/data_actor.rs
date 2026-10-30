@@ -3043,9 +3043,18 @@ where
         self.core().state
     }
 
+    fn lifecycle_revision(&self) -> Option<u64> {
+        Some(self.core().lifecycle_revision)
+    }
+
     fn transition_state(&mut self, trigger: ComponentTrigger) -> anyhow::Result<()> {
         let core = self.core_mut();
-        core.state = core.state.transition(&trigger)?;
+        let state = core.state.transition(&trigger)?;
+        let revision = core.lifecycle_revision.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!("Component '{}' lifecycle revision exhausted", core.actor_id)
+        })?;
+        core.state = state;
+        core.lifecycle_revision = revision;
 
         #[cfg(feature = "python")]
         if core.state == ComponentState::Disposed {
@@ -3078,7 +3087,9 @@ where
             }
         });
 
-        clock.borrow_mut().register_default_handler(callback);
+        clock
+            .borrow_mut()
+            .register_default_handler(callback.with_native_target(actor_id));
 
         self.initialize()
     }
@@ -3127,6 +3138,7 @@ pub struct DataActorCore {
     clock: Option<Rc<RefCell<dyn Clock>>>, // Wired up on registration
     cache: Option<Rc<RefCell<Cache>>>,     // Wired up on registration
     state: ComponentState,
+    lifecycle_revision: u64,
     topic_handlers: AHashMap<MStr<Pattern>, Subscription<ShareableMessageHandler>>,
     instrument_handlers: AHashMap<MStr<Pattern>, Subscription<TypedHandler<InstrumentAny>>>,
     deltas_handlers: AHashMap<MStr<Pattern>, Subscription<TypedHandler<OrderBookDeltas>>>,
@@ -3172,6 +3184,7 @@ impl Debug for DataActorCore {
             .field("actor_id", &self.actor_id)
             .field("config", &self.config)
             .field("state", &self.state)
+            .field("lifecycle_revision", &self.lifecycle_revision)
             .field("trader_id", &self.trader_id)
             .finish()
     }
@@ -4018,6 +4031,7 @@ impl DataActorCore {
             clock: None,     // None until registered
             cache: None,     // None until registered
             state: ComponentState::default(),
+            lifecycle_revision: 0,
             topic_handlers: AHashMap::new(),
             instrument_handlers: AHashMap::new(),
             deltas_handlers: AHashMap::new(),
@@ -4130,6 +4144,14 @@ impl DataActorCore {
     /// Returns the actors state.
     pub fn state(&self) -> ComponentState {
         self.state
+    }
+
+    /// Returns the monotonic revision of accepted native lifecycle transitions.
+    ///
+    /// The revision starts at zero before initialization. Reset preserves it;
+    /// invalid triggers and exhausted-counter transitions leave it unchanged.
+    pub fn lifecycle_revision(&self) -> u64 {
+        self.lifecycle_revision
     }
 
     /// Returns the trader ID this actor is registered to.
@@ -5972,4 +5994,110 @@ where
 
 fn log_received_bulk(kind: &str, correlation_id: &UUID4, records: usize) {
     log::debug!("{RECV} {kind} correlation_id={correlation_id} records={records}");
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use rstest::rstest;
+
+    use super::*;
+    use crate::{
+        component::{component_lifecycle_revision, deregister_component, register_component},
+        nautilus_actor,
+    };
+
+    #[derive(Debug)]
+    struct LifecycleActor {
+        core: DataActorCore,
+        fail_stop: bool,
+        starts: usize,
+    }
+
+    impl LifecycleActor {
+        fn new() -> Self {
+            Self {
+                core: DataActorCore::new(DataActorConfig::default()),
+                fail_stop: false,
+                starts: 0,
+            }
+        }
+    }
+
+    impl DataActor for LifecycleActor {
+        fn on_start(&mut self) -> anyhow::Result<()> {
+            self.starts += 1;
+            Ok(())
+        }
+
+        fn on_stop(&mut self) -> anyhow::Result<()> {
+            anyhow::ensure!(!self.fail_stop, "stop failed");
+            Ok(())
+        }
+    }
+
+    nautilus_actor!(LifecycleActor);
+
+    #[rstest]
+    fn native_lifecycle_revision_survives_same_object_resume_and_reset() {
+        let mut actor = LifecycleActor::new();
+        assert_eq!(actor.lifecycle_revision(), Some(0));
+        actor.initialize().unwrap();
+        assert_eq!(actor.lifecycle_revision(), Some(1));
+        actor.start().unwrap();
+        actor.stop().unwrap();
+        let stopped = actor.lifecycle_revision().unwrap();
+        assert_eq!(stopped, 5);
+        actor.resume().unwrap();
+        actor.stop().unwrap();
+        assert_eq!(actor.state(), ComponentState::Stopped);
+        assert!(actor.lifecycle_revision().unwrap() > stopped);
+        let stopped_again = actor.lifecycle_revision().unwrap();
+        actor.reset().unwrap();
+        actor.start().unwrap();
+        actor.stop().unwrap();
+        assert_eq!(actor.state(), ComponentState::Stopped);
+        assert!(actor.lifecycle_revision().unwrap() > stopped_again);
+        assert_eq!(actor.core.lifecycle_revision(), 15);
+    }
+
+    #[rstest]
+    fn native_lifecycle_revision_advances_before_failed_hook_but_not_invalid_trigger() {
+        let mut actor = LifecycleActor::new();
+        actor.initialize().unwrap();
+        assert!(actor.stop().is_err());
+        assert_eq!(actor.lifecycle_revision(), Some(1));
+        actor.start().unwrap();
+        actor.fail_stop = true;
+        assert!(actor.stop().is_err());
+        assert_eq!(actor.state(), ComponentState::Stopping);
+        assert_eq!(actor.lifecycle_revision(), Some(4));
+    }
+
+    #[rstest]
+    fn native_lifecycle_revision_overflow_rejects_state_and_hook_mutation() {
+        let mut actor = LifecycleActor::new();
+        actor.initialize().unwrap();
+        actor.core.lifecycle_revision = u64::MAX;
+        assert!(
+            actor
+                .start()
+                .unwrap_err()
+                .to_string()
+                .contains("revision exhausted")
+        );
+        assert_eq!(actor.lifecycle_revision(), Some(u64::MAX));
+        assert_eq!(actor.state(), ComponentState::Ready);
+        assert_eq!(actor.starts, 0);
+    }
+
+    #[rstest]
+    fn native_lifecycle_revision_registry_reads_standard_actor_capability() {
+        let mut actor = LifecycleActor::new();
+        actor.core.actor_id = "LIFECYCLE-REVISION".into();
+        actor.initialize().unwrap();
+        let id = actor.core.actor_id.inner();
+        let _component = register_component(actor);
+        assert_eq!(component_lifecycle_revision(&id).unwrap(), Some(1));
+        deregister_component(&id);
+    }
 }

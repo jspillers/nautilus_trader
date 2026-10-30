@@ -81,6 +81,23 @@ impl SimulatedExecutionClientFactory for SandboxExecutionClientFactory {
         config: &dyn ClientConfig,
         cache: Rc<RefCell<Cache>>,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
+        self.create_with_clock(
+            trader_id,
+            name,
+            config,
+            cache,
+            Rc::new(RefCell::new(LiveClock::default())),
+        )
+    }
+
+    fn create_with_clock(
+        &self,
+        trader_id: TraderId,
+        name: &str,
+        config: &dyn ClientConfig,
+        cache: Rc<RefCell<Cache>>,
+        clock: Rc<RefCell<dyn Clock>>,
+    ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         let sandbox_config = config
             .as_any()
             .downcast_ref::<SandboxExecutionClientConfig>()
@@ -92,7 +109,6 @@ impl SimulatedExecutionClientFactory for SandboxExecutionClientFactory {
             .clone();
 
         let client_id = ClientId::from(name);
-        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(LiveClock::default()));
 
         let core = ExecutionClientCore::new(
             trader_id,

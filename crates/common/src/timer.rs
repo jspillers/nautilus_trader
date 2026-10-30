@@ -33,7 +33,11 @@ use nautilus_core::{
 };
 #[cfg(feature = "python")]
 use pyo3::{Py, PyAny, Python};
+use serde::{Deserialize, Serialize};
 use ustr::Ustr;
+
+mod recorded;
+pub use recorded::{RecordedTimeEventDispatch, TimerBinding};
 
 /// Returns a positive nanosecond interval, coercing zero to one nanosecond.
 #[must_use]
@@ -42,7 +46,7 @@ pub fn create_valid_interval(interval_ns: DurationNanos) -> NonZeroU64 {
 }
 
 #[repr(C)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.common", from_py_object)
@@ -203,6 +207,12 @@ pub enum TimeEventCallback {
     Rust(Arc<dyn Fn(TimeEvent) + Send + Sync>),
     /// Local Rust callback using `Rc` (not `Send`/`Sync`).
     RustLocal(Rc<dyn Fn(TimeEvent)>),
+    /// Native routing metadata carried with the actual callback lease.
+    Bound {
+        callback: Box<Self>,
+        binding: TimerBinding,
+        execution_lease: Option<crate::clock::ExecutionClockLease>,
+    },
 }
 
 impl Debug for TimeEventCallback {
@@ -212,18 +222,75 @@ impl Debug for TimeEventCallback {
             Self::Python(_) => f.write_str("Python callback"),
             Self::Rust(_) => f.write_str("Rust callback (thread-safe)"),
             Self::RustLocal(_) => f.write_str("Rust callback (local)"),
+            Self::Bound {
+                callback, binding, ..
+            } => f
+                .debug_struct(stringify!(TimeEventCallback))
+                .field("callback", callback)
+                .field("binding", binding)
+                .finish(),
         }
     }
 }
 
 impl TimeEventCallback {
+    /// Tags a framework-installed default callback with its native target ID.
+    #[must_use]
+    pub fn with_native_target(self, target: Ustr) -> Self {
+        let (callback, previous) = self.into_unbound();
+        let mut binding = previous.unwrap_or_default();
+        binding.target = Some(target);
+        Self::Bound {
+            callback: Box::new(callback),
+            binding,
+            execution_lease: None,
+        }
+    }
+
+    pub(crate) fn with_runtime_binding(
+        self,
+        binding: TimerBinding,
+        execution_lease: Option<crate::clock::ExecutionClockLease>,
+    ) -> Self {
+        let (callback, _) = self.into_unbound();
+        Self::Bound {
+            callback: Box::new(callback),
+            binding,
+            execution_lease,
+        }
+    }
+
+    pub(crate) fn into_unbound(self) -> (Self, Option<TimerBinding>) {
+        match self {
+            Self::Bound {
+                callback, binding, ..
+            } => (*callback, Some(binding)),
+            callback => (callback, None),
+        }
+    }
+
+    /// Returns metadata attached to this concrete callback lease, if present.
+    #[must_use]
+    pub fn binding(&self) -> Option<&TimerBinding> {
+        match self {
+            Self::Bound { binding, .. } => Some(binding),
+            _ => None,
+        }
+    }
+
     /// Returns `true` if this is a local (non-thread-safe) Rust callback.
     ///
     /// Local callbacks use `Rc` internally and require creation, cloning, dropping,
     /// and invocation to stay on the originating thread.
     #[must_use]
     pub const fn is_local(&self) -> bool {
-        matches!(self, Self::RustLocal(_))
+        match self {
+            Self::Bound { callback, .. } => callback.is_local(),
+            Self::RustLocal(_) => true,
+            Self::Rust(_) => false,
+            #[cfg(feature = "python")]
+            Self::Python(_) => false,
+        }
     }
 
     /// Invokes the callback for the given `TimeEvent`.
@@ -239,6 +306,26 @@ impl TimeEventCallback {
             Self::Python(callback) => callback.call(event),
             Self::Rust(callback) => callback(event),
             Self::RustLocal(callback) => callback(event),
+            Self::Bound {
+                callback,
+                binding,
+                execution_lease,
+            } => {
+                let actual_owner = binding
+                    .target
+                    .and_then(|id| crate::actor::registry::actor_registration(&id));
+                let dispatch = RecordedTimeEventDispatch {
+                    event: event.clone(),
+                    binding: binding.clone(),
+                    actual_owner,
+                    actual_execution_owner: execution_lease
+                        .as_ref()
+                        .filter(|lease| lease.is_active())
+                        .map(crate::clock::ExecutionClockLease::registration),
+                };
+                crate::msgbus::dispatch_tap_publish("events.time.dispatch".into(), &dispatch);
+                callback.call(event);
+            }
         }
     }
 }
@@ -486,6 +573,9 @@ impl Iterator for VirtualTimer {
         Some(item)
     }
 }
+
+#[cfg(test)]
+mod recorded_tests;
 
 #[cfg(test)]
 mod tests {

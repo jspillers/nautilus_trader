@@ -397,6 +397,23 @@ mod tests {
     };
 
     #[rstest]
+    #[case(OrderType::Limit)]
+    #[case(OrderType::Market)]
+    fn test_event_metadata_matches_native_history(#[case] kind: OrderType) {
+        let order = OrderTestBuilder::new(kind)
+            .instrument_id(InstrumentId::from("BTC-USDT.BINANCE"))
+            .quantity(Quantity::from(10))
+            .price(Price::new(100.0, 2))
+            .build();
+        let events = order.events();
+        assert_eq!(order.event_count(), events.len());
+        assert_eq!(order.last_event(), *events.last().unwrap());
+        for event in events {
+            assert_eq!(event.id(), event.clone().into_boxed().id());
+        }
+    }
+
+    #[rstest]
     #[should_panic(expected = "Order invariant violated: first event must be OrderInitialized")]
     fn test_init_event_panics_when_first_event_is_not_initialized() {
         let mut order = OrderTestBuilder::new(OrderType::Market)

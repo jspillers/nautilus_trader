@@ -32,11 +32,13 @@ use std::{
 use async_trait::async_trait;
 use nautilus_common::{
     clients::{ExecutionClient, ExecutionReportTask},
+    clock::{Clock, ExecutionClockLease},
     live::dst::task::JoinHandle,
     messages::execution::{
-        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-        GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
-        ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
+        ExecutionClientSettlement, GenerateFillReports, GenerateOrderStatusReport,
+        GenerateOrderStatusReports, GeneratePositionStatusReports, ModifyOrder, QueryAccount,
+        QueryOrder, SubmitOrder, SubmitOrderList,
     },
 };
 use nautilus_core::{Params, UnixNanos};
@@ -284,6 +286,15 @@ impl Drop for ReportTaskGuard {
 
 #[async_trait(?Send)]
 impl ExecutionClient for LiveExecutionClient {
+    fn bind_clock_registration(&mut self, registration: ExecutionClockLease) -> bool {
+        self.client
+            .try_borrow_mut()
+            .is_ok_and(|mut client| client.bind_clock_registration(registration))
+    }
+
+    fn recorded_clock(&self) -> Option<Rc<RefCell<dyn Clock>>> {
+        self.client.borrow().recorded_clock()
+    }
     fn is_connected(&self) -> bool {
         self.client.borrow().is_connected()
     }
@@ -306,6 +317,16 @@ impl ExecutionClient for LiveExecutionClient {
 
     fn get_account(&self) -> Option<AccountAny> {
         self.client.borrow().get_account()
+    }
+
+    fn strategy_settlement(
+        &self,
+        strategy_id: StrategyId,
+    ) -> anyhow::Result<ExecutionClientSettlement> {
+        self.client
+            .try_borrow()
+            .map_err(|e| anyhow::anyhow!("Execution client is busy: {e}"))?
+            .strategy_settlement(strategy_id)
     }
 
     fn retain_unresolved_submissions(&self) -> bool {

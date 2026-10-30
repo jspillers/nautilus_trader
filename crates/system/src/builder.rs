@@ -16,6 +16,7 @@
 use std::{cell::RefCell, fmt::Debug, rc::Rc, time::Duration};
 
 use nautilus_common::{
+    actor::DataActorConfig,
     cache::{CacheConfig, database::CacheDatabaseAdapter},
     clock::Clock,
     enums::Environment,
@@ -31,12 +32,14 @@ use nautilus_execution::engine::config::ExecutionEngineConfig;
 use nautilus_model::identifiers::TraderId;
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
+use nautilus_trading::ImportableStrategyConfig;
 
 use crate::{
     clock_factory::ClockFactory,
     config::KernelConfig,
     event_store::{EventStoreFactory, KernelEventStore},
     kernel::{NautilusKernel, NautilusKernelDependencies},
+    strategy_factory::StrategyFactory,
 };
 
 /// Builder for constructing a [`NautilusKernel`] with a fluent API.
@@ -69,12 +72,18 @@ pub struct NautilusKernelBuilder {
     event_store_factory: Option<EventStoreFactory>,
     external_msgbus_factory: Option<Box<dyn MessageBusBackingFactory>>,
     external_msgbus_egress: Option<Box<dyn MessageBusExternalEgress>>,
+    native_controller: Option<DataActorConfig>,
+    strategies: Vec<ImportableStrategyConfig>,
+    strategy_factories: Vec<StrategyFactory>,
 }
 
 impl Debug for NautilusKernelBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(NautilusKernelBuilder))
             .field("name", &self.name)
+            .field("native_controller", &self.native_controller)
+            .field("strategies", &self.strategies)
+            .field("strategy_factories", &self.strategy_factories)
             .field("trader_id", &self.trader_id)
             .field("environment", &self.environment)
             .field("instance_id", &self.instance_id)
@@ -110,6 +119,26 @@ impl Debug for NautilusKernelBuilder {
 }
 
 impl NautilusKernelBuilder {
+    /// Configures the standard native controller installed during construction.
+    #[must_use]
+    pub fn with_native_controller(mut self, config: DataActorConfig) -> Self {
+        self.native_controller = Some(config);
+        self
+    }
+
+    /// Selects initial strategies through native importable configuration.
+    #[must_use]
+    pub fn with_strategies(mut self, strategies: Vec<ImportableStrategyConfig>) -> Self {
+        self.strategies = strategies;
+        self
+    }
+
+    /// Installs a compiled strategy constructor in the native controller.
+    #[must_use]
+    pub fn with_strategy_factory(mut self, factory: StrategyFactory) -> Self {
+        self.strategy_factories.push(factory);
+        self
+    }
     /// Creates a new [`NautilusKernelBuilder`] with required parameters.
     #[must_use]
     pub const fn new(name: String, trader_id: TraderId, environment: Environment) -> Self {
@@ -139,6 +168,9 @@ impl NautilusKernelBuilder {
             event_store_factory: None,
             external_msgbus_factory: None,
             external_msgbus_egress: None,
+            native_controller: None,
+            strategies: Vec::new(),
+            strategy_factories: Vec::new(),
         }
     }
 
@@ -351,6 +383,8 @@ impl NautilusKernelBuilder {
         }
 
         let config = KernelConfig {
+            native_controller: self.native_controller,
+            strategies: self.strategies,
             environment: self.environment,
             trader_id: self.trader_id,
             load_state: self.load_state,
@@ -382,7 +416,8 @@ impl NautilusKernelBuilder {
             NautilusKernelDependencies::default()
                 .with_clock_factory(self.clock_factory)
                 .with_cache_database(self.cache_database)
-                .with_event_store_factory(self.event_store_factory),
+                .with_event_store_factory(self.event_store_factory)
+                .with_strategy_factories(self.strategy_factories),
         )?;
 
         let config = kernel.config.msgbus().unwrap_or_default();

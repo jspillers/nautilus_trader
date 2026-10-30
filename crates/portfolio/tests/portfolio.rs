@@ -3247,6 +3247,84 @@ fn test_margin_partial_fill_updates_margin_init_from_leaves_qty(
 }
 
 #[rstest]
+#[case::reported_unlocked(AccountType::Cash, false, "0.00")]
+#[case::reported_locked(AccountType::Cash, false, "7.00")]
+#[case::calculated(AccountType::Cash, true, "0.00")]
+#[case::wallet(AccountType::Wallet, false, "0.00")]
+fn test_initialize_orders_respects_reported_cash(
+    #[case] account_type: AccountType,
+    #[case] calculate_account_state: bool,
+    #[case] reported_locked: &str,
+) {
+    let instrument = InstrumentAny::CurrencyPair(default_fx_ccy(
+        Symbol::from("AUD/USD"),
+        Some(Venue::from("SIM")),
+    ));
+    let mut cache = Cache::new(None, None);
+    cache.add_instrument(instrument.clone()).unwrap();
+    let cache = Rc::new(RefCell::new(cache));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut portfolio = Portfolio::new(clock, Rc::clone(&cache), None);
+    let account_id = AccountId::from("SIM-001");
+    let total = Money::from("1000.00 USD");
+    let locked = Money::from(format!("{reported_locked} USD").as_str());
+    let balance = AccountBalance::from_total_and_locked(
+        total.as_decimal(),
+        locked.as_decimal(),
+        Currency::USD(),
+    )
+    .unwrap();
+    portfolio.update_account(&AccountState::new(
+        account_id,
+        account_type,
+        vec![balance],
+        vec![],
+        true,
+        UUID4::new(),
+        0.into(),
+        0.into(),
+        (account_type != AccountType::Wallet).then_some(Currency::USD()),
+    ));
+    cache
+        .borrow_mut()
+        .account_mut(&account_id)
+        .unwrap()
+        .set_calculate_account_state(calculate_account_state);
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("6"))
+        .price(Price::from("0.35"))
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, true)
+        .unwrap();
+    order = cache
+        .borrow_mut()
+        .update_order(&OrderEventAny::Submitted(submit_order(&order)))
+        .unwrap();
+    cache
+        .borrow_mut()
+        .update_order(&OrderEventAny::Accepted(accept_order(&order)))
+        .unwrap();
+
+    // No venue refresh can mask a startup-only double reservation.
+    for _ in 0..2 {
+        portfolio.initialize_orders();
+        assert!(portfolio.is_initialized());
+        let account = cache.borrow().account_owned(&account_id).unwrap();
+        assert_eq!(account.calculated_account_state(), calculate_account_state);
+        let expected = if calculate_account_state || account_type == AccountType::Wallet {
+            AccountBalance::from_total_and_locked(dec!(1000), dec!(2.10), Currency::USD()).unwrap()
+        } else {
+            balance
+        };
+        assert_eq!(account.balance(Some(Currency::USD())), Some(&expected));
+    }
+}
+
+#[rstest]
 fn test_initialize_orders_cash_account_with_base_currency() {
     let instrument = InstrumentAny::CurrencyPair(default_fx_ccy(
         Symbol::from("AUD/USD"),
@@ -11032,4 +11110,46 @@ fn test_unrealized_pnl_skips_empty_zero_quote_side(mut portfolio: Portfolio) {
     );
     let snapshot = portfolio.build_snapshot(&account_id).unwrap();
     assert!(snapshot.stale_instruments.contains(&instrument.id()));
+}
+
+#[rstest]
+fn account_endpoint_notifies_after_native_cache_update_without_recursive_publication(
+    simple_cache: Cache,
+    clock: VirtualClock,
+    cash_account_state: AccountState,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let portfolio = Portfolio::new(
+        Rc::new(RefCell::new(clock)),
+        Rc::new(RefCell::new(simple_cache)),
+        None,
+    );
+    let cache = Rc::clone(portfolio.cache());
+    let received = Rc::new(RefCell::new(Vec::new()));
+    let seen = Rc::clone(&received);
+    let handler = TypedHandler::from(move |event: &AccountState| {
+        let current = cache.borrow().account_owned(&event.account_id).unwrap();
+        assert_eq!(current.last_event().unwrap().event_id, event.event_id);
+        seen.borrow_mut().push(event.clone());
+    });
+    // Even a higher-priority observer must see native applied account state.
+    msgbus::subscribe_account_state("events.account.*".into(), handler, Some(100));
+    msgbus::send_account_state(
+        MessagingSwitchboard::portfolio_update_account(),
+        &cash_account_state,
+    );
+    assert_eq!(
+        received.borrow().as_slice(),
+        std::slice::from_ref(&cash_account_state)
+    );
+    // An existing applied-state topic notification must not be republished by
+    // Portfolio's own subscriber or change the original native timestamps.
+    msgbus::publish_account_state(
+        format!("events.account.{}", cash_account_state.account_id).into(),
+        &cash_account_state,
+    );
+    assert_eq!(
+        received.borrow().as_slice(),
+        &[cash_account_state.clone(), cash_account_state]
+    );
 }

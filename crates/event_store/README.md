@@ -142,6 +142,65 @@ Each file stores:
 Every commit uses `Durability::Immediate`. The high-watermark advances only after the backend
 acknowledges durability.
 
+## Immutable prefixes of an active run
+
+`EventStoreLifecycle::start_prefix_checkpoint` (or `EventStoreSession::start_prefix_checkpoint`
+for a directly owned session) admits one optional export job through the existing
+bounded writer channel. The writer flushes earlier entries, records the durable high-watermark
+and current manifest, and hands off one native `redb::ReadTransaction`. The worker copies native
+encoded entry rows and their original secondary index rows in bounded transactions while the
+source continues appending. It does not copy an open database file or seal the source.
+The lifecycle rejects disabled, unopened or sealed capture handles. Writer ownership remains
+private; lower-level writer users can call `EventStoreWriter::start_prefix_checkpoint` directly.
+
+The destination uses a `.checkpoint` extension and explicit `PrefixCheckpoint` metadata. Its
+source manifest remains `Running`; no `RunEnded` event is synthesized. A private staging artifact
+is published with an atomic, no-overwrite hard link only after all rows and completion metadata
+have committed. The destination parent directory must support hard links and directory sync.
+If directory sync fails after publication, `CheckpointError::PublicationUncertain` identifies
+the completed artifact which exists at the destination; inspect that path before retrying.
+Ordinary run openers reject
+checkpoint metadata, even if the file is renamed to `.redb`.
+
+`PrefixCheckpointReader` explicitly opens completed prefix artifacts. Its verifier combines the
+existing native entry/hash/index checks with digests of the original encoded entry and index
+tables. This proves structural identity through the frozen boundary, not capture completeness,
+availability of external dependencies, or exact replay. The cache snapshot anchor is an opaque
+reference, not full initial kernel state; exporting its referenced blob and proving replay remain
+separate work. Existing verification may allocate memory proportional to the prefix.
+
+The existing native verifier isolates checkpoint reads in its worker subprocess:
+
+```bash
+cargo run -p nautilus-event-store --bin verify -- --prefix-checkpoint /path/to/prefix.checkpoint
+```
+
+The explicit mode prevents treating a running source as a sealed run or a completed checkpoint.
+It reuses the verifier's timeout and abnormal-worker-exit handling, and never repairs, seals or
+quarantines its input. Entry/index table digests participate in the clean result. Marker sidecars
+and cache snapshot blobs are not exported; the report retains those limitations. The library
+reader and its `verify` method remain in-process APIs, so use the binary for potentially damaged
+files.
+
+Per-job limits must be supplied explicitly: transaction rows and bytes, destination cache and
+file bytes, source-file growth while the read view is pinned, and a cooperative deadline.
+Dropping or cancelling the job requests release of its native read view and cleans private
+partial output. Bounds and cancellation are checked between native reads/commits; operating
+system I/O cannot be forcibly interrupted. One active job prevents unbounded accumulation of
+pinned views. Actual MVCC page growth and shared-device latency still require workload
+qualification; these limits are operational export bounds, not trading capacity guarantees.
+Optional admission or destination failures do not trigger capture's required halt callback;
+a failed native writer flush retains the existing fail-stop behavior. Other backends default to
+explicit unsupported behavior, and deterministic simulation does not spawn export workers.
+
+The ignored `checkpoint_workload_qualification` test is an explicit release diagnostic. It pairs
+writer-only and concurrent-export cases over a fixed synthetic dataset, reporting submit latency,
+backlog, export completion time, source-file growth and native allocated-page samples. Its native
+write-transaction stats observer runs in both cases; observation overhead is included. Run it
+separately with `--ignored --nocapture --test-threads=1` and retain its JSON output with the tested
+platform, filesystem, source and build identity. The measurements qualify only that workload,
+not a deployment capacity, full initial kernel state or same-strategy replay.
+
 ## Failure and verification model
 
 The verifier is intentionally process-isolated. Some corrupted `redb` files can panic on open or

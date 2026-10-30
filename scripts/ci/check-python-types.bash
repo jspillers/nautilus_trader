@@ -10,6 +10,7 @@ project_dir="$(native_path "${3:-$1}")"
 
 VIRTUAL_ENV="" uv run --project "$project_dir" --no-sync python -m ty check \
   --python-version 3.12 \
+  --extra-search-path "$examples_dir/live" \
   --extra-search-path "$pkg_dir/../docs/tutorials" \
   --extra-search-path "$examples_dir/live/architect_ax" \
   --extra-search-path "$examples_dir/live/interactive_brokers" \

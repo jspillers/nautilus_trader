@@ -56,6 +56,10 @@ use crate::{
     trailing::{store_trailing_stop_activation, trailing_stop_calculate},
 };
 
+// Apply held emulation triggers before default-priority user data callbacks.
+// This is native preprocessing, like the DataEngine's built-in priority.
+const MARKET_DATA_PRIORITY: u32 = 10;
+
 pub struct OrderEmulator {
     clock: Rc<RefCell<dyn Clock>>,
     cache: Rc<RefCell<Cache>>,
@@ -177,7 +181,7 @@ impl OrderEmulator {
 
         let topic = get_quotes_topic(instrument_id);
         self.quote_handlers.insert(instrument_id, handler.clone());
-        msgbus::subscribe_quotes(topic.into(), handler, None);
+        msgbus::subscribe_quotes(topic.into(), handler, Some(MARKET_DATA_PRIORITY));
         self.send_data_command(DataCommand::Subscribe(SubscribeCommand::Quotes(
             SubscribeQuotes::new(
                 instrument_id,
@@ -207,7 +211,7 @@ impl OrderEmulator {
 
         let topic = get_trades_topic(instrument_id);
         self.trade_handlers.insert(instrument_id, handler.clone());
-        msgbus::subscribe_trades(topic.into(), handler, None);
+        msgbus::subscribe_trades(topic.into(), handler, Some(MARKET_DATA_PRIORITY));
         self.send_data_command(DataCommand::Subscribe(SubscribeCommand::Trades(
             SubscribeTrades::new(
                 instrument_id,
@@ -2612,6 +2616,116 @@ mod tests {
             .get_matching_core(&instrument.id())
             .unwrap();
         assert_eq!(core.last, Some(Price::from("5065.00")));
+    }
+
+    #[rstest]
+    fn test_emulation_trigger_precedes_default_market_data_subscriber(
+        instrument: CryptoPerpetual,
+        #[values(TriggerType::BidAsk, TriggerType::LastPrice)] trigger: TriggerType,
+        #[values(true, false)] observer_first: bool,
+    ) {
+        let (_clock, cache, emulator) = create_emulator();
+        let _data_commands = register_data_command_handler("DataEngine.queue_execute.priority");
+        let exec_commands = register_exec_command_handler("ExecEngine.queue_execute.priority");
+        let risk_events = register_risk_event_handler("RiskEngine.process.priority");
+        add_instrument_to_cache(&cache, &instrument);
+        let order = create_stop_market_order(&instrument, trigger);
+        let client_order_id = order.client_order_id();
+        let command = create_submit_order(&instrument, &order);
+        cache
+            .borrow_mut()
+            .add_order(order, None, None, false)
+            .unwrap();
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let quote_observed = observed.clone();
+        let quote_cache = cache.clone();
+        let quote_handler = TypedHandler::from(move |_: &QuoteTick| {
+            quote_observed.borrow_mut().push(
+                quote_cache
+                    .borrow()
+                    .order(&client_order_id)
+                    .unwrap()
+                    .status(),
+            );
+        });
+        let trade_observed = observed.clone();
+        let trade_cache = cache.clone();
+        let trade_handler = TypedHandler::from(move |_: &TradeTick| {
+            trade_observed.borrow_mut().push(
+                trade_cache
+                    .borrow()
+                    .order(&client_order_id)
+                    .unwrap()
+                    .status(),
+            );
+        });
+        let subscribe_observer = || match trigger {
+            TriggerType::BidAsk => msgbus::subscribe_quotes(
+                get_quotes_topic(instrument.id()).into(),
+                quote_handler.clone(),
+                None,
+            ),
+            TriggerType::LastPrice => msgbus::subscribe_trades(
+                get_trades_topic(instrument.id()).into(),
+                trade_handler.clone(),
+                None,
+            ),
+            _ => unreachable!(),
+        };
+
+        if observer_first {
+            subscribe_observer();
+        }
+        // Populate the native topic cache before the emulator's late subscription.
+        // This nontriggering update must not release the held order.
+        match trigger {
+            TriggerType::BidAsk => msgbus::publish_quote(
+                get_quotes_topic(instrument.id()),
+                &create_quote_tick(&instrument, "4999.00", "5000.00"),
+            ),
+            TriggerType::LastPrice => msgbus::publish_trade(
+                get_trades_topic(instrument.id()),
+                &create_trade_tick(&instrument, "5000.00"),
+            ),
+            _ => unreachable!(),
+        }
+        emulator
+            .borrow_mut()
+            .cache_submit_order_command(command.clone());
+        emulator.borrow_mut().handle_submit_order(&command);
+        assert_eq!(
+            cache.borrow().order(&client_order_id).unwrap().status(),
+            OrderStatus::Emulated
+        );
+
+        if !observer_first {
+            subscribe_observer();
+        }
+        observed.borrow_mut().clear();
+
+        match trigger {
+            TriggerType::BidAsk => msgbus::publish_quote(
+                get_quotes_topic(instrument.id()),
+                &create_quote_tick(&instrument, "5100.00", "5101.00"),
+            ),
+            TriggerType::LastPrice => msgbus::publish_trade(
+                get_trades_topic(instrument.id()),
+                &create_trade_tick(&instrument, "5100.00"),
+            ),
+            _ => unreachable!(),
+        }
+        assert_eq!(*observed.borrow(), vec![OrderStatus::Released]);
+        assert_eq!(
+            cache.borrow().order(&client_order_id).unwrap().status(),
+            OrderStatus::Released
+        );
+        assert!(matches!(
+            risk_events.get_messages().last(),
+            Some(OrderEventAny::Released(_))
+        ));
+        assert!(
+            matches!(exec_commands.get_messages().as_slice(), [TradingCommand::SubmitOrder(value)] if value.client_order_id == client_order_id)
+        );
     }
 
     #[rstest]

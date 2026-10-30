@@ -238,6 +238,24 @@ pub trait EventStore: Send {
         Ok(None)
     }
 
+    /// Freezes a durable immutable prefix for native off-writer export.
+    ///
+    /// The writer invokes this only after flushing earlier queued entries. A backend must
+    /// return a stable read view and metadata at the same boundary without sealing the run.
+    /// Backends without this native capability reject it explicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported backends, sealed runs or native read failures.
+    fn freeze_prefix(
+        &self,
+        _frozen_at_ns: nautilus_core::UnixNanos,
+    ) -> Result<crate::checkpoint::FrozenPrefix, EventStoreError> {
+        Err(EventStoreError::Backend(
+            "immutable prefixes are unsupported by this backend".to_string(),
+        ))
+    }
+
     /// Seals the open run with the given final status and persists the manifest update.
     ///
     /// Subsequent calls to [`EventStore::append_batch`] return [`EventStoreError::Closed`].

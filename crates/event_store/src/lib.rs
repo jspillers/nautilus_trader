@@ -54,6 +54,7 @@
 
 pub mod backend;
 pub mod capture;
+pub mod checkpoint;
 pub mod codec;
 pub mod entry;
 pub mod error;
@@ -83,14 +84,19 @@ pub use capture::{
     encode_fill_report, encode_order_filled, encode_order_status_report,
     encode_position_status_report, encode_submit_order, register_default,
 };
+pub use checkpoint::{
+    CheckpointError, CheckpointJob, CheckpointKind, CheckpointLimits, CheckpointStatus,
+    FrozenPrefix, PrefixCheckpointDescriptor, PrefixCheckpointReader, PrefixCheckpointVerifyReport,
+    PrefixMetadata, TableDigest,
+};
 pub use entry::{EventStoreEntry, PayloadType, Topic};
 pub use error::EventStoreError;
 pub use hash::{EntryHash, compute_entry_hash};
 pub use headers::Headers;
 pub use kernel::{
     BootError, EventStoreLifecycle, EventStoreLifecycleOptions, EventStoreSession, HaltSignal,
-    KernelError, RecoveredRun, RecoveryOutcome, build_run_id, open_run, open_run_with_options,
-    recover_predecessors,
+    KernelError, RecordedOriginSource, RecordedRunOrigin, RecordedRunOriginWitness, RecoveredRun,
+    RecoveryOutcome, build_run_id, open_run, open_run_with_options, recover_predecessors,
 };
 pub use manifest::{RunId, RunManifest, RunStatus};
 pub use markers::{

@@ -1392,6 +1392,47 @@ impl OrderMatchingEngine {
         self.core.get_orders()
     }
 
+    /// Returns whether native matching or unapplied projection work belongs to a strategy.
+    ///
+    /// Existing acknowledgement cleanup retires applied projection records. Missing
+    /// cache ownership for retained venue work remains pending for every strategy.
+    pub fn has_strategy_work(&mut self, strategy_id: StrategyId) -> bool {
+        self.purge_applied_updates();
+        self.purge_applied_fills();
+        self.purge_applied_cancels();
+        self.purge_applied_rejections();
+        let cache = self.cache.borrow();
+        let belongs = |id: &ClientOrderId| {
+            cache
+                .order(id)
+                .is_none_or(|order| order.strategy_id() == strategy_id)
+        };
+        self.core
+            .iter_orders()
+            .any(|order| belongs(&order.client_order_id))
+            || self.pending_updates.borrow().keys().any(belongs)
+            || self
+                .pending_fills
+                .values()
+                .any(|fill| belongs(&fill.client_order_id))
+            || self.pending_oto_order_ids.iter().any(belongs)
+            || self
+                .other_instrument_oto_order_ids
+                .iter()
+                .any(|id| belongs(id) && cache.order(id).is_none_or(|order| !order.is_closed()))
+            || self.rejected_oto_parent_ids.borrow().iter().any(belongs)
+            || self.canceled_oto_order_ids.iter().any(belongs)
+            || self.queue_pending.keys().any(belongs)
+            || (self.pending_resolution
+                && cache.has_positions_open(
+                    Some(&self.venue),
+                    Some(&self.instrument.id()),
+                    Some(&strategy_id),
+                    None,
+                    None,
+                ))
+    }
+
     #[must_use]
     /// Returns true if an order with the given client order ID exists in the matching engine.
     pub fn order_exists(&self, client_order_id: ClientOrderId) -> bool {

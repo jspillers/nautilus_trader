@@ -294,6 +294,21 @@ pub trait CustomDataTrait: HasTsInit + Send + Sync + Debug {
     /// Returns an error if JSON serialization fails.
     fn to_json(&self) -> anyhow::Result<String>;
 
+    /// Serializes the custom data to a JSON value for its native envelope.
+    ///
+    /// The default preserves the JSON-string conversion for existing implementations.
+    /// Types with a direct serde representation can override this to avoid creating
+    /// and parsing intermediate text, returning the same value as `to_json`.
+    ///
+    /// # Errors
+    /// Returns an error if JSON serialization or parsing fails.
+    fn to_json_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        let json = self.to_json().map_err(|e| {
+            serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })?;
+        serde_json::from_str(&json)
+    }
+
     /// Python-facing JSON serialization. Default implementation forwards to `to_json`.
     /// Override if a different behavior is needed for the Python API.
     ///
@@ -442,34 +457,9 @@ impl CustomData {
     }
 }
 
-/// Canonical JSON envelope for `CustomData`. All serialized `CustomData` uses this shape so
-/// deserialization can extract the payload without depending on user payload field names.
-struct CustomDataEnvelope {
-    type_name: String,
-    data_type: serde_json::Value,
-    payload: serde_json::Value,
-}
-
-impl Serialize for CustomDataEnvelope {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("CustomDataEnvelope", 3)?;
-        state.serialize_field("type", &self.type_name)?;
-        state.serialize_field("data_type", &self.data_type)?;
-        state.serialize_field("payload", &self.payload)?;
-        state.end()
-    }
-}
-
 impl CustomData {
     fn to_envelope_json_value(&self) -> Result<serde_json::Value, serde_json::Error> {
-        let json = self.data.to_json().map_err(|e| {
-            serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        })?;
-        let payload: serde_json::Value = serde_json::from_str(&json)?;
+        let payload = self.data.to_json_value()?;
         let metadata_value = self.data_type.metadata().map_or(
             serde_json::Value::Object(serde_json::Map::new()),
             |m| {
@@ -490,12 +480,19 @@ impl CustomData {
             );
         }
 
-        let envelope = CustomDataEnvelope {
-            type_name: self.data.type_name().to_string(),
-            data_type: serde_json::Value::Object(data_type_obj),
-            payload,
-        };
-        serde_json::to_value(envelope)
+        // Move the existing values instead of serializing them into a second tree,
+        // inserting in the canonical order also preserves serde_json/preserve_order.
+        let mut envelope = serde_json::Map::new();
+        envelope.insert(
+            "type".to_string(),
+            serde_json::Value::String(self.data.type_name().to_string()),
+        );
+        envelope.insert(
+            "data_type".to_string(),
+            serde_json::Value::Object(data_type_obj),
+        );
+        envelope.insert("payload".to_string(), payload);
+        Ok(serde_json::Value::Object(envelope))
     }
 }
 
@@ -609,6 +606,48 @@ mod tests {
             .downcast_ref::<TestCustomData>()
             .unwrap();
         assert_eq!(orig_inner, rt_inner);
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_custom_data_preserves_canonical_codec_bytes(#[case] with_metadata: bool) {
+        let inner = TestCustomData {
+            ts_init: UnixNanos::from(100),
+            instrument_id: InstrumentId::from("TEST.SIM"),
+        };
+        let metadata = with_metadata.then(|| {
+            serde_json::from_value::<Params>(json!({"note": "quotes \" and λ", "n": 7})).unwrap()
+        });
+        let identifier = with_metadata.then(|| "TEST.SIM".to_string());
+        let original = CustomData::new(
+            Arc::new(inner),
+            DataType::new("TestCustomData", metadata, identifier),
+        );
+        let mut expected_type = json!({"type_name": "TestCustomData", "metadata": {}});
+        if with_metadata {
+            expected_type["metadata"] =
+                serde_json::to_value(original.data_type.metadata().unwrap()).unwrap();
+            expected_type["identifier"] = json!("TEST.SIM");
+        }
+        // Independent prior wire shape, including optional metadata and identifier
+        let canonical = json!({
+            "type": "TestCustomData",
+            "data_type": expected_type,
+            "payload": {"ts_init": 100, "instrument_id": "TEST.SIM"},
+        });
+        assert_eq!(
+            serde_json::to_vec(&original).unwrap(),
+            serde_json::to_vec(&canonical).unwrap()
+        );
+        assert_eq!(
+            rmp_serde::to_vec(&original).unwrap(),
+            rmp_serde::to_vec(&canonical).unwrap()
+        );
+        assert_eq!(
+            rmp_serde::to_vec_named(&original).unwrap(),
+            rmp_serde::to_vec_named(&canonical).unwrap()
+        );
     }
 
     #[rstest]

@@ -47,6 +47,7 @@ use crate::{
     snapshot::SnapshotAnchor,
     writer::{
         WriterConfig,
+        budget::Reservation,
         halt::{self, HaltCallback, HaltReason},
     },
 };
@@ -70,6 +71,13 @@ pub(super) enum WriterMessage {
         /// One-shot reply channel for the close result.
         ack: SyncSender<Result<u64, EventStoreError>>,
     },
+    /// Freezes a durable prefix without exporting on the writer thread or sealing the run.
+    FreezePrefix {
+        /// One-shot handoff to the owned export worker.
+        ack: SyncSender<Result<crate::checkpoint::FrozenPrefix, EventStoreError>>,
+        /// A dropped ticket or expired export request can avoid pinning a read view.
+        cancelled: Arc<AtomicBool>,
+    },
     /// Records a cache snapshot anchor after all pending entries have been flushed.
     RecordSnapshotAnchor {
         /// Cache-owned reference to the snapshot blob.
@@ -79,6 +87,100 @@ pub(super) enum WriterMessage {
         /// One-shot reply channel for the recorded anchor.
         ack: SyncSender<Result<SnapshotAnchor, EventStoreError>>,
     },
+}
+
+#[cfg(not(madsim))]
+impl WriterMessage {
+    pub(super) fn accounted_bytes(&self) -> usize {
+        let base = std::mem::size_of::<BudgetedMessage>()
+            .max(std::mem::size_of::<AppendEntry>() + std::mem::size_of::<Option<Reservation>>());
+        let aligned = |n: usize| n.checked_next_multiple_of(64).unwrap_or(usize::MAX);
+        let draft_bytes = |draft: &EntryDraft| {
+            draft.index_keys.iter().fold(
+                aligned(draft.payload.len())
+                    .saturating_add(64)
+                    .saturating_add(
+                        draft
+                            .index_keys
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<crate::backend::IndexKey>()),
+                    ),
+                |sum, key| sum.saturating_add(aligned(key.key.capacity())),
+            )
+        };
+        base.saturating_add(match self {
+            Self::Entry { draft, .. } => draft_bytes(draft),
+            Self::Close { run_ended, .. } => draft_bytes(run_ended),
+            Self::FreezePrefix { .. } => 0,
+            Self::RecordSnapshotAnchor {
+                blob_ref,
+                content_hash,
+                ..
+            } => aligned(blob_ref.capacity()).saturating_add(aligned(content_hash.capacity())),
+        })
+    }
+
+    pub(super) fn compact_payload(&mut self) {
+        let draft = match self {
+            Self::Entry { draft, .. } => draft,
+            Self::Close { run_ended, .. } => run_ended,
+            Self::RecordSnapshotAnchor { .. } | Self::FreezePrefix { .. } => return,
+        };
+        // A Bytes slice can retain an arbitrarily large caller-owned backing allocation,
+        // an independent exact-length copy makes the queue's payload accounting finite.
+        draft.payload = bytes::Bytes::copy_from_slice(&draft.payload);
+    }
+}
+
+/// Reservation follows its message into the durable batch instead of ending at dequeue.
+#[cfg(not(madsim))]
+pub(super) struct BudgetedMessage {
+    pub(super) message: WriterMessage,
+    pub(super) reservation: Option<Reservation>,
+    pub(super) bytes: usize,
+}
+
+#[cfg(not(madsim))]
+struct Batch {
+    entries: Vec<AppendEntry>,
+    reservations: Vec<Option<Reservation>>,
+    bytes: usize,
+}
+
+#[cfg(not(madsim))]
+impl Batch {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+            reservations: Vec::with_capacity(capacity),
+            bytes: 0,
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    fn would_exceed(&self, bytes: usize, config: &WriterConfig) -> bool {
+        !self.is_empty()
+            && config
+                .max_batch_bytes
+                .is_some_and(|limit| self.bytes.saturating_add(bytes) > limit)
+    }
+    fn full(&self, config: &WriterConfig) -> bool {
+        self.entries.len() >= config.max_batch_entries
+            || config
+                .max_batch_bytes
+                .is_some_and(|limit| self.bytes >= limit)
+    }
+    fn push(&mut self, entry: AppendEntry, reservation: Option<Reservation>, bytes: usize) {
+        self.entries.push(entry);
+        self.reservations.push(reservation);
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.reservations.clear();
+        self.bytes = 0;
+    }
 }
 
 /// The writer thread's halt fire path: the shared callback plus the once-only latch
@@ -105,11 +207,12 @@ impl HaltSink {
 #[cfg(not(madsim))]
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "writer thread owns the backend, config, halt sink, and clock"
+    clippy::too_many_lines,
+    reason = "writer thread owns the ordered entry, snapshot, flush and close lifecycle"
 )]
 pub(super) fn run(
     mut backend: Box<dyn EventStore + Send>,
-    rx: Receiver<WriterMessage>,
+    rx: Receiver<BudgetedMessage>,
     config: WriterConfig,
     halt: HaltSink,
     high_watermark: Arc<AtomicU64>,
@@ -126,7 +229,7 @@ pub(super) fn run(
         }
     };
 
-    let mut batch: Vec<AppendEntry> = Vec::with_capacity(config.max_batch_entries);
+    let mut batch = Batch::new(config.max_batch_entries);
     let mut batch_deadline: Option<Instant> = None;
 
     loop {
@@ -140,16 +243,29 @@ pub(super) fn run(
         };
 
         match recv_result {
-            Ok(WriterMessage::Entry { draft, ts_publish }) => {
+            Ok(BudgetedMessage {
+                message: WriterMessage::Entry { draft, ts_publish },
+                reservation,
+                bytes,
+            }) => {
+                if batch.would_exceed(bytes, &config) {
+                    if !flush(backend.as_mut(), &mut batch, &halt, high_watermark.as_ref()) {
+                        return;
+                    }
+                    batch_deadline = None;
+                }
                 let append = build_append_entry(draft, ts_publish, next_seq);
                 next_seq += 1;
-                batch.push(append);
+                batch.push(append, reservation, bytes);
 
                 if batch_deadline.is_none() {
                     batch_deadline = Some(Instant::now() + config.max_batch_latency);
                 }
 
-                if batch.len() >= config.max_batch_entries
+                // A busy receiver must not keep the elapsed batch deadline alive forever
+                let deadline_reached =
+                    batch_deadline.is_some_and(|deadline| Instant::now() >= deadline);
+                if (batch.full(&config) || deadline_reached)
                     && !flush(backend.as_mut(), &mut batch, &halt, high_watermark.as_ref())
                 {
                     return;
@@ -159,12 +275,38 @@ pub(super) fn run(
                     batch_deadline = None;
                 }
             }
-            Ok(WriterMessage::Close { run_ended, ack }) => {
-                drain_pending(&rx, &mut batch, &mut next_seq);
+            Ok(BudgetedMessage {
+                message: WriterMessage::Close { run_ended, ack },
+                reservation,
+                bytes,
+            }) => {
+                if !drain_pending(
+                    &rx,
+                    &mut batch,
+                    &mut next_seq,
+                    backend.as_mut(),
+                    &config,
+                    &halt,
+                    high_watermark.as_ref(),
+                ) {
+                    let _ = ack.send(Err(EventStoreError::Backend(
+                        "writer fail-stopped while draining before seal".to_string(),
+                    )));
+                    return;
+                }
+
+                if batch.would_exceed(bytes, &config)
+                    && !flush(backend.as_mut(), &mut batch, &halt, high_watermark.as_ref())
+                {
+                    let _ = ack.send(Err(EventStoreError::Backend(
+                        "writer fail-stopped before terminal entry".to_string(),
+                    )));
+                    return;
+                }
 
                 let now = clock.get_time_ns();
                 let run_ended_append = build_append_entry(run_ended, now, next_seq);
-                batch.push(run_ended_append);
+                batch.push(run_ended_append, reservation, bytes);
 
                 let flush_ok = flush(backend.as_mut(), &mut batch, &halt, high_watermark.as_ref());
                 if !flush_ok {
@@ -185,10 +327,38 @@ pub(super) fn run(
                 let _ = ack.send(final_result);
                 return;
             }
-            Ok(WriterMessage::RecordSnapshotAnchor {
-                blob_ref,
-                content_hash,
-                ack,
+            Ok(BudgetedMessage {
+                message: WriterMessage::FreezePrefix { ack, cancelled },
+                reservation,
+                ..
+            }) => {
+                if cancelled.load(Ordering::Acquire) {
+                    let _ = ack.send(Err(EventStoreError::Closed));
+                    continue;
+                }
+
+                if !batch.is_empty()
+                    && !flush(backend.as_mut(), &mut batch, &halt, high_watermark.as_ref())
+                {
+                    let _ = ack.send(Err(EventStoreError::Backend(
+                        "writer fail-stopped before prefix freeze".to_string(),
+                    )));
+                    return;
+                }
+                let frozen = backend.freeze_prefix(clock.get_time_ns());
+                let _ = ack.send(frozen);
+                drop(reservation);
+                batch_deadline = None;
+            }
+            Ok(BudgetedMessage {
+                message:
+                    WriterMessage::RecordSnapshotAnchor {
+                        blob_ref,
+                        content_hash,
+                        ack,
+                    },
+                reservation,
+                ..
             }) => {
                 if !record_snapshot_anchor(
                     backend.as_mut(),
@@ -202,6 +372,7 @@ pub(super) fn run(
                     return;
                 }
 
+                drop(reservation);
                 batch_deadline = None;
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -225,7 +396,7 @@ pub(super) fn run(
 #[cfg(not(madsim))]
 fn record_snapshot_anchor(
     backend: &mut dyn EventStore,
-    batch: &mut Vec<AppendEntry>,
+    batch: &mut Batch,
     halt: &HaltSink,
     high_watermark: &AtomicU64,
     blob_ref: String,
@@ -257,21 +428,42 @@ fn record_snapshot_anchor(
 }
 
 #[cfg(not(madsim))]
-fn drain_pending(rx: &Receiver<WriterMessage>, batch: &mut Vec<AppendEntry>, next_seq: &mut u64) {
-    while let Ok(msg) = rx.try_recv() {
-        match msg {
+fn drain_pending(
+    rx: &Receiver<BudgetedMessage>,
+    batch: &mut Batch,
+    next_seq: &mut u64,
+    backend: &mut dyn EventStore,
+    config: &WriterConfig,
+    halt: &HaltSink,
+    high_watermark: &AtomicU64,
+) -> bool {
+    while let Ok(pending) = rx.try_recv() {
+        let BudgetedMessage {
+            message,
+            reservation,
+            bytes,
+        } = pending;
+
+        match message {
             WriterMessage::Entry { draft, ts_publish } => {
+                if batch.would_exceed(bytes, config) && !flush(backend, batch, halt, high_watermark)
+                {
+                    return false;
+                }
                 let append = build_append_entry(draft, ts_publish, *next_seq);
                 *next_seq += 1;
-                batch.push(append);
+                batch.push(append, reservation, bytes);
+                if batch.full(config) && !flush(backend, batch, halt, high_watermark) {
+                    return false;
+                }
             }
-            // A second Close while draining: there is no producer that should send one
-            // (close consumes the writer), but if a future API permits it, fall back
-            // to the run_ended entry the outer loop already queued and ignore this one.
             WriterMessage::Close { ack, .. } => {
                 let _ = ack.send(Err(EventStoreError::Backend(
                     "writer is already closing".to_string(),
                 )));
+            }
+            WriterMessage::FreezePrefix { ack, .. } => {
+                let _ = ack.send(Err(EventStoreError::Closed));
             }
             WriterMessage::RecordSnapshotAnchor { ack, .. } => {
                 let _ = ack.send(Err(EventStoreError::Backend(
@@ -280,6 +472,7 @@ fn drain_pending(rx: &Receiver<WriterMessage>, batch: &mut Vec<AppendEntry>, nex
             }
         }
     }
+    true
 }
 
 /// Commits the current batch, advances the high-watermark mirror on success, or fires the
@@ -287,7 +480,7 @@ fn drain_pending(rx: &Receiver<WriterMessage>, batch: &mut Vec<AppendEntry>, nex
 #[cfg(not(madsim))]
 fn flush(
     backend: &mut dyn EventStore,
-    batch: &mut Vec<AppendEntry>,
+    batch: &mut Batch,
     halt: &HaltSink,
     high_watermark: &AtomicU64,
 ) -> bool {
@@ -295,7 +488,7 @@ fn flush(
         return true;
     }
 
-    match backend.append_batch(batch) {
+    match backend.append_batch(&batch.entries) {
         Ok(new_hwm) => {
             high_watermark.store(new_hwm, Ordering::Release);
             batch.clear();

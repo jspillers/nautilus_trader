@@ -34,6 +34,11 @@
 //! - **Any-based routing** (`publish_any`, `subscribe_any`): Flexible dispatch for
 //!   custom types and Python interop. Handlers receive `&dyn Any`.
 //!
+//! Both routes deliver higher priorities first, then lexical pattern order, and
+//! retain insertion order when both match. Generated handler IDs remain opaque
+//! identities; they do not determine delivery order. Removing and re-adding a
+//! subscription gives it a new place after existing ties.
+//!
 //! See [`core`] module documentation for design decisions and performance details.
 
 pub mod config;

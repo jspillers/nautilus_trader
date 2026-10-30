@@ -834,7 +834,9 @@ impl SimulatedExchange {
     pub fn send(&mut self, command: TradingCommand) {
         if matches!(
             &command,
-            TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_)
+            TradingCommand::QueryOrder(_)
+                | TradingCommand::QueryAccount(_)
+                | TradingCommand::QueryStrategySettlement(_)
         ) {
             log::warn!("Simulated exchange does not support queries: {command}");
             return;
@@ -859,8 +861,17 @@ impl SimulatedExchange {
     fn generate_inflight_command(&mut self, command: &TradingCommand) -> (UnixNanos, u32) {
         if let Some(latency_model) = &self.latency_model {
             let ts = match command {
-                TradingCommand::SubmitOrder(_) | TradingCommand::SubmitOrderList(_) => {
-                    command.ts_init() + latency_model.get_insert_latency()
+                TradingCommand::SubmitOrder(cmd) => {
+                    command.ts_init() + latency_model.get_insert_latency_for_order(&cmd.order_init)
+                }
+                TradingCommand::SubmitOrderList(cmd) => {
+                    let latency = cmd
+                        .order_inits
+                        .iter()
+                        .map(|order| latency_model.get_insert_latency_for_order(order))
+                        .max()
+                        .unwrap_or_else(|| latency_model.get_insert_latency());
+                    command.ts_init() + latency
                 }
                 TradingCommand::ModifyOrder(_) | TradingCommand::ModifyOrders(_) => {
                     command.ts_init() + latency_model.get_update_latency()
@@ -2281,6 +2292,40 @@ mod tests {
         assert!(exchange.instruments.is_empty());
         assert!(exchange.matching_engines.is_empty());
         assert_eq!(exchange.last_raw_id, u32::MAX);
+    }
+
+    #[rstest]
+    fn test_post_only_latency_is_selected_per_inflight_command() {
+        let mut exchange = setup_exchange(Dispatch::Latency);
+        exchange.latency_model = Some(LatencyModelHandle::new(
+            StaticLatencyModel::new(
+                DurationNanos::from_millis(40),
+                DurationNanos::from_millis(250),
+                DurationNanos::ZERO,
+                DurationNanos::from_millis(60),
+            )
+            .with_post_only_insert_latency(DurationNanos::ZERO),
+        ));
+
+        for (post_only, expected_ms) in [(false, 290), (true, 40), (false, 290), (true, 40)] {
+            let order = OrderTestBuilder::new(OrderType::Limit)
+                .instrument_id("AUD/USD.SIM".into())
+                .side(OrderSide::Buy)
+                .quantity("1".into())
+                .price("1.00000".into())
+                .post_only(post_only)
+                .build();
+            let command = TradingCommand::SubmitOrder(SubmitOrder::from_order(
+                &order,
+                TraderId::test_default(),
+                None,
+                None,
+                UUID4::new(),
+                UnixNanos::from(100),
+            ));
+            let (due, _) = exchange.generate_inflight_command(&command);
+            assert_eq!(due, UnixNanos::from(100 + expected_ms * 1_000_000));
+        }
     }
 
     #[rstest]

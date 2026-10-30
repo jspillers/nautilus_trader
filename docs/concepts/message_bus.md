@@ -106,8 +106,22 @@ of invoking the Python callback.
 Python object publication does not send the object to external message-bus storage or transport.
 
 Delivery is **synchronous**. Nested publication finishes before the publishing callback continues.
-Higher subscription priorities run first; equal priority does not imply subscription insertion order.
-Use distinct priorities when callback order matters, including reproducible backtests.
+Higher subscription priorities run first, followed by lexical pattern order. This fork retains
+subscription insertion order when priority and pattern are equal in both native typed and Any-based
+routing, including cached topics. Opaque generated handler IDs do not determine delivery order.
+Repeating an existing subscription keeps its place; unsubscribing and subscribing again places it
+after existing handlers with the same priority and pattern.
+Use distinct priorities for required precedence, and reproduce the original subscription operations
+when reproducing a recorded run.
+The native `OrderEmulator` subscribes to quote and trade updates at priority `10`, before Actor and
+Strategy market-data callbacks at default priority `0`. A matching update can therefore release a
+held emulated order before a default callback cancels or modifies it on that same update. This fork
+deliberately defines that native preprocessing precedence; the upstream
+[emulated-order lifecycle](https://nautilustrader.io/docs/latest/concepts/orders/emulated/) describes
+monitoring and cancellation without assigning their same-update callback precedence. An explicitly
+higher-priority subscription still runs first. This ordering does not change emulation's native risk
+or execution routing.
+
 A handler exception is logged, and delivery continues to the remaining handlers. This delivery model
 does not make it safe to re-enter a component that is already executing in the publishing call stack.
 

@@ -20,6 +20,7 @@ use std::{collections::HashMap, str::FromStr, time::Duration};
 use ahash::AHashMap;
 use indexmap::IndexSet;
 use nautilus_common::{
+    actor::DataActorConfig,
     cache::CacheConfig,
     config::{
         ConfigError, ConfigErrorCollector, ConfigResult, check_non_empty_field, check_range,
@@ -44,7 +45,7 @@ use nautilus_risk::engine::config::RiskEngineConfig;
 #[cfg(feature = "streaming")]
 use nautilus_system::config::{DataCatalogConfig, StreamingConfig};
 use nautilus_system::{config::NautilusKernelConfig, event_store::EventStoreConfig};
-use nautilus_trading::ImportableControllerConfig;
+use nautilus_trading::{ImportableControllerConfig, ImportableStrategyConfig};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -753,6 +754,11 @@ impl Default for PluginConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
 pub struct LiveNodeConfig {
+    /// The standard native controller, separate from an importable Python controller.
+    pub native_controller: Option<DataActorConfig>,
+    /// Initial strategies selected through compiled native factories before startup.
+    #[builder(default)]
+    pub strategies: Vec<ImportableStrategyConfig>,
     /// The trading environment.
     #[builder(default = Environment::Live)]
     pub environment: Environment,
@@ -1083,6 +1089,12 @@ impl LiveExecutionEngineConfig {
 }
 
 impl NautilusKernelConfig for LiveNodeConfig {
+    fn native_controller(&self) -> Option<DataActorConfig> {
+        self.native_controller.clone()
+    }
+    fn strategies(&self) -> Vec<ImportableStrategyConfig> {
+        self.strategies.clone()
+    }
     fn environment(&self) -> Environment {
         self.environment
     }

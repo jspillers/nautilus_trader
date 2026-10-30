@@ -40,7 +40,7 @@ use indexmap::{IndexMap, IndexSet};
 use nautilus_common::{
     cache::{Cache, PositionRef},
     clients::ExecutionClient,
-    clock::Clock,
+    clock::{Clock, ExecutionClockLease, ExecutionClockRegistration},
     enums::LogColor,
     generators::position_id::PositionIdGenerator,
     log_info,
@@ -48,8 +48,10 @@ use nautilus_common::{
     messages::{
         ExecutionReport,
         execution::{
-            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
-            QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
+            ExecutionClientSettlement, ModifyOrder, QueryAccount, QueryOrder,
+            StrategySettlementClient, StrategySettlementMarker, SubmitOrder, SubmitOrderList,
+            TradingCommand,
         },
     },
     msgbus::{
@@ -58,8 +60,8 @@ use nautilus_common::{
         typed_handler::ShareableMessageHandler,
     },
     runner::{
-        TradingCommandMessage, capture_trading_cmd, trading_cmd_is_dispatching,
-        try_get_trading_cmd_sender,
+        TradingCommandMessage, capture_trading_cmd, send_strategy_settlement_marker,
+        trading_cmd_is_dispatching, try_get_trading_cmd_sender,
     },
     timer::{TimeEvent, TimeEventCallback},
 };
@@ -127,6 +129,7 @@ pub struct ExecutionEngine {
     clock: Rc<RefCell<dyn Clock>>,
     cache: Rc<RefCell<Cache>>,
     clients: IndexMap<ClientId, ExecutionClientAdapter>,
+    client_clock_generations: AHashMap<ClientId, u64>,
     default_client_id: Option<ClientId>,
     routing_map: AHashMap<Venue, ClientId>,
     instrument_venues: AHashSet<Venue>,
@@ -177,6 +180,7 @@ impl ExecutionEngine {
             clock: clock.clone(),
             cache,
             clients: IndexMap::new(),
+            client_clock_generations: AHashMap::new(),
             default_client_id: None,
             routing_map: AHashMap::new(),
             instrument_venues: AHashSet::new(),
@@ -420,7 +424,7 @@ impl ExecutionEngine {
             anyhow::bail!("Client already registered with ID {client_id}");
         }
 
-        let adapter = ExecutionClientAdapter::new(client);
+        let adapter = self.create_client_adapter(client)?;
         self.cache
             .borrow_mut()
             .add_client_account(client_id, adapter.account_id);
@@ -430,10 +434,54 @@ impl ExecutionEngine {
         Ok(())
     }
 
+    fn create_client_adapter(
+        &mut self,
+        mut client: Box<dyn ExecutionClient>,
+    ) -> anyhow::Result<ExecutionClientAdapter> {
+        let client_id = client.client_id();
+        let generation = self
+            .client_clock_generations
+            .get(&client_id)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Native client registration generation exhausted"))?;
+        let lease = ExecutionClockLease::new(ExecutionClockRegistration {
+            client_id,
+            registration_id: UUID4::new(),
+            generation,
+        });
+        client.bind_clock_registration(lease.clone());
+        let mut adapter = ExecutionClientAdapter::new(client);
+        adapter.clock_registration = Some(lease);
+        self.client_clock_generations.insert(client_id, generation);
+        Ok(adapter)
+    }
+
+    /// Returns the current native execution-client clock registration identity.
+    #[must_use]
+    pub fn client_clock_registration(
+        &self,
+        client_id: ClientId,
+    ) -> Option<ExecutionClockRegistration> {
+        self.clients
+            .get(&client_id)?
+            .clock_registration
+            .as_ref()
+            .filter(|lease| lease.is_active())
+            .map(ExecutionClockLease::registration)
+    }
+
     /// Registers a default execution client for fallback routing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the checked native client registration generation is exhausted.
     pub fn register_default_client(&mut self, client: Box<dyn ExecutionClient>) {
         let client_id = client.client_id();
-        let adapter = ExecutionClientAdapter::new(client);
+        let adapter = self
+            .create_client_adapter(client)
+            .expect("Native client registration generation exhausted");
         {
             let mut cache = self.cache.borrow_mut();
             cache.add_client_account(client_id, adapter.account_id);
@@ -552,6 +600,42 @@ impl ExecutionEngine {
         self.clients.values().map(|a| a.client.as_ref()).collect()
     }
 
+    /// Inspects registered clients without certifying native runner eligibility.
+    pub fn inspect_strategy_settlement(
+        &self,
+        strategy_id: StrategyId,
+    ) -> Vec<StrategySettlementClient> {
+        let mut clients: Vec<_> = self
+            .clients
+            .iter()
+            .map(|(id, adapter)| {
+                let (state, error) = match adapter.client.strategy_settlement(strategy_id) {
+                    Ok(state) => (state, None),
+                    Err(e) => (ExecutionClientSettlement::Pending, Some(e.to_string())),
+                };
+                StrategySettlementClient {
+                    client_id: *id,
+                    state,
+                    error,
+                }
+            })
+            .collect();
+
+        for id in &self.external_clients {
+            if !clients.iter().any(|client| client.client_id == *id) {
+                clients.push(StrategySettlementClient {
+                    client_id: *id,
+                    state: ExecutionClientSettlement::Unsupported,
+                    error: Some(
+                        "External execution client does not expose native settlement".to_string(),
+                    ),
+                });
+            }
+        }
+        clients.sort_by_key(|client| client.client_id);
+        clients
+    }
+
     #[must_use]
     /// Returns execution clients that would handle the given orders.
     ///
@@ -634,6 +718,17 @@ impl ExecutionEngine {
     pub fn register_oms_type(&mut self, strategy_id: StrategyId, oms_type: OmsType) {
         self.oms_overrides.insert(strategy_id, oms_type);
         log::info!("Registered OMS::{oms_type:?} for {strategy_id}");
+    }
+
+    /// Returns the configured OMS override for a strategy, if one is registered.
+    #[must_use]
+    pub fn oms_type_override(&self, strategy_id: StrategyId) -> Option<OmsType> {
+        self.oms_overrides.get(&strategy_id).copied()
+    }
+
+    /// Removes a strategy's configured OMS override after native retirement.
+    pub fn deregister_oms_type(&mut self, strategy_id: StrategyId) {
+        self.oms_overrides.remove(&strategy_id);
     }
 
     /// Registers external order claims for a strategy.
@@ -1032,12 +1127,12 @@ impl ExecutionEngine {
         self.cache.borrow_mut().cache_all().await?;
 
         // Snapshot before iterating: `get_or_init_own_order_book` re-enters `self.cache.borrow_mut()`.
-        let own_book_entries: Vec<(InstrumentId, OwnBookOrder)> = {
+        let (own_book_entries, cache_integrity): (Vec<(InstrumentId, OwnBookOrder)>, bool) = {
             let mut cache = self.cache.borrow_mut();
             cache.build_index();
-            let _ = cache.check_integrity();
+            let integrity = cache.check_integrity();
 
-            if self.config.manage_own_order_books {
+            let entries = if self.config.manage_own_order_books {
                 cache
                     .orders(None, None, None, None, None)
                     .into_iter()
@@ -1046,7 +1141,8 @@ impl ExecutionEngine {
                     .collect()
             } else {
                 Vec::new()
-            }
+            };
+            (entries, integrity)
         };
 
         for (instrument_id, own_order) in own_book_entries {
@@ -1055,6 +1151,9 @@ impl ExecutionEngine {
         }
 
         self.set_position_id_counts();
+        self.cache
+            .borrow()
+            .complete_bootstrap_cache_load(cache_integrity);
 
         log::info!(
             "Loaded cache in {}ms",
@@ -2055,6 +2154,17 @@ impl ExecutionEngine {
             log::debug!("{RECV}{CMD} {command}");
         }
 
+        if let TradingCommand::QueryStrategySettlement(query) = command {
+            let observed_at = self.clock.borrow().timestamp_ns();
+            let marker = StrategySettlementMarker {
+                query,
+                native_instance_id: get_message_bus().borrow().instance_id,
+                observed_at,
+            };
+            send_strategy_settlement_marker(marker, observed_at);
+            return;
+        }
+
         match self.validate_submission(&command) {
             SubmissionValidationResult::Valid => {}
             SubmissionValidationResult::StaleOrder {
@@ -2159,6 +2269,9 @@ impl ExecutionEngine {
             TradingCommand::CancelAllOrders(cmd) => self.handle_cancel_all_orders(client, &cmd),
             TradingCommand::QueryOrder(cmd) => self.handle_query_order(client, cmd),
             TradingCommand::QueryAccount(cmd) => self.handle_query_account(client, cmd),
+            TradingCommand::QueryStrategySettlement(_) => {
+                unreachable!("settlement queries bypass client routing")
+            }
         }
     }
 
@@ -2301,6 +2414,9 @@ impl ExecutionEngine {
                 let issuer = cmd.account_id.get_issuer();
                 format!("account_id={}, issuer={issuer}", cmd.account_id)
             }
+            TradingCommand::QueryStrategySettlement(cmd) => {
+                format!("strategy_id={}", cmd.strategy_id)
+            }
         }
     }
 
@@ -2363,6 +2479,7 @@ impl ExecutionEngine {
             | TradingCommand::CancelOrders(_)
             | TradingCommand::CancelAllOrders(_)
             | TradingCommand::QueryOrder(_) => None,
+            TradingCommand::QueryStrategySettlement(_) => None,
         }
     }
 
@@ -2377,6 +2494,7 @@ impl ExecutionEngine {
             TradingCommand::CancelAllOrders(cmd) => Some(cmd.instrument_id),
             TradingCommand::QueryOrder(cmd) => Some(cmd.instrument_id),
             TradingCommand::QueryAccount(_) => None,
+            TradingCommand::QueryStrategySettlement(_) => None,
         }
     }
 
@@ -5007,6 +5125,23 @@ mod tests {
     use rstest::*;
 
     use super::*;
+
+    #[rstest]
+    fn oms_override_retirement_preserves_other_strategies() {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let mut engine =
+            ExecutionEngine::new(Rc::new(RefCell::new(VirtualClock::new())), cache, None);
+        let retired = StrategyId::from("Retired-001");
+        let peer = StrategyId::from("Peer-002");
+        assert_eq!(engine.oms_type_override(retired), None);
+        engine.register_oms_type(retired, OmsType::Hedging);
+        engine.register_oms_type(peer, OmsType::Netting);
+        assert_eq!(engine.oms_type_override(retired), Some(OmsType::Hedging));
+        engine.deregister_oms_type(retired);
+        engine.deregister_oms_type(retired);
+        assert_eq!(engine.oms_type_override(retired), None);
+        assert_eq!(engine.oms_type_override(peer), Some(OmsType::Netting));
+    }
 
     #[rstest]
     fn netting_positions_open_for_report_scopes_positions_by_account() {

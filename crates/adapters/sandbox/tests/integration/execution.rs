@@ -59,7 +59,7 @@ use nautilus_execution::{
     },
 };
 use nautilus_model::{
-    accounts::{AccountAny, MarginAccount},
+    accounts::{Account, AccountAny, MarginAccount},
     data::{Bar, BarType, Data, InstrumentClose, InstrumentStatus, QuoteTick, TradeTick},
     enums::{
         AccountType, AggressorSide, BookType, ContingencyType, InstrumentCloseType, LiquiditySide,
@@ -79,7 +79,7 @@ use nautilus_model::{
     },
     orders::{Order, OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs},
     position::Position,
-    types::{Currency, Money, Price, Quantity},
+    types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use nautilus_sandbox::{SandboxExecutionClient, SandboxExecutionClientConfig};
 #[cfg(feature = "python")]
@@ -2578,6 +2578,100 @@ async fn test_client_connect(mut execution_client: SandboxExecutionClient) {
 
     assert!(result.is_ok());
     assert!(execution_client.is_connected());
+}
+
+#[rstest]
+#[case::fresh_cash(false)]
+#[case::restored_cash(true)]
+#[tokio::test]
+async fn test_client_connect_preserves_cached_cash_balances(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+    #[case] restored: bool,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let context = create_test_context_with(trader_id, account_id, venue, |config| {
+        config.account_type = AccountType::Cash;
+        config.starting_balances = vec![Money::from("100.00 USD")];
+    });
+    setup_account_state_handler(context.cache.clone());
+    let expected = if restored {
+        let balance = AccountBalance::new(
+            Money::from("90.00 USD"),
+            Money::from("10.00 USD"),
+            Money::from("80.00 USD"),
+        );
+        context
+            .client
+            .generate_account_state(vec![balance], vec![], false, 0.into(), None)
+            .unwrap();
+        balance
+    } else {
+        AccountBalance::new(
+            Money::from("100.00 USD"),
+            Money::from("0.00 USD"),
+            Money::from("100.00 USD"),
+        )
+    };
+    let mut client = context.client;
+
+    client.connect().await.unwrap();
+
+    let cache = context.cache.borrow();
+    let account = cache.account(&account_id).unwrap();
+    assert!(account.is_cash_account());
+    assert!(account.calculated_account_state());
+    assert_eq!(account.balances()[&Currency::USD()], expected);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_client_connect_after_execution_engine_reset_uses_starting_cash(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let context = create_test_context_with(trader_id, account_id, venue, |config| {
+        config.account_type = AccountType::Cash;
+        config.starting_balances = vec![Money::from("100.00 USD")];
+    });
+    setup_account_state_handler(context.cache.clone());
+    context
+        .client
+        .generate_account_state(
+            vec![AccountBalance::new(
+                Money::from("90.00 USD"),
+                Money::from("0.00 USD"),
+                Money::from("90.00 USD"),
+            )],
+            vec![],
+            false,
+            0.into(),
+            None,
+        )
+        .unwrap();
+    let mut engine = ExecutionEngine::new(context.test_clock, context.cache.clone(), None);
+    let client_id = context.client.client_id();
+    engine.register_client(Box::new(context.client)).unwrap();
+
+    engine.reset();
+
+    assert!(context.cache.borrow().account(&account_id).is_none());
+    engine
+        .get_client_adapter_mut(&client_id)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let cache = context.cache.borrow();
+    let account = cache.account(&account_id).unwrap();
+    assert_eq!(
+        account.balance_total(Some(Currency::USD())),
+        Some(Money::from("100.00 USD"))
+    );
+    assert!(account.calculated_account_state());
 }
 
 #[rstest]
@@ -8168,4 +8262,158 @@ async fn test_runtime_fee_factory_preserves_native_dispatch_and_commission() {
             .to_string()
             .contains("conflicts with config.fee_model")
     );
+}
+
+#[rstest]
+fn test_post_only_latency_overlapping_orders_and_cancel(
+    trader_id: TraderId,
+    instrument: InstrumentAny,
+) {
+    let model = LatencyModelAny::Static(
+        StaticLatencyModel::new(
+            DurationNanos::from_millis(40),
+            DurationNanos::from_millis(250),
+            DurationNanos::ZERO,
+            DurationNanos::from_millis(60),
+        )
+        .with_post_only_insert_latency(DurationNanos::ZERO),
+    );
+    let mut harness = setup_engine_harness(trader_id, &instrument, Some(model));
+    let ts = harness.test_clock.borrow().timestamp_ns();
+    let maker = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id("O-POST-ONLY".into())
+        .side(OrderSide::Buy)
+        .price(Price::from("99.00"))
+        .quantity(Quantity::from("1.000"))
+        .post_only(true)
+        .ts_init(ts)
+        .build();
+    let other = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id("O-OTHER".into())
+        .side(OrderSide::Buy)
+        .price(Price::from("98.00"))
+        .quantity(Quantity::from("1.000"))
+        .ts_init(ts)
+        .build();
+    // A slower command arrives first; its classification cannot delay the post-only order
+    send_through_engine(&harness, trader_id, other.clone());
+    send_through_engine(&harness, trader_id, maker.clone());
+    assert_eq!(harness.settle().len(), 2);
+    assert_eq!(
+        advance_and_fire(&harness.test_clock, UnixNanos::from(*ts + 39_999_999)),
+        0
+    );
+    assert!(harness.settle().is_empty());
+    assert_eq!(
+        advance_and_fire(&harness.test_clock, UnixNanos::from(*ts + 40_000_000)),
+        1
+    );
+    let events = harness.settle();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(&events[0], OrderEventAny::Accepted(e)
+        if e.client_order_id == maker.client_order_id() && e.ts_event == UnixNanos::from(*ts + 40_000_000)));
+    assert_eq!(
+        cached_status(&harness.cache, &other),
+        OrderStatus::Submitted
+    );
+    let cancel_time = harness.test_clock.borrow().timestamp_ns();
+    send_command_through_engine(
+        &harness,
+        trader_id,
+        DeferredCommand::Cancel,
+        std::slice::from_ref(&maker),
+        cancel_time,
+    );
+    harness.settle();
+    assert_eq!(
+        advance_and_fire(&harness.test_clock, UnixNanos::from(*ts + 139_999_999)),
+        0
+    );
+    assert!(harness.settle().is_empty());
+    assert_eq!(
+        advance_and_fire(&harness.test_clock, UnixNanos::from(*ts + 140_000_000)),
+        1
+    );
+    let events = harness.settle();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(&events[0], OrderEventAny::Canceled(e)
+        if e.client_order_id == maker.client_order_id() && e.ts_event == UnixNanos::from(*ts + 140_000_000)));
+    assert_eq!(
+        advance_and_fire(&harness.test_clock, UnixNanos::from(*ts + 289_999_999)),
+        0
+    );
+    assert!(harness.settle().is_empty());
+    assert_eq!(
+        advance_and_fire(&harness.test_clock, UnixNanos::from(*ts + 290_000_000)),
+        1
+    );
+    let events = harness.settle();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(&events[0], OrderEventAny::Accepted(e)
+        if e.client_order_id == other.client_order_id() && e.ts_event == UnixNanos::from(*ts + 290_000_000)));
+    harness.engine.borrow_mut().stop();
+}
+
+#[rstest]
+#[case(true, 40_000_000)]
+#[case(false, 290_000_000)]
+fn test_post_only_latency_order_list_keeps_atomic_slowest_arrival(
+    trader_id: TraderId,
+    instrument: InstrumentAny,
+    #[case] both_post_only: bool,
+    #[case] expected_ns: u64,
+) {
+    let model = LatencyModelAny::Static(
+        StaticLatencyModel::new(
+            DurationNanos::from_millis(40),
+            DurationNanos::from_millis(250),
+            DurationNanos::ZERO,
+            DurationNanos::from_millis(60),
+        )
+        .with_post_only_insert_latency(DurationNanos::ZERO),
+    );
+    let mut harness = setup_engine_harness(trader_id, &instrument, Some(model));
+    let ts = harness.test_clock.borrow().timestamp_ns();
+    let orders: Vec<_> = [true, both_post_only]
+        .into_iter()
+        .enumerate()
+        .map(|(i, post_only)| {
+            let order = OrderTestBuilder::new(OrderType::Limit)
+                .instrument_id(instrument.id())
+                .client_order_id(format!("O-LIST-{i}").as_str().into())
+                .side(OrderSide::Buy)
+                .price(Price::from("99.00"))
+                .quantity(Quantity::from("1.000"))
+                .post_only(post_only)
+                .ts_init(ts)
+                .build();
+            cache_order(&harness, &order);
+            order
+        })
+        .collect();
+    msgbus::send_trading_command(
+        MessagingSwitchboard::exec_engine_execute(),
+        TradingCommand::SubmitOrderList(create_submit_order_list(
+            trader_id,
+            harness.client_id,
+            instrument.id(),
+            &orders,
+        )),
+    );
+    assert_eq!(harness.settle().len(), 2);
+    assert_eq!(
+        advance_and_fire(&harness.test_clock, UnixNanos::from(*ts + expected_ns - 1)),
+        0
+    );
+    assert!(harness.settle().is_empty());
+    assert_eq!(
+        advance_and_fire(&harness.test_clock, UnixNanos::from(*ts + expected_ns)),
+        1
+    );
+    let events = harness.settle();
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|event| matches!(event, OrderEventAny::Accepted(e) if e.ts_event == UnixNanos::from(*ts + expected_ns))));
+    harness.engine.borrow_mut().stop();
 }

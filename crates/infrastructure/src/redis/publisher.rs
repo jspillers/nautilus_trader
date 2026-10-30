@@ -18,7 +18,10 @@
 use std::{
     collections::VecDeque,
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -32,7 +35,6 @@ use super::{msgbus::RedisMessageBusConfig, stream_fields::bus_message_fields};
 struct Outstanding {
     messages: usize,
     bytes: usize,
-    failed: bool,
 }
 
 /// Credits cover the original channel, pending buffer and unconfirmed batches.
@@ -42,6 +44,7 @@ pub(super) struct PublishBudget {
     maximum_messages: usize,
     maximum_bytes: usize,
     outstanding: Mutex<Outstanding>,
+    failed: AtomicBool,
     failure: tokio::sync::Notify,
 }
 
@@ -51,6 +54,7 @@ impl PublishBudget {
             maximum_messages,
             maximum_bytes,
             outstanding: Mutex::default(),
+            failed: AtomicBool::new(false),
             failure: tokio::sync::Notify::new(),
         }
     }
@@ -58,11 +62,12 @@ impl PublishBudget {
     pub(super) fn reserve(&self, message: &BusMessage) -> anyhow::Result<()> {
         let mut work = self.outstanding.lock().expect("Publisher budget poisoned");
         let bytes = message_bytes(message);
-        if work.failed
+
+        if self.is_failed()
             || work.messages >= self.maximum_messages
             || bytes > self.maximum_bytes.saturating_sub(work.bytes)
         {
-            work.failed = true;
+            self.failed.store(true, Ordering::Release);
             self.failure.notify_one();
             anyhow::bail!("Native publisher outstanding-work limit exceeded");
         }
@@ -84,15 +89,266 @@ impl PublishBudget {
     }
 
     pub(super) fn is_failed(&self) -> bool {
-        self.outstanding
-            .lock()
-            .expect("Publisher budget poisoned")
-            .failed
+        self.failed.load(Ordering::Acquire)
+    }
+
+    fn replace(&self, old: &BusMessage, new: &BusMessage) -> anyhow::Result<()> {
+        let mut work = self.outstanding.lock().expect("Publisher budget poisoned");
+        let retained = work
+            .bytes
+            .checked_sub(message_bytes(old))
+            .expect("Publisher byte credit");
+        let bytes = message_bytes(new);
+        if self.is_failed() || bytes > self.maximum_bytes.saturating_sub(retained) {
+            self.failed.store(true, Ordering::Release);
+            self.failure.notify_one();
+            anyhow::bail!("Native publisher outstanding-work limit exceeded");
+        }
+        work.bytes = retained + bytes;
+        Ok(())
     }
 
     async fn failed(&self) {
         if !self.is_failed() {
             self.failure.notified().await;
+        }
+    }
+}
+
+type LatestSlot = Arc<Mutex<Option<BusMessage>>>;
+
+#[derive(Debug)]
+pub(super) enum PublishItem {
+    Message(BusMessage),
+    Latest(LatestSlot),
+}
+
+#[derive(Debug, Default)]
+struct Admission {
+    latest: Mutex<Option<(String, LatestSlot)>>,
+    closing: AtomicBool,
+    closed_reported: AtomicBool,
+}
+
+#[derive(Debug)]
+enum Rejection {
+    Closed,
+    Budget(anyhow::Error),
+}
+
+#[derive(Debug)]
+pub(super) struct PublishFailure {
+    first: bool,
+    rejection: Rejection,
+}
+
+impl PublishFailure {
+    pub(super) fn report(self) {
+        if self.first {
+            match self.rejection {
+                Rejection::Closed => log::error!("Native publisher channel closed"),
+                Rejection::Budget(e) => log::error!("Failed to queue native publication: {e}"),
+            }
+        }
+    }
+}
+
+/// Native publisher admission, retaining one pending slot per contiguous selected topic.
+#[derive(Debug, Clone)]
+pub(super) struct PublishSender {
+    sender: tokio::sync::mpsc::UnboundedSender<PublishItem>,
+    budget: Option<Arc<PublishBudget>>,
+    topics: Arc<[String]>,
+    admission: Arc<Admission>,
+}
+
+impl PublishSender {
+    pub(super) fn new(
+        sender: tokio::sync::mpsc::UnboundedSender<PublishItem>,
+        budget: Option<Arc<PublishBudget>>,
+        topics: Vec<String>,
+    ) -> Self {
+        Self {
+            sender,
+            budget,
+            topics: topics.into(),
+            admission: Arc::default(),
+        }
+    }
+
+    pub(super) fn is_closed(&self) -> bool {
+        self.admission.closing.load(Ordering::Acquire)
+            || self.sender.is_closed()
+            || self
+                .budget
+                .as_ref()
+                .is_some_and(|budget| budget.is_failed())
+    }
+
+    fn closed_failure(&self) -> PublishFailure {
+        let known_failure = self
+            .budget
+            .as_ref()
+            .is_some_and(|budget| budget.is_failed());
+        PublishFailure {
+            first: !known_failure && !self.admission.closed_reported.swap(true, Ordering::AcqRel),
+            rejection: Rejection::Closed,
+        }
+    }
+
+    pub(super) fn send(&self, message: BusMessage) -> Result<(), PublishFailure> {
+        let close = message.topic == CLOSE_TOPIC;
+        if close && self.admission.closing.swap(true, Ordering::AcqRel) {
+            return Err(PublishFailure {
+                first: false,
+                rejection: Rejection::Closed,
+            });
+        }
+
+        if !close && self.is_closed() {
+            // A known fatal budget transition already reports its cause
+            return Err(self.closed_failure());
+        }
+        let mut latest = self
+            .admission
+            .latest
+            .lock()
+            .expect("Publisher admission poisoned");
+
+        if close {
+            if self.sender.is_closed() {
+                return Err(PublishFailure {
+                    first: false,
+                    rejection: Rejection::Closed,
+                });
+            }
+            *latest = None;
+            return self
+                .sender
+                .send(PublishItem::Message(message))
+                .map_err(|_| PublishFailure {
+                    first: false,
+                    rejection: Rejection::Closed,
+                });
+        }
+
+        if self.is_closed() {
+            return Err(self.closed_failure());
+        }
+        let selected = self
+            .topics
+            .iter()
+            .any(|topic| topic == message.topic.as_str());
+        let result = if selected {
+            if latest
+                .as_ref()
+                .is_none_or(|(topic, _)| topic != message.topic.as_str())
+            {
+                *latest = Some((message.topic.to_string(), Arc::new(Mutex::new(None))));
+            }
+            let slot = &latest.as_ref().expect("Selected publisher slot").1;
+            self.enqueue_latest(slot, message)
+        } else {
+            // Other topics freeze the previous slot, preserving financial FIFO barriers
+            *latest = None;
+            self.enqueue_message(message)
+        };
+        drop(latest);
+
+        match result {
+            Ok(retired) => {
+                drop(retired);
+                Ok(())
+            }
+            Err(rejection) => {
+                let first = match &rejection {
+                    Rejection::Closed => {
+                        !self.admission.closed_reported.swap(true, Ordering::AcqRel)
+                    }
+                    Rejection::Budget(_) => true,
+                };
+                Err(PublishFailure { first, rejection })
+            }
+        }
+    }
+
+    fn enqueue_latest(
+        &self,
+        slot: &LatestSlot,
+        message: BusMessage,
+    ) -> Result<Option<BusMessage>, Rejection> {
+        let mut pending = slot.lock().expect("Publisher slot poisoned");
+        if let Some(old) = pending.as_ref() {
+            self.budget
+                .as_ref()
+                .map_or(Ok(()), |budget| budget.replace(old, &message))
+                .map_err(Rejection::Budget)?;
+            return Ok(pending.replace(message));
+        }
+        self.budget
+            .as_ref()
+            .map_or(Ok(()), |budget| budget.reserve(&message))
+            .map_err(Rejection::Budget)?;
+        *pending = Some(message);
+        if self.sender.send(PublishItem::Latest(slot.clone())).is_err() {
+            let rejected = pending.take().expect("Unqueued publisher payload");
+            release_message(self.budget.as_deref(), &rejected);
+            return Err(Rejection::Closed);
+        }
+        Ok(None)
+    }
+
+    fn enqueue_message(&self, message: BusMessage) -> Result<Option<BusMessage>, Rejection> {
+        self.budget
+            .as_ref()
+            .map_or(Ok(()), |budget| budget.reserve(&message))
+            .map_err(Rejection::Budget)?;
+
+        if let Err(e) = self.sender.send(PublishItem::Message(message)) {
+            let PublishItem::Message(rejected) = e.0 else {
+                unreachable!()
+            };
+            release_message(self.budget.as_deref(), &rejected);
+            return Err(Rejection::Closed);
+        }
+        Ok(None)
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum PublishReceiver {
+    Plain(tokio::sync::mpsc::UnboundedReceiver<BusMessage>),
+    Queued(tokio::sync::mpsc::UnboundedReceiver<PublishItem>),
+}
+
+impl From<tokio::sync::mpsc::UnboundedReceiver<BusMessage>> for PublishReceiver {
+    fn from(receiver: tokio::sync::mpsc::UnboundedReceiver<BusMessage>) -> Self {
+        Self::Plain(receiver)
+    }
+}
+impl From<tokio::sync::mpsc::UnboundedReceiver<PublishItem>> for PublishReceiver {
+    fn from(receiver: tokio::sync::mpsc::UnboundedReceiver<PublishItem>) -> Self {
+        Self::Queued(receiver)
+    }
+}
+impl PublishReceiver {
+    pub(super) async fn recv(&mut self) -> Option<BusMessage> {
+        match self {
+            Self::Plain(receiver) => receiver.recv().await,
+            Self::Queued(receiver) => receiver.recv().await.map(|item| match item {
+                PublishItem::Message(message) => message,
+                PublishItem::Latest(slot) => slot
+                    .lock()
+                    .expect("Publisher slot poisoned")
+                    .take()
+                    .expect("Queued publisher payload"),
+            }),
+        }
+    }
+    pub(super) fn close(&mut self) {
+        match self {
+            Self::Plain(receiver) => receiver.close(),
+            Self::Queued(receiver) => receiver.close(),
         }
     }
 }
@@ -169,8 +425,11 @@ fn batch_pipeline(
     maximum_messages: usize,
 ) -> (Pipeline, usize, usize) {
     let mut pipe = redis::pipe();
-    pipe.atomic();
     let count = maximum_messages.min(buffer.len());
+    // XADD is itself atomic. Preserve transactions only for multi-record batches.
+    if count > 1 {
+        pipe.atomic();
+    }
     let mut bytes = 0;
     for message in buffer.drain(..count) {
         bytes += message_bytes(&message);
@@ -198,7 +457,7 @@ fn batch_pipeline(
 /// Uses one original multiplexed connection, polling submissions in FIFO order.
 /// The callback owns a clone of that connection, not a new socket or driver.
 pub(super) async fn run<F, R>(
-    mut receiver: tokio::sync::mpsc::UnboundedReceiver<BusMessage>,
+    receiver: impl Into<PublishReceiver>,
     stream: String,
     config: MessageBusConfig,
     backing: RedisMessageBusConfig,
@@ -209,6 +468,7 @@ where
     F: FnMut(Pipeline) -> R,
     R: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
+    let mut receiver = receiver.into();
     validate(&backing)?;
     anyhow::ensure!(
         config.autotrim_mins.is_none_or(|minutes| minutes == 0),
@@ -256,7 +516,7 @@ where
 
         tokio::select! {
             // Poll ordered request futures before accepting the next batch.
-            // This submits each MULTI/EXEC before its successor on the same driver.
+            // This submits each batch before its successor on the same driver.
             biased;
             confirmation = pending.next(), if !pending.is_empty() => {
                 confirmation.expect("Pending publisher confirmation")?;
@@ -328,6 +588,246 @@ mod tests {
         }
     }
 
+    fn native_admission(
+        maximum_messages: usize,
+        maximum_bytes: usize,
+        topics: &[&str],
+    ) -> (PublishSender, PublishReceiver, Arc<PublishBudget>) {
+        let budget = Arc::new(PublishBudget::new(maximum_messages, maximum_bytes));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            PublishSender::new(
+                tx,
+                Some(budget.clone()),
+                topics.iter().map(|s| (*s).to_owned()).collect(),
+            ),
+            rx.into(),
+            budget,
+        )
+    }
+
+    #[tokio::test]
+    async fn native_admission_preserves_financial_and_topic_barriers() {
+        let (sender, mut receiver, budget) = native_admission(4, 4096, &["data.quote"]);
+        for (topic, payload) in [
+            ("data.quote", b"old-1".as_slice()),
+            ("data.quote", b"old-2"),
+            ("events.order", b"first"),
+            ("data.quote", b"new-1"),
+            ("data.quote", b"new-2"),
+            ("events.order", b"second"),
+        ] {
+            sender.send(message(topic, payload)).unwrap();
+        }
+        assert_eq!(budget.outstanding.lock().unwrap().messages, 4);
+        for expected in [b"old-2".as_slice(), b"first", b"new-2", b"second"] {
+            let actual = receiver.recv().await.unwrap();
+            assert_eq!(actual.payload.as_ref(), expected);
+            release_message(Some(&budget), &actual);
+        }
+        assert_eq!(budget.outstanding.lock().unwrap().messages, 0);
+        assert!(!budget.is_failed());
+    }
+
+    #[tokio::test]
+    async fn native_admission_never_rewrites_claimed_payloads() {
+        let (sender, mut receiver, budget) = native_admission(2, 4096, &["data.quote"]);
+        sender.send(message("data.quote", b"first")).unwrap();
+        let claimed = receiver.recv().await.unwrap();
+        sender.send(message("data.quote", b"second")).unwrap();
+        assert_eq!(claimed.payload.as_ref(), b"first");
+        assert_eq!(budget.outstanding.lock().unwrap().messages, 2);
+        let next = receiver.recv().await.unwrap();
+        assert_eq!(next.payload.as_ref(), b"second");
+        release_message(Some(&budget), &claimed);
+        release_message(Some(&budget), &next);
+        assert_eq!(budget.outstanding.lock().unwrap().messages, 0);
+    }
+
+    #[tokio::test]
+    async fn native_replacement_tracks_bytes_and_keeps_oversize_failure_latched() {
+        let (sender, mut receiver, budget) = native_admission(2, 32, &["data.quote"]);
+        sender.send(message("data.quote", b"small")).unwrap();
+        sender
+            .send(message("data.quote", b"a-larger-payload"))
+            .unwrap();
+        assert_eq!(budget.outstanding.lock().unwrap().bytes, 10 + 16);
+        sender.send(message("data.quote", b"x")).unwrap();
+        assert_eq!(budget.outstanding.lock().unwrap().bytes, 11);
+        let rejection = sender
+            .send(message(
+                "data.quote",
+                b"payload-is-too-large-for-the-existing-credit",
+            ))
+            .unwrap_err();
+        assert!(rejection.first);
+        assert!(sender.is_closed());
+        assert!(
+            !sender
+                .send(message("data.quote", b"later"))
+                .unwrap_err()
+                .first
+        );
+        let pending = receiver.recv().await.unwrap();
+        assert_eq!(pending.payload.as_ref(), b"x");
+        release_message(Some(&budget), &pending);
+        let work = budget.outstanding.lock().unwrap();
+        assert_eq!((work.messages, work.bytes), (0, 0));
+        assert!(budget.is_failed());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_native_admission_and_claim_return_all_credit_and_deliver_latest() {
+        let (sender, receiver, budget) = native_admission(8, 4096, &["data.quote"]);
+        let mut config = limits(2);
+        config.publish_max_outstanding_messages = Some(8);
+        config.publish_coalesce_topics = vec!["data.quote".to_owned()];
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let sink = published.clone();
+        let worker_budget = budget.clone();
+
+        let worker = tokio::spawn(run(
+            receiver,
+            "quotes".into(),
+            MessageBusConfig::default(),
+            config,
+            Some(worker_budget),
+            move |pipeline| {
+                // Observe submission order, as the real Redis driver does.
+                // Confirmation futures may complete in a different order.
+                sink.lock().unwrap().push(pipeline.get_packed_pipeline());
+                async move {
+                    tokio::task::yield_now().await;
+                    Ok(())
+                }
+            },
+        ));
+
+        for value in 0..5000 {
+            sender
+                .send(BusMessage::with_str_topic(
+                    "data.quote",
+                    BusPayloadType::QuoteTick,
+                    Bytes::from(value.to_string()),
+                    SerializationEncoding::Json,
+                ))
+                .unwrap();
+        }
+        sender.send(message("data.quote", b"last")).unwrap();
+        sender.send(BusMessage::new_close()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let work = budget.outstanding.lock().unwrap();
+        assert_eq!((work.messages, work.bytes), (0, 0));
+        assert!(!budget.is_failed());
+        assert!(
+            published
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .windows(4)
+                .any(|part| part == b"last")
+        );
+    }
+
+    #[rstest]
+    fn unexpected_native_channel_close_is_reported_once_and_never_admits_facts() {
+        let (sender, receiver, budget) = native_admission(2, 4096, &["data.quote"]);
+        drop(receiver);
+        assert!(sender.is_closed());
+        assert!(
+            sender
+                .send(message("events.order", b"first"))
+                .unwrap_err()
+                .first
+        );
+        assert!(
+            !sender
+                .send(message("events.order", b"second"))
+                .unwrap_err()
+                .first
+        );
+        assert_eq!(budget.outstanding.lock().unwrap().messages, 0);
+    }
+
+    #[tokio::test]
+    async fn different_selected_topics_remain_ordering_barriers_at_admission() {
+        let (sender, mut receiver, budget) =
+            native_admission(3, 4096, &["data.first", "data.second"]);
+        for (topic, payload) in [
+            ("data.first", b"old".as_slice()),
+            ("data.first", b"first"),
+            ("data.second", b"second"),
+            ("data.first", b"third"),
+        ] {
+            sender.send(message(topic, payload)).unwrap();
+        }
+
+        for expected in [b"first".as_slice(), b"second", b"third"] {
+            let actual = receiver.recv().await.unwrap();
+            assert_eq!(actual.payload.as_ref(), expected);
+            release_message(Some(&budget), &actual);
+        }
+        assert_eq!(budget.outstanding.lock().unwrap().messages, 0);
+    }
+
+    #[rstest]
+    fn native_unselected_facts_still_fail_at_the_original_limit() {
+        let (sender, _receiver, budget) = native_admission(2, 4096, &["data.quote"]);
+        sender.send(message("events.order", b"first")).unwrap();
+        sender.send(message("events.order", b"second")).unwrap();
+        assert!(
+            sender
+                .send(message("events.order", b"third"))
+                .unwrap_err()
+                .first
+        );
+        assert!(sender.is_closed());
+        assert!(
+            !sender
+                .send(message("events.order", b"fourth"))
+                .unwrap_err()
+                .first
+        );
+        assert_eq!(budget.outstanding.lock().unwrap().messages, 2);
+    }
+
+    #[tokio::test]
+    async fn native_close_freezes_accepted_quote_and_bypasses_full_credit() {
+        let (sender, mut receiver, budget) = native_admission(1, 4096, &["data.quote"]);
+        sender.send(message("data.quote", b"before-close")).unwrap();
+        sender.send(BusMessage::new_close()).unwrap();
+        assert!(sender.is_closed());
+        assert!(sender.send(message("data.quote", b"after-close")).is_err());
+        let accepted = receiver.recv().await.unwrap();
+        assert_eq!(accepted.payload.as_ref(), b"before-close");
+        release_message(Some(&budget), &accepted);
+        assert_eq!(receiver.recv().await.unwrap().topic, CLOSE_TOPIC);
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn native_failure_read_never_waits_for_accounting(#[case] failed: bool) {
+        let budget = Arc::new(PublishBudget::new(1, 4096));
+        if failed {
+            budget.reserve(&message("events.order", b"first")).unwrap();
+            assert!(budget.reserve(&message("events.order", b"second")).is_err());
+        }
+        let work = budget.outstanding.lock().unwrap();
+        let reader = budget.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || tx.send(reader.is_failed()).unwrap());
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        drop(work);
+        handle.join().unwrap();
+        assert_eq!(result.unwrap(), failed);
+    }
+
     #[rstest]
     fn outstanding_bound_includes_unconfirmed_work_and_latches_failure() {
         let budget = PublishBudget::new(2, 128);
@@ -350,7 +850,7 @@ mod tests {
         );
         let outstanding = budget.outstanding.lock().unwrap();
         assert_eq!((outstanding.messages, outstanding.bytes), (0, 0));
-        assert!(outstanding.failed);
+        assert!(budget.is_failed());
     }
 
     #[rstest]
@@ -563,6 +1063,25 @@ mod tests {
         assert!(published[0].windows(8).any(|part| part == b"accepted"));
         assert_eq!(budget.outstanding.lock().unwrap().messages, 0);
     }
+
+    #[rstest]
+    fn only_multi_record_batches_have_transaction_wrappers() {
+        for count in [1, 2, 4] {
+            let mut buffer = (0..count)
+                .map(|_| message("events.order", b"fact"))
+                .collect();
+            let (pipe, messages, _) =
+                batch_pipeline(&mut buffer, "facts", &MessageBusConfig::default(), count);
+            let packed = pipe.get_packed_pipeline();
+            let text = String::from_utf8(packed).unwrap();
+            assert_eq!(messages, count);
+            assert!(buffer.is_empty());
+            assert_eq!(text.matches("MULTI").count(), usize::from(count > 1));
+            assert_eq!(text.matches("EXEC").count(), usize::from(count > 1));
+            assert_eq!(text.matches("XADD").count(), count);
+        }
+    }
+
     async fn resp_command(reader: &mut BufReader<TcpStream>) -> Vec<Vec<u8>> {
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
@@ -584,7 +1103,7 @@ mod tests {
     }
 
     // Exercises the canonical Redis multiplexed driver on one real TCP socket.
-    // The server withholds the first EXEC reply until it checks for batch two.
+    // The server withholds the first XADD reply until it checks for batch two.
     #[tokio::test]
     async fn canonical_driver_pipelines_both_roles_before_ack_and_preserves_fact_order() {
         use tokio::{io::AsyncWriteExt, net::TcpListener};
@@ -598,16 +1117,13 @@ mod tests {
                     let mut reader = BufReader::new(socket);
                     loop {
                         let args = resp_command(&mut reader).await;
-                        if args[0] == b"MULTI" {
+                        if args[0] == b"XADD" {
+                            assert!(args.iter().any(|value| value == b"first"));
                             break;
                         }
                         assert_eq!(args[0], b"CLIENT");
                         reader.get_mut().write_all(b"+OK\r\n").await.unwrap();
                     }
-                    let first = resp_command(&mut reader).await;
-                    assert_eq!(first[0], b"XADD");
-                    assert!(first.iter().any(|value| value == b"first"));
-                    assert_eq!(resp_command(&mut reader).await[0], b"EXEC");
                     let before_ack = if reader.buffer().is_empty() {
                         let mut byte = [0];
                         tokio::time::timeout(
@@ -619,21 +1135,11 @@ mod tests {
                     } else {
                         true
                     };
-                    reader
-                        .get_mut()
-                        .write_all(b"+OK\r\n+QUEUED\r\n*1\r\n$3\r\n1-0\r\n")
-                        .await
-                        .unwrap();
-                    assert_eq!(resp_command(&mut reader).await[0], b"MULTI");
+                    reader.get_mut().write_all(b"$3\r\n1-0\r\n").await.unwrap();
                     let second = resp_command(&mut reader).await;
                     assert_eq!(second[0], b"XADD");
                     assert!(second.iter().any(|value| value == b"second"));
-                    assert_eq!(resp_command(&mut reader).await[0], b"EXEC");
-                    reader
-                        .get_mut()
-                        .write_all(b"+OK\r\n+QUEUED\r\n*1\r\n$3\r\n2-0\r\n")
-                        .await
-                        .unwrap();
+                    reader.get_mut().write_all(b"$3\r\n2-0\r\n").await.unwrap();
                     before_ack
                 });
                 let client = redis::Client::open(format!("redis://{address}/")).unwrap();

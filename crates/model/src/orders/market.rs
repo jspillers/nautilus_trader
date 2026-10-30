@@ -439,6 +439,16 @@ impl Order for MarketOrder {
         self.leaves_qty = self.quantity.saturating_sub(self.filled_qty);
     }
 
+    fn event_count(&self) -> usize {
+        self.events.len()
+    }
+
+    fn last_event(&self) -> &OrderEventAny {
+        self.events
+            .last()
+            .expect("Order invariant violated: no events")
+    }
+
     fn events(&self) -> Vec<&OrderEventAny> {
         self.events.iter().collect()
     }

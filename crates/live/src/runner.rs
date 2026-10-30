@@ -65,6 +65,8 @@ use std::{
     thread::{self, ThreadId},
 };
 
+#[cfg(feature = "node")]
+use nautilus_common::runner::recorded::RecordedRunnerDispatch;
 use nautilus_common::{
     live::{
         dispatch::DispatchMessage,
@@ -81,8 +83,8 @@ use nautilus_common::{
     msgbus::{self, MessagingSwitchboard},
     runner::{
         DataCommandSender, TimeEventMessage, TimeEventSender, TradingCommandMessage,
-        TradingCommandSender, replace_data_cmd_sender, replace_exec_cmd_sender,
-        replace_time_event_sender,
+        TradingCommandSender, recorded::RuntimeDispatchScope, replace_data_cmd_sender,
+        replace_exec_cmd_sender, replace_time_event_sender,
     },
 };
 use nautilus_model::events::OrderEventAny;
@@ -225,6 +227,8 @@ pub(crate) enum PendingRunnerEvent {
 
 pub struct AsyncRunner {
     channels: AsyncRunnerChannels,
+    #[cfg(feature = "node")]
+    recorded_front: Option<PendingRunnerEvent>,
     time_evt_tx: tokio::sync::mpsc::UnboundedSender<DispatchMessage<TimeEventMessage>>,
     system_evt_tx: tokio::sync::mpsc::UnboundedSender<DispatchMessage<SystemEvent>>,
     system_cmd_tx: tokio::sync::mpsc::UnboundedSender<DispatchMessage<SystemCommand>>,
@@ -232,7 +236,7 @@ pub struct AsyncRunner {
     signal_tx: tokio::sync::mpsc::UnboundedSender<()>,
     exec_evt_tx: tokio::sync::mpsc::UnboundedSender<DispatchMessage<ExecutionEvent>>,
     exec_cmd_tx: tokio::sync::mpsc::UnboundedSender<DispatchMessage<TradingCommandMessage>>,
-    data_evt_tx: tokio::sync::mpsc::UnboundedSender<DispatchMessage<DataEvent>>,
+    data_evt_tx: EventSender<DataEvent>,
     data_cmd_tx: tokio::sync::mpsc::UnboundedSender<DispatchMessage<DataCommand>>,
 }
 
@@ -284,6 +288,8 @@ impl AsyncRunner {
         let (data_cmd_tx, data_cmd_rx) = unbounded_channel::<DispatchMessage<DataCommand>>();
 
         Self {
+            #[cfg(feature = "node")]
+            recorded_front: None,
             channels: AsyncRunnerChannels {
                 time_evt_rx,
                 system_evt_rx,
@@ -300,7 +306,7 @@ impl AsyncRunner {
             signal_tx,
             exec_evt_tx,
             exec_cmd_tx,
-            data_evt_tx,
+            data_evt_tx: EventSender::new(data_evt_tx),
             data_cmd_tx,
         }
     }
@@ -330,7 +336,7 @@ impl AsyncRunner {
         replace_system_command_sender(DispatchSender::new(self.system_cmd_tx.clone()));
         replace_exec_event_sender(EventSender::new(self.exec_evt_tx.clone()));
         replace_exec_cmd_sender(Arc::new(AsyncTradingCommandSender::new(self.exec_cmd_tx.clone())));
-        replace_data_event_sender(EventSender::new(self.data_evt_tx.clone()));
+        replace_data_event_sender(self.data_evt_tx.with_current_thread_owner());
         replace_data_cmd_sender(Arc::new(sender));
     }
 
@@ -480,6 +486,9 @@ impl AsyncRunner {
     #[inline]
     #[must_use]
     pub fn handle_time_event(message: DispatchMessage<TimeEventMessage>) -> bool {
+        let _recorded = RuntimeDispatchScope::enter(|| {
+            nautilus_common::runner::recorded::describe_time_event(message.message())
+        });
         message.dispatch(TimeEventMessage::dispatch)
     }
 
@@ -490,6 +499,9 @@ impl AsyncRunner {
     /// Panics if a rooted command is processed outside its owner thread.
     #[inline]
     pub fn handle_data_command(cmd: DispatchMessage<DataCommand>) {
+        let _recorded = RuntimeDispatchScope::enter(|| {
+            nautilus_common::runner::recorded::describe_data_command(cmd.message())
+        });
         cmd.dispatch(|cmd| {
             msgbus::send_data_command(MessagingSwitchboard::data_engine_execute(), cmd);
         });
@@ -516,6 +528,10 @@ impl AsyncRunner {
     /// Handles a data event by sending to the appropriate `DataEngine` endpoint.
     #[inline]
     pub fn handle_data_event(event: DataEvent) {
+        let _recorded = RuntimeDispatchScope::enter(|| {
+            nautilus_common::runner::recorded::describe_data_event(&event)
+        });
+
         match event {
             DataEvent::Data(data) => {
                 msgbus::send_data(MessagingSwitchboard::data_engine_process_data(), data);
@@ -573,6 +589,10 @@ impl AsyncRunner {
     /// Handles an execution event by sending to the appropriate engine endpoint.
     #[inline]
     pub fn handle_exec_event(event: ExecutionEvent) {
+        let _recorded = RuntimeDispatchScope::enter(|| {
+            nautilus_common::runner::recorded::describe_execution_event(&event)
+        });
+
         match event {
             ExecutionEvent::Order(order_event) => {
                 msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), order_event);
@@ -610,6 +630,12 @@ impl AsyncRunner {
                     account,
                 );
             }
+            ExecutionEvent::StrategySettlement(marker) => {
+                let result = marker.unsupported(
+                    "Standalone runner does not provide a LiveNode settlement boundary",
+                );
+                msgbus::publish_any(result.query.topic().into(), &result);
+            }
         }
     }
 
@@ -622,6 +648,85 @@ impl AsyncRunner {
 
 #[cfg(feature = "node")]
 impl AsyncRunner {
+    pub(crate) fn take_recorded(
+        &mut self,
+        expected: &RecordedRunnerDispatch,
+    ) -> anyhow::Result<PendingRunnerEvent> {
+        use nautilus_common::runner::recorded::{self, RecordedChannel};
+
+        if self.recorded_front.is_none() {
+            self.recorded_front = match expected.channel {
+                RecordedChannel::ExecutionEvents => self
+                    .channels
+                    .exec_evt_rx
+                    .try_recv()
+                    .ok()
+                    .map(PendingRunnerEvent::ExecEvent),
+                RecordedChannel::ExecutionCommands => self
+                    .channels
+                    .exec_cmd_rx
+                    .try_recv()
+                    .ok()
+                    .map(PendingRunnerEvent::ExecCommand),
+                RecordedChannel::DataCommands => self
+                    .channels
+                    .data_cmd_rx
+                    .try_recv()
+                    .ok()
+                    .map(PendingRunnerEvent::DataCommand),
+                RecordedChannel::DataEvents => self
+                    .channels
+                    .data_evt_rx
+                    .try_recv()
+                    .ok()
+                    .map(PendingRunnerEvent::DataEvent),
+                _ => anyhow::bail!("Channel does not admit recomputed recorded dispatch"),
+            };
+        }
+        let front = self
+            .recorded_front
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Recorded native queue front is absent"))?;
+        let mut actual = match front {
+            PendingRunnerEvent::ExecEvent(event) => {
+                recorded::describe_execution_event(event.message())
+            }
+            PendingRunnerEvent::ExecCommand(command) => {
+                recorded::describe_trading_command(command.message())
+            }
+            PendingRunnerEvent::DataCommand(command) => {
+                recorded::describe_data_command(command.message())
+            }
+            PendingRunnerEvent::DataEvent(event) => recorded::describe_data_event(event.message()),
+            _ => anyhow::bail!("Unsupported recorded native channel"),
+        };
+        actual.ordinal = recorded::next_ordinal(actual.channel);
+        anyhow::ensure!(
+            *expected == actual,
+            "Recorded native queue front differs: expected {expected:?}; actual {actual:?}"
+        );
+        Ok(self.recorded_front.take().expect("validated native front"))
+    }
+
+    pub(crate) fn recorded_execution_empty(&self) -> bool {
+        self.channels.exec_evt_rx.is_empty()
+            && self.channels.exec_cmd_rx.is_empty()
+            && !matches!(
+                self.recorded_front,
+                Some(PendingRunnerEvent::ExecEvent(_) | PendingRunnerEvent::ExecCommand(_))
+            )
+    }
+
+    pub(crate) fn recorded_external_empty(&self) -> bool {
+        self.channels.data_evt_rx.is_empty()
+            && self.recorded_time_empty()
+            && !matches!(self.recorded_front, Some(PendingRunnerEvent::DataEvent(_)))
+    }
+
+    pub(crate) fn recorded_time_empty(&self) -> bool {
+        self.channels.time_evt_rx.is_empty()
+    }
+
     pub(crate) fn poll_pending(&mut self, mut process: impl FnMut(PendingRunnerEvent)) -> usize {
         self.bind_senders();
 
@@ -979,6 +1084,8 @@ mod tests {
         let (exec_cmd_tx, _) = tokio::sync::mpsc::unbounded_channel();
 
         AsyncRunner {
+            #[cfg(feature = "node")]
+            recorded_front: None,
             channels: AsyncRunnerChannels {
                 time_evt_rx,
                 system_evt_rx,
@@ -993,7 +1100,7 @@ mod tests {
             system_cmd_tx,
             exec_evt_tx,
             exec_cmd_tx,
-            data_evt_tx,
+            data_evt_tx: EventSender::new(data_evt_tx),
             data_cmd_tx,
             signal_rx,
             signal_tx,
@@ -2913,3 +3020,7 @@ mod tests {
         assert_eq!(*received.borrow(), vec![correlation_id]);
     }
 }
+
+#[cfg(all(test, feature = "node"))]
+#[path = "runner/recorded_tests.rs"]
+mod recorded_tests;

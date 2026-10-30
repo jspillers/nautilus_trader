@@ -1163,6 +1163,8 @@ impl LiveNodeConfig {
 
         Ok(Self {
             environment: environment.unwrap_or(default.environment),
+            native_controller: None,
+            strategies: Vec::new(),
             trader_id: trader_id.unwrap_or(default.trader_id),
             load_state: load_state.unwrap_or(default.load_state),
             save_state: save_state.unwrap_or(default.save_state),

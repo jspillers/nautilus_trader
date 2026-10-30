@@ -33,6 +33,13 @@ use crate::error::EventStoreError;
 pub enum HaltReason {
     /// Nonblocking capture found the bounded writer queue full.
     QueueFull,
+    /// Accounted bytes pending durable append exhausted the configured memory budget.
+    PendingBytesFull {
+        /// Configured byte ceiling.
+        limit: usize,
+        /// Accounted bytes in the message which could not be accepted.
+        required: usize,
+    },
     /// A submit blocked longer than the configured halt threshold while waiting for the
     /// writer thread to drain the channel.
     BackpressureStall {

@@ -22,16 +22,16 @@ use async_trait::async_trait;
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
-    clock::Clock,
+    clock::{Clock, ExecutionClockLease},
     factories::OrderEventFactory,
     live::try_get_exec_event_sender,
     messages::{
         ExecutionEvent,
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
-            GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
-            GeneratePositionStatusReports, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
-            SubmitOrderList, TradingCommand,
+            ExecutionClientSettlement, GenerateFillReports, GenerateOrderStatusReport,
+            GenerateOrderStatusReports, GeneratePositionStatusReports, ModifyOrder, QueryAccount,
+            QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
         },
     },
     msgbus::{
@@ -554,14 +554,26 @@ impl SandboxExecutionClient {
         SandboxInner::drain_inbound(&self.inner);
 
         let instrument_id = quote.instrument_id;
-        let instrument = self.cache.borrow().try_instrument(&instrument_id)?.clone();
+        let instrument = {
+            let cache = self.cache.borrow();
+            let instrument = cache.try_instrument(&instrument_id)?;
 
-        if !check_quote_or_drop("quote tick", quote, &instrument) {
-            return Ok(());
-        }
+            if !check_quote_or_drop("quote tick", quote, instrument) {
+                return Ok(());
+            }
+            (!self
+                .inner
+                .borrow()
+                .matching_engines
+                .contains_key(&instrument_id))
+            .then(|| instrument.clone())
+        };
 
         let mut inner = self.inner.borrow_mut();
-        inner.ensure_matching_engine(&instrument);
+        if let Some(instrument) = instrument {
+            inner.ensure_matching_engine(&instrument);
+        }
+
         if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
             engine.process_quote_tick(quote);
         }
@@ -581,14 +593,26 @@ impl SandboxExecutionClient {
         }
 
         let instrument_id = trade.instrument_id;
-        let instrument = self.cache.borrow().try_instrument(&instrument_id)?.clone();
+        let instrument = {
+            let cache = self.cache.borrow();
+            let instrument = cache.try_instrument(&instrument_id)?;
 
-        if !check_trade_or_drop("trade tick", trade, &instrument) {
-            return Ok(());
-        }
+            if !check_trade_or_drop("trade tick", trade, instrument) {
+                return Ok(());
+            }
+            (!self
+                .inner
+                .borrow()
+                .matching_engines
+                .contains_key(&instrument_id))
+            .then(|| instrument.clone())
+        };
 
         let mut inner = self.inner.borrow_mut();
-        inner.ensure_matching_engine(&instrument);
+        if let Some(instrument) = instrument {
+            inner.ensure_matching_engine(&instrument);
+        }
+
         if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
             engine.process_trade_tick(trade);
         }
@@ -608,14 +632,26 @@ impl SandboxExecutionClient {
         }
 
         let instrument_id = bar.bar_type.instrument_id();
-        let instrument = self.cache.borrow().try_instrument(&instrument_id)?.clone();
+        let instrument = {
+            let cache = self.cache.borrow();
+            let instrument = cache.try_instrument(&instrument_id)?;
 
-        if !check_bar_or_drop("bar", bar, &instrument) {
-            return Ok(());
-        }
+            if !check_bar_or_drop("bar", bar, instrument) {
+                return Ok(());
+            }
+            (!self
+                .inner
+                .borrow()
+                .matching_engines
+                .contains_key(&instrument_id))
+            .then(|| instrument.clone())
+        };
 
         let mut inner = self.inner.borrow_mut();
-        inner.ensure_matching_engine(&instrument);
+        if let Some(instrument) = instrument {
+            inner.ensure_matching_engine(&instrument);
+        }
+
         if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
             engine.process_bar(bar);
         }
@@ -631,10 +667,22 @@ impl SandboxExecutionClient {
         SandboxInner::drain_inbound(&self.inner);
 
         let instrument_id = deltas.instrument_id;
-        let instrument = self.cache.borrow().try_instrument(&instrument_id)?.clone();
+        let instrument = {
+            let cache = self.cache.borrow();
+            let instrument = cache.try_instrument(&instrument_id)?;
+            (!self
+                .inner
+                .borrow()
+                .matching_engines
+                .contains_key(&instrument_id))
+            .then(|| instrument.clone())
+        };
 
         let mut inner = self.inner.borrow_mut();
-        inner.ensure_matching_engine(&instrument);
+        if let Some(instrument) = instrument {
+            inner.ensure_matching_engine(&instrument);
+        }
+
         if let Some(engine) = inner.matching_engines.get_mut(&instrument_id) {
             engine.process_order_book_deltas(deltas)?;
         }
@@ -680,6 +728,16 @@ impl SandboxExecutionClient {
 
 #[async_trait(?Send)]
 impl ExecutionClient for SandboxExecutionClient {
+    fn bind_clock_registration(&mut self, registration: ExecutionClockLease) -> bool {
+        self.clock
+            .borrow_mut()
+            .bind_execution_registration(registration)
+    }
+
+    fn recorded_clock(&self) -> Option<Rc<RefCell<dyn Clock>>> {
+        Some(self.clock.clone())
+    }
+
     fn is_connected(&self) -> bool {
         self.core.borrow().is_connected()
     }
@@ -698,6 +756,30 @@ impl ExecutionClient for SandboxExecutionClient {
 
     fn oms_type(&self) -> OmsType {
         self.config.oms_type
+    }
+
+    fn strategy_settlement(
+        &self,
+        strategy_id: StrategyId,
+    ) -> anyhow::Result<ExecutionClientSettlement> {
+        if !self.core.try_borrow()?.is_connected() {
+            return Ok(ExecutionClientSettlement::Pending);
+        }
+        let mut inner = self.inner.try_borrow_mut()?;
+        if inner.inbound_queue.iter().any(|delayed| {
+            delayed
+                .command
+                .strategy_id()
+                .is_none_or(|id| id == strategy_id)
+        }) || inner
+            .matching_engines
+            .values_mut()
+            .any(|engine| engine.has_strategy_work(strategy_id))
+        {
+            Ok(ExecutionClientSettlement::Pending)
+        } else {
+            Ok(ExecutionClientSettlement::Quiescent)
+        }
     }
 
     fn settles_contract_expirations(&self) -> bool {
@@ -810,7 +892,9 @@ impl ExecutionClient for SandboxExecutionClient {
             return Ok(());
         }
 
-        let balances = self.get_account_balances();
+        // Reconnect after native cache loading preserves the calculated account;
+        // a fresh or fully reset cache still uses configured starting balances.
+        let balances = self.get_current_account_balances();
         let ts_event = self.clock.borrow().timestamp_ns();
         self.generate_account_state(balances, vec![], false, ts_event, None)?;
 
@@ -1125,17 +1209,24 @@ impl SandboxInner {
     fn process_quote_tick(&mut self, quote: &QuoteTick) {
         let instrument_id = quote.instrument_id;
 
-        let instrument = self.cache.borrow().instrument(&instrument_id).cloned();
-        if let Some(instrument) = instrument {
-            if !check_quote_or_drop("quote tick", quote, &instrument) {
+        let instrument = {
+            let cache = self.cache.borrow();
+            let Some(instrument) = cache.instrument(&instrument_id) else {
+                return;
+            };
+
+            if !check_quote_or_drop("quote tick", quote, instrument) {
                 return;
             }
+            (!self.matching_engines.contains_key(&instrument_id)).then(|| instrument.clone())
+        };
 
+        if let Some(instrument) = instrument {
             self.ensure_matching_engine(&instrument);
+        }
 
-            if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
-                engine.process_quote_tick(quote);
-            }
+        if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+            engine.process_quote_tick(quote);
         }
     }
 
@@ -1146,17 +1237,24 @@ impl SandboxInner {
 
         let instrument_id = trade.instrument_id;
 
-        let instrument = self.cache.borrow().instrument(&instrument_id).cloned();
-        if let Some(instrument) = instrument {
-            if !check_trade_or_drop("trade tick", trade, &instrument) {
+        let instrument = {
+            let cache = self.cache.borrow();
+            let Some(instrument) = cache.instrument(&instrument_id) else {
+                return;
+            };
+
+            if !check_trade_or_drop("trade tick", trade, instrument) {
                 return;
             }
+            (!self.matching_engines.contains_key(&instrument_id)).then(|| instrument.clone())
+        };
 
+        if let Some(instrument) = instrument {
             self.ensure_matching_engine(&instrument);
+        }
 
-            if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
-                engine.process_trade_tick(trade);
-            }
+        if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+            engine.process_trade_tick(trade);
         }
     }
 
@@ -1167,32 +1265,46 @@ impl SandboxInner {
 
         let instrument_id = bar.bar_type.instrument_id();
 
-        let instrument = self.cache.borrow().instrument(&instrument_id).cloned();
-        if let Some(instrument) = instrument {
-            if !check_bar_or_drop("bar", bar, &instrument) {
+        let instrument = {
+            let cache = self.cache.borrow();
+            let Some(instrument) = cache.instrument(&instrument_id) else {
+                return;
+            };
+
+            if !check_bar_or_drop("bar", bar, instrument) {
                 return;
             }
+            (!self.matching_engines.contains_key(&instrument_id)).then(|| instrument.clone())
+        };
 
+        if let Some(instrument) = instrument {
             self.ensure_matching_engine(&instrument);
+        }
 
-            if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
-                engine.process_bar(bar);
-            }
+        if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+            engine.process_bar(bar);
         }
     }
 
     fn process_order_book_deltas(&mut self, deltas: &OrderBookDeltas) {
         let instrument_id = deltas.instrument_id;
 
-        let instrument = self.cache.borrow().instrument(&instrument_id).cloned();
+        let instrument = {
+            let cache = self.cache.borrow();
+            let Some(instrument) = cache.instrument(&instrument_id) else {
+                return;
+            };
+            (!self.matching_engines.contains_key(&instrument_id)).then(|| instrument.clone())
+        };
+
         if let Some(instrument) = instrument {
             self.ensure_matching_engine(&instrument);
+        }
 
-            if let Some(engine) = self.matching_engines.get_mut(&instrument_id)
-                && let Err(e) = engine.process_order_book_deltas(deltas)
-            {
-                log::error!("Error processing order book deltas: {e}");
-            }
+        if let Some(engine) = self.matching_engines.get_mut(&instrument_id)
+            && let Err(e) = engine.process_order_book_deltas(deltas)
+        {
+            log::error!("Error processing order book deltas: {e}");
         }
     }
 
@@ -1347,7 +1459,9 @@ impl SandboxInner {
             TradingCommand::CancelOrder(cmd) => self.apply_cancel_order(cmd),
             TradingCommand::CancelOrders(cmd) => self.apply_batch_cancel_orders(cmd),
             TradingCommand::CancelAllOrders(cmd) => self.apply_cancel_all_orders(cmd),
-            TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_) => {}
+            TradingCommand::QueryOrder(_)
+            | TradingCommand::QueryAccount(_)
+            | TradingCommand::QueryStrategySettlement(_) => {}
         }
         Ok(())
     }
@@ -1454,7 +1568,9 @@ impl SandboxInner {
             // `CancelAllOrders` names no orders and the strategy marks none `PENDING_CANCEL` for
             // it, so there is no pending state to release and the FSM would refuse a rejection.
             TradingCommand::CancelAllOrders(_) => {}
-            TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_) => {}
+            TradingCommand::QueryOrder(_)
+            | TradingCommand::QueryAccount(_)
+            | TradingCommand::QueryStrategySettlement(_) => {}
         }
     }
 
@@ -1745,16 +1861,24 @@ impl SandboxInner {
         };
 
         match command {
-            TradingCommand::SubmitOrder(_) | TradingCommand::SubmitOrderList(_) => {
-                latency_model.get_insert_latency()
+            TradingCommand::SubmitOrder(cmd) => {
+                latency_model.get_insert_latency_for_order(&cmd.order_init)
             }
+            TradingCommand::SubmitOrderList(cmd) => cmd
+                .order_inits
+                .iter()
+                .map(|order| latency_model.get_insert_latency_for_order(order))
+                .max()
+                .unwrap_or_else(|| latency_model.get_insert_latency()),
             TradingCommand::ModifyOrder(_) | TradingCommand::ModifyOrders(_) => {
                 latency_model.get_update_latency()
             }
             TradingCommand::CancelOrder(_)
             | TradingCommand::CancelOrders(_)
             | TradingCommand::CancelAllOrders(_) => latency_model.get_delete_latency(),
-            TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_) => DurationNanos::ZERO,
+            TradingCommand::QueryOrder(_)
+            | TradingCommand::QueryAccount(_)
+            | TradingCommand::QueryStrategySettlement(_) => DurationNanos::ZERO,
         }
     }
 

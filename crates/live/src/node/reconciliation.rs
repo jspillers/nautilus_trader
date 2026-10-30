@@ -65,65 +65,188 @@ impl LiveNode {
         intervals: ReconciliationCheckIntervals,
         state: &mut ReconciliationCheckState<'_>,
     ) {
-        if reconciliation_check_due(now, *state.last_inflight_check, intervals.inflight) {
-            if self.state() == NodeState::ShuttingDown {
-                return;
-            }
+        let due = ReconciliationDue::at(now, intervals, state);
+        let performed = self.apply_reconciliation_due(
+            due,
+            state.open_order_report_task,
+            state.targeted_order_report_task.as_ref(),
+            state.position_report_task,
+        );
 
-            let result = self.exec_manager.check_inflight_orders();
-            self.process_reconciliation_events(&result.events);
-            for cmd in result.queries {
-                AsyncRunner::handle_exec_command(cmd);
-            }
-
+        if performed.inflight {
             *state.last_inflight_check = now;
         }
 
-        let open_due = reconciliation_check_due(now, *state.last_open_check, intervals.open);
-        let position_due =
-            reconciliation_check_due(now, *state.last_position_check, intervals.position);
-
-        if (open_due || position_due) && self.state() == NodeState::ShuttingDown {
-            return;
+        if performed.open {
+            *state.last_open_check = now;
         }
 
-        if state.open_order_report_task.is_some() || state.targeted_order_report_task.is_some() {
-            if open_due {
+        if performed.position {
+            *state.last_position_check = now;
+        }
+    }
+
+    pub(super) fn apply_reconciliation_due(
+        &mut self,
+        due: ReconciliationDue,
+        open: &mut Option<OpenOrderReportTask>,
+        targeted: Option<&TargetedOrderReportTask>,
+        position: &mut Option<PositionReportTask>,
+    ) -> ReconciliationChecksPerformed {
+        let mut performed = ReconciliationChecksPerformed::default();
+
+        if due.inflight {
+            if self.state() == NodeState::ShuttingDown {
+                return performed;
+            }
+            let result = self.exec_manager.check_inflight_orders();
+            self.process_reconciliation_events(&result.events);
+            for command in result.queries {
+                AsyncRunner::handle_exec_command(command);
+            }
+            performed.inflight = true;
+        }
+
+        if (due.open || due.position) && self.state() == NodeState::ShuttingDown {
+            return performed;
+        }
+
+        if open.is_some() || targeted.is_some() {
+            if due.open {
                 log::debug!("Open-order reconciliation already in progress");
-                *state.last_open_check = now;
+                performed.open = true;
             }
 
-            if position_due {
+            if due.position {
                 log::debug!(
                     "Position reconciliation delayed: open-order reconciliation in progress"
                 );
             }
-
-            return;
+            return performed;
         }
 
-        if state.position_report_task.is_some() {
-            if position_due {
+        if position.is_some() {
+            if due.position {
                 log::debug!("Position reconciliation already in progress");
-                *state.last_position_check = now;
+                performed.position = true;
             }
 
-            if open_due {
+            if due.open {
                 log::debug!(
                     "Open-order reconciliation delayed: position reconciliation in progress"
                 );
             }
-
-            return;
+            return performed;
         }
 
-        if position_due && (!open_due || *state.last_position_check < *state.last_open_check) {
-            *state.position_report_task = self.start_position_report_check();
-            *state.last_position_check = now;
-        } else if open_due {
-            *state.open_order_report_task = self.start_open_order_report_check();
-            *state.last_open_check = now;
+        if due.position && (!due.open || due.order == ReconciliationOrder::PositionFirst) {
+            *position = self.start_position_report_check();
+            performed.position = true;
+        } else if due.open {
+            *open = self.start_open_order_report_check();
+            performed.open = true;
         }
+        performed
+    }
+
+    pub(super) fn apply_open_order_report_outcome(
+        &mut self,
+        result: ReportTaskOutcome<OpenOrderReportResult>,
+        is_shutting_down: bool,
+    ) -> Option<TargetedOrderReportTask> {
+        match result {
+            ReportTaskOutcome::Completed(result) => {
+                let clients = self
+                    .exec_clients
+                    .iter()
+                    .map(|client| client as &dyn ExecutionClient)
+                    .collect::<Vec<_>>();
+                let reconciliation = self.exec_manager.reconcile_open_order_reports(
+                    &result.check,
+                    result.reports,
+                    &result.queried_clients,
+                    &result.failed_clients,
+                    &clients,
+                );
+                self.process_reconciliation_events(&reconciliation.events);
+                if !reconciliation.targeted_queries.is_empty() {
+                    if is_shutting_down {
+                        let ids = reconciliation
+                            .targeted_queries
+                            .iter()
+                            .map(TargetedOrderQuery::client_order_id)
+                            .collect::<Vec<_>>();
+                        self.cleanup_cancelled_report_tasks(&ids);
+                    } else {
+                        return Some(
+                            self.start_targeted_order_report_check(reconciliation.targeted_queries),
+                        );
+                    }
+                }
+            }
+            ReportTaskOutcome::TimedOut => {
+                self.cleanup_cancelled_report_tasks(&[]);
+                log::warn!(
+                    "Open-order report collection expired after {:?}",
+                    self.config.timeout_reconciliation
+                );
+            }
+        }
+        None
+    }
+
+    pub(super) fn apply_targeted_order_report_outcome(
+        &mut self,
+        result: ReportTaskOutcome<Vec<TargetedOrderReportResult>>,
+        planned: &[ClientOrderId],
+    ) {
+        match result {
+            ReportTaskOutcome::Completed(result) => {
+                let clients = self
+                    .exec_clients
+                    .iter()
+                    .map(|client| client as &dyn ExecutionClient)
+                    .collect::<Vec<_>>();
+                let events = self
+                    .exec_manager
+                    .reconcile_targeted_order_reports(result, &clients);
+                self.process_reconciliation_events(&events);
+            }
+            ReportTaskOutcome::TimedOut => {
+                self.cleanup_cancelled_report_tasks(planned);
+                log::warn!(
+                    "Targeted order report collection expired after {:?}",
+                    self.config.timeout_reconciliation
+                );
+            }
+        }
+    }
+
+    pub(super) fn apply_position_report_outcome(
+        &mut self,
+        result: ReportTaskOutcome<PositionReportTaskResult>,
+        is_shutting_down: bool,
+    ) -> Option<PositionReportTask> {
+        match result {
+            ReportTaskOutcome::Completed(PositionReportTaskResult::Positions(result)) => {
+                if is_shutting_down {
+                    self.cleanup_cancelled_report_tasks(&[]);
+                } else {
+                    return self.handle_position_report_result(result);
+                }
+            }
+            ReportTaskOutcome::Completed(PositionReportTaskResult::Fills(result)) => {
+                self.handle_position_fill_report_result(result);
+            }
+            ReportTaskOutcome::TimedOut => {
+                self.cleanup_cancelled_report_tasks(&[]);
+                log::warn!(
+                    "Position report collection expired after {:?}",
+                    self.config.timeout_reconciliation
+                );
+            }
+        }
+        None
     }
 
     fn start_open_order_report_check(&mut self) -> Option<OpenOrderReportTask> {
@@ -760,6 +883,46 @@ pub(super) struct ReconciliationCheckIntervals {
     pub(super) inflight: Duration,
     pub(super) open: Duration,
     pub(super) position: Duration,
+}
+
+/// Due decisions made by the existing native monotonic maintenance timer.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(super) struct ReconciliationDue {
+    pub(super) inflight: bool,
+    pub(super) open: bool,
+    pub(super) position: bool,
+    pub(super) order: ReconciliationOrder,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ReconciliationOrder {
+    #[default]
+    OpenFirst,
+    PositionFirst,
+}
+impl ReconciliationDue {
+    pub(super) fn at(
+        now: dst::time::Instant,
+        intervals: ReconciliationCheckIntervals,
+        state: &ReconciliationCheckState<'_>,
+    ) -> Self {
+        Self {
+            inflight: reconciliation_check_due(now, *state.last_inflight_check, intervals.inflight),
+            open: reconciliation_check_due(now, *state.last_open_check, intervals.open),
+            position: reconciliation_check_due(now, *state.last_position_check, intervals.position),
+            order: if *state.last_position_check < *state.last_open_check {
+                ReconciliationOrder::PositionFirst
+            } else {
+                ReconciliationOrder::OpenFirst
+            },
+        }
+    }
+}
+#[derive(Default)]
+pub(super) struct ReconciliationChecksPerformed {
+    inflight: bool,
+    open: bool,
+    position: bool,
 }
 
 /// Last check instants and report tasks owned by the node loop.

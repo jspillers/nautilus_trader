@@ -20,9 +20,12 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
-use nautilus_common::messages::execution::{
-    GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
-    GeneratePositionStatusReports,
+use nautilus_common::{
+    clock::ExecutionClockLease,
+    messages::execution::{
+        GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
+        GeneratePositionStatusReports,
+    },
 };
 use nautilus_core::UnixNanos;
 use nautilus_model::{
@@ -45,6 +48,7 @@ pub struct ExecutionClientAdapter {
     pub venue: Venue,
     pub account_id: AccountId,
     pub oms_type: OmsType,
+    pub(crate) clock_registration: Option<ExecutionClockLease>,
 }
 
 impl Deref for ExecutionClientAdapter {
@@ -87,6 +91,7 @@ impl ExecutionClientAdapter {
             venue,
             account_id,
             oms_type,
+            clock_registration: None,
         }
     }
 
@@ -215,5 +220,13 @@ impl ExecutionClientAdapter {
             strategy_id,
             ts_init,
         );
+    }
+}
+
+impl Drop for ExecutionClientAdapter {
+    fn drop(&mut self) {
+        if let Some(registration) = &self.clock_registration {
+            registration.retire();
+        }
     }
 }

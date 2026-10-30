@@ -13437,3 +13437,152 @@ fn test_cache_api_infallible_borrow_conflict_panics_with_context() {
     let _guard = cell.borrow_mut();
     let _ = api.order(&ClientOrderId::from("BORROW-ORDER"));
 }
+
+#[rstest]
+fn test_execution_revision_covers_native_mutation_and_read_boundaries(mut cache: Cache) {
+    let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100_000))
+        .build();
+    let id = order.client_order_id();
+    let mut revision = cache.execution_revision();
+    macro_rules! changed {
+        ($operation:expr) => {{
+            $operation;
+            assert!(cache.execution_revision() > revision);
+            revision = cache.execution_revision();
+        }};
+    }
+    changed!(cache.add_order(order.clone(), None, None, false).unwrap());
+    assert!(cache.order(&id).is_some());
+    assert_eq!(cache.execution_revision(), revision);
+    changed!(drop(cache.order_mut(&id)));
+    changed!(cache.replace_order(&order).unwrap());
+    assert_eq!(cache.execution_revision(), revision);
+    let order = cache
+        .update_order(&TestOrderEventStubs::submitted(
+            &order,
+            AccountId::from("SIM-001"),
+        ))
+        .unwrap();
+    let order = cache
+        .update_order(&TestOrderEventStubs::accepted(
+            &order,
+            AccountId::from("SIM-001"),
+            VenueOrderId::from("V-REV"),
+        ))
+        .unwrap();
+    revision = cache.execution_revision();
+    let fill = TestOrderEventStubs::filled(
+        &order,
+        &instrument,
+        Some(TradeId::new("T-REV")),
+        Some(PositionId::new("P-REV")),
+        Some(Price::from("1.00000")),
+        None,
+        None,
+        None,
+        Some(UnixNanos::from(1_000_000_000)),
+        None,
+    );
+    let position = Position::new(&instrument, fill.clone().into());
+    let discovery = cache.order_fill_revision();
+    changed!(cache.update_order(&fill).unwrap());
+    assert!(cache.order_fill_revision() > discovery);
+    changed!(cache.add_position(&position, OmsType::Hedging).unwrap());
+    changed!(drop(cache.position_mut(&position.id)));
+    changed!(cache.update_position(&position).unwrap());
+    changed!(
+        cache
+            .replace_position(&position, OmsType::Hedging, true, false)
+            .unwrap()
+    );
+    changed!(cache.snapshot_position(&position).unwrap());
+    changed!(cache.settle_position_snapshots(&position, None));
+    let snapshot = cache.snapshot_position_encoded(&position).unwrap();
+    assert!(cache.execution_revision() > revision);
+    let mut restored = Cache::default();
+    let before = restored.execution_revision();
+    restored
+        .restore_snapshot_blob(&snapshot.blob_ref, snapshot.blob)
+        .unwrap();
+    assert!(restored.execution_revision() > before);
+    revision = cache.execution_revision();
+    changed!(cache.reset());
+    assert_eq!(cache.execution_revision(), revision);
+}
+
+#[rstest]
+fn test_book_and_instrument_revisions_are_separate_from_financial_state(mut cache: Cache) {
+    let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+    let id = instrument.id();
+    let financial = cache.financial_revision();
+    let metadata = cache.instrument_revision();
+    cache.add_instrument(instrument.clone()).unwrap();
+    assert!(cache.instrument_revision() > metadata);
+    let metadata = cache.instrument_revision();
+    cache.add_instrument(instrument).unwrap();
+    assert!(cache.instrument_revision() > metadata);
+    let book = cache.book_revision();
+    cache
+        .add_order_book(OrderBook::new(id, BookType::L2_MBP))
+        .unwrap();
+    assert!(cache.book_revision() > book);
+    let book = cache.book_revision();
+    assert!(cache.order_book(&id).is_some());
+    assert_eq!(cache.book_revision(), book);
+    cache.order_book_mut(&id).unwrap().reset();
+    assert!(cache.book_revision() > book);
+    assert_eq!(cache.financial_revision(), financial);
+}
+
+#[rstest]
+fn test_cache_instance_disambiguates_equal_revisions_after_replacement() {
+    let first = Cache::default();
+    let replacement = Cache::default();
+    assert_eq!(first.financial_revision(), replacement.financial_revision());
+    assert_ne!(first.instance_id(), replacement.instance_id());
+}
+
+#[rstest]
+fn test_fill_discovery_revision_skips_unfilled_lifecycle_but_detects_imports() {
+    let mut cache = Cache::default();
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(InstrumentId::from("AUD/USD.SIM"))
+        .side(OrderSide::Buy)
+        .price(Price::from("1.00000"))
+        .quantity(Quantity::from(100_000))
+        .build();
+    let financial = cache.financial_revision();
+    let execution = cache.execution_revision();
+    let discovery = cache.order_fill_revision();
+    cache.add_order(order.clone(), None, None, false).unwrap();
+    let account = AccountId::from("SIM-001");
+    let submitted = cache
+        .update_order(&TestOrderEventStubs::submitted(&order, account))
+        .unwrap();
+    let accepted = cache
+        .update_order(&TestOrderEventStubs::accepted(
+            &submitted,
+            account,
+            VenueOrderId::from("V-DISCOVERY"),
+        ))
+        .unwrap();
+    let canceled = cache
+        .update_order(&TestOrderEventStubs::canceled(
+            &accepted,
+            account,
+            accepted.venue_order_id(),
+        ))
+        .unwrap();
+    assert_eq!(cache.order_fill_revision(), discovery);
+    assert_eq!(cache.financial_revision(), financial);
+    assert!(cache.execution_revision() > execution);
+    cache.replace_order(&canceled).unwrap();
+    assert!(cache.order_fill_revision() > discovery);
+    let discovery = cache.order_fill_revision();
+    drop(cache.order_mut(&canceled.client_order_id()));
+    assert!(cache.order_fill_revision() > discovery);
+}

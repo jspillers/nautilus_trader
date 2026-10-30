@@ -70,6 +70,12 @@ Alternatively, `register_default_client` registers a client and makes it the def
 
 ## Live node lifecycle
 
+`LiveNodeBuilder` invokes data client factories and execution client factories in their respective
+registration order, preserving that order when registering clients with their engines. Data clients
+connect before execution clients. Connections within each phase remain concurrent, so independent
+network completion and subsequent input arrival order can differ. Registration order does not
+establish a global FIFO order across live inputs.
+
 Rust `LiveNode::run()` prepares cached and venue state before starting trader components, then owns
 the event loop and coordinated shutdown.
 
@@ -411,9 +417,15 @@ equal or inverted thresholds.
 
 ### State transitions
 
-The live runner evaluates the monitor on its 100 ms maintenance tick, after sampling current queue
-depths. Queue depth is a point-in-time value. Mean dispatch time uses the messages and dispatch busy
-time accumulated since the previous metrics snapshot.
+The live runner observes `Backlogged` at native dispatch boundaries, before processing a dequeued
+message and after dispatch, across all five queues. The message just dequeued is included when an
+idle runner wakes on a burst. Both activation and recovery publish immediately on the native typed
+bus; recovery needs no subsequent input or maintenance tick. Queue depth is a point-in-time value,
+not an estimate of book freshness or execution-client connectivity.
+
+`Slow` remains periodic reporting on the 100 ms maintenance tick. Mean dispatch time uses the
+messages and dispatch busy time accumulated since the previous metrics snapshot. Backlog events
+report that same window's mean when available, but dispatch cost does not gate backlog transitions.
 
 | Condition    | Measure                                               | `Triggered`                                    | `Cleared`                                    |
 | ------------ | ----------------------------------------------------- | ---------------------------------------------- | -------------------------------------------- |
@@ -424,7 +436,7 @@ Each channel tracks `Backlogged` and `Slow` independently:
 
 - A value between the clear and trigger thresholds retains the prior state, so it does not publish
   another event.
-- If both conditions cross on one tick, the node publishes two events. Each condition clears
+- If both conditions cross, the node publishes two events. Each condition clears
   independently.
 - A sample window with no dispatches does not evaluate `Slow`. The condition retains its prior state
   until a window contains a dispatch.

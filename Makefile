@@ -431,7 +431,8 @@ format:  #-- Format Rust (with nightly) and Python code
 .PHONY: pre-commit
 pre-commit: check-cargo-cooldown  #-- Run all pre-commit hooks on all files
 	@$(timer_start) \
-		prek run --all-files \
+		PYO3_PYTHON="$$(VIRTUAL_ENV= uv run --project python --no-sync python -c 'import sys; print(sys.executable)')" \
+		VIRTUAL_ENV= uv run --project python --no-sync prek run --all-files \
 	$(call timer_end,Pre-commit)
 
 # The check-code target uses CARGO_FEATURES which is controlled by the HYPERSYNC flag.

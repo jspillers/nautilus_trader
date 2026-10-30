@@ -16,12 +16,19 @@
 use nautilus_common::{
     actor::{self, CallbackDispatchError},
     live::dst,
+    runner::recorded::RuntimeDispatchScope,
 };
 
 const CALLBACK_DRAIN_BUDGET: usize = 64;
 
 pub(crate) async fn drain_callbacks() -> Result<bool, CallbackDispatchError> {
-    let pending = actor::drain_callbacks(CALLBACK_DRAIN_BUDGET)?;
+    let pending = {
+        let _recorded = RuntimeDispatchScope::enter(|| {
+            nautilus_common::runner::recorded::describe_callbacks(CALLBACK_DRAIN_BUDGET)
+        });
+        actor::drain_callbacks(CALLBACK_DRAIN_BUDGET)?
+    };
+
     if pending {
         dst::task::yield_now().await;
     }

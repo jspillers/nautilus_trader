@@ -18,7 +18,9 @@
 use std::{cell::RefCell, collections::HashMap, fmt::Debug, rc::Rc, time::Duration};
 
 use ahash::{AHashMap, AHashSet};
+use indexmap::IndexMap;
 use nautilus_common::{
+    actor::DataActorConfig,
     cache::{CacheConfig, database::CacheDatabaseFactory},
     clients::ExecutionClient,
     clock::Clock,
@@ -45,8 +47,9 @@ use nautilus_system::{
     clock_factory::ClockFactory,
     event_store::{EventStoreFactory, KernelEventStore},
     kernel::{NautilusKernel, NautilusKernelDependencies},
+    strategy_factory::StrategyFactory,
 };
-use nautilus_trading::ImportableControllerConfig;
+use nautilus_trading::{ImportableControllerConfig, ImportableStrategyConfig};
 
 use super::{
     LiveNode,
@@ -91,8 +94,8 @@ impl Debug for ExternalMessageBusIngress {
 pub struct LiveNodeBuilder {
     name: String,
     config: LiveNodeConfig,
-    data_client_factories: HashMap<String, Box<dyn DataClientFactory>>,
-    exec_client_factories: HashMap<String, ExecutionClientFactoryEntry>,
+    data_client_factories: IndexMap<String, Box<dyn DataClientFactory>>,
+    exec_client_factories: IndexMap<String, ExecutionClientFactoryEntry>,
     data_client_configs: HashMap<String, Box<dyn ClientConfig>>,
     exec_client_configs: HashMap<String, Box<dyn ClientConfig>>,
     data_client_routing: HashMap<String, RoutingConfig>,
@@ -103,6 +106,7 @@ pub struct LiveNodeBuilder {
     external_msgbus_factory: Option<Box<dyn MessageBusBackingFactory>>,
     external_msgbus_egress: Option<Box<dyn MessageBusExternalEgress>>,
     external_msgbus_ingress: Option<ExternalMessageBusIngress>,
+    strategy_factories: Vec<StrategyFactory>,
 }
 
 impl Debug for LiveNodeBuilder {
@@ -110,6 +114,7 @@ impl Debug for LiveNodeBuilder {
         f.debug_struct(stringify!(LiveNodeBuilder))
             .field("name", &self.name)
             .field("config", &self.config)
+            .field("strategy_factories", &self.strategy_factories)
             .field("data_client_factories", &self.data_client_factories.keys())
             .field("exec_client_factories", &self.exec_client_factories.keys())
             .field("data_client_configs", &self.data_client_configs.keys())
@@ -137,6 +142,26 @@ impl Debug for LiveNodeBuilder {
 }
 
 impl LiveNodeBuilder {
+    /// Configures the standard native controller installed during kernel construction.
+    #[must_use]
+    pub fn with_native_controller(mut self, config: DataActorConfig) -> Self {
+        self.config.native_controller = Some(config);
+        self
+    }
+
+    /// Selects initial strategies through native importable configuration.
+    #[must_use]
+    pub fn with_strategies(mut self, strategies: Vec<ImportableStrategyConfig>) -> Self {
+        self.config.strategies = strategies;
+        self
+    }
+
+    /// Installs a compiled strategy constructor in the native controller.
+    #[must_use]
+    pub fn with_strategy_factory(mut self, factory: StrategyFactory) -> Self {
+        self.strategy_factories.push(factory);
+        self
+    }
     /// Creates a new [`LiveNodeBuilder`] with required parameters.
     ///
     /// # Errors
@@ -154,8 +179,8 @@ impl LiveNodeBuilder {
         Ok(Self {
             name: "LiveNode".to_string(),
             config,
-            data_client_factories: HashMap::new(),
-            exec_client_factories: HashMap::new(),
+            data_client_factories: IndexMap::new(),
+            exec_client_factories: IndexMap::new(),
             data_client_configs: HashMap::new(),
             exec_client_configs: HashMap::new(),
             data_client_routing: HashMap::new(),
@@ -166,6 +191,7 @@ impl LiveNodeBuilder {
             external_msgbus_factory: None,
             external_msgbus_egress: None,
             external_msgbus_ingress: None,
+            strategy_factories: Vec::new(),
         })
     }
 
@@ -180,8 +206,8 @@ impl LiveNodeBuilder {
         Ok(Self {
             name: "LiveNode".to_string(),
             config,
-            data_client_factories: HashMap::new(),
-            exec_client_factories: HashMap::new(),
+            data_client_factories: IndexMap::new(),
+            exec_client_factories: IndexMap::new(),
             data_client_configs: HashMap::new(),
             exec_client_configs: HashMap::new(),
             data_client_routing: HashMap::new(),
@@ -192,6 +218,7 @@ impl LiveNodeBuilder {
             external_msgbus_factory: None,
             external_msgbus_egress: None,
             external_msgbus_ingress: None,
+            strategy_factories: Vec::new(),
         })
     }
 
@@ -306,6 +333,13 @@ impl LiveNodeBuilder {
         F: Fn() -> Rc<RefCell<dyn Clock>> + 'static,
     {
         self.clock_factory = Some(ClockFactory::new(factory));
+        self
+    }
+
+    /// Supplies a native clock factory, preserving its component-clock initialization policy.
+    #[must_use]
+    pub fn with_native_clock_factory(mut self, factory: ClockFactory) -> Self {
+        self.clock_factory = Some(factory);
         self
     }
 
@@ -587,6 +621,10 @@ impl LiveNodeBuilder {
         );
 
         self.config.validate_runtime_support()?;
+        anyhow::ensure!(
+            self.config.controller.is_none() || self.config.native_controller.is_none(),
+            "Cannot combine native and importable Python controllers"
+        );
 
         if self.config.event_store.is_some() && self.event_store_factory.is_none() {
             anyhow::bail!(
@@ -613,7 +651,8 @@ impl LiveNodeBuilder {
             self.config.clone(),
             NautilusKernelDependencies::default()
                 .with_clock_factory(self.clock_factory.clone())
-                .with_event_store_factory(self.event_store_factory.take()),
+                .with_event_store_factory(self.event_store_factory.take())
+                .with_strategy_factories(std::mem::take(&mut self.strategy_factories)),
         )?;
 
         #[cfg(feature = "python")]
@@ -706,7 +745,20 @@ impl LiveNodeBuilder {
                         kernel.clock(),
                     ),
                     ExecutionClientFactoryEntry::Simulated(factory) => {
-                        factory.create(self.config.trader_id, name, config.as_ref(), kernel.cache())
+                        let clock = self
+                            .clock_factory
+                            .clone()
+                            .unwrap_or_else(|| {
+                                ClockFactory::for_environment(self.config.environment)
+                            })
+                            .create_component_clock();
+                        factory.create_with_clock(
+                            self.config.trader_id,
+                            name,
+                            config.as_ref(),
+                            kernel.cache(),
+                            clock,
+                        )
                     }
                 })?;
 
@@ -875,14 +927,19 @@ impl ExternalMessageBusIngress {
 }
 
 #[cfg(test)]
+mod client_order_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
     use nautilus_common::{
+        actor::{DataActor, DataActorConfig, registry::try_get_actor_unchecked},
         cache::CacheView,
         clients::ExecutionClient,
         clock::Clock,
-        enums::Environment,
+        component::Component,
+        enums::{ComponentState, Environment},
         factories::{ClientConfig, ExecutionClientFactory},
         messages::execution::{SubmitOrder, TradingCommand},
         msgbus::{
@@ -896,7 +953,9 @@ mod tests {
         data::InstrumentClose,
         enums::{AccountType, InstrumentCloseType, OmsType, OrderSide, OrderType},
         events::{AccountState, OrderDeniedReason, OrderEventAny},
-        identifiers::{AccountId, ClientId, ClientOrderId, TraderId, Venue},
+        identifiers::{
+            AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, Venue,
+        },
         instruments::{
             Instrument, InstrumentAny,
             stubs::{audusd_sim, binary_option},
@@ -905,12 +964,112 @@ mod tests {
         stubs::TestDefault,
         types::{AccountBalance, Money, Price, Quantity},
     };
-    use nautilus_trading::ImportableControllerConfig;
+    use nautilus_system::StrategyFactory;
+    use nautilus_trading::{
+        ImportableControllerConfig, nautilus_strategy,
+        strategy::{StrategyConfig, StrategyCore},
+    };
     use rstest::rstest;
+    use serde::Deserialize;
     use ustr::Ustr;
 
     use super::LiveNodeBuilder;
     use crate::node::config::RoutingConfig;
+
+    #[derive(Debug, Deserialize)]
+    struct ConfiguredFixtureConfig {
+        base: StrategyConfig,
+        value: u64,
+    }
+
+    #[derive(Debug)]
+    struct ConfiguredFixture {
+        core: StrategyCore,
+        value: u64,
+    }
+    impl DataActor for ConfiguredFixture {}
+    nautilus_strategy!(ConfiguredFixture, {
+        fn external_order_instrument_ids(&self) -> Option<Vec<InstrumentId>> {
+            self.core.config.external_order_instrument_ids.clone()
+        }
+    });
+
+    #[rstest]
+    fn test_live_node_importable_native_strategy_configuration() {
+        let config: super::LiveNodeConfig = serde_json::from_value(serde_json::json!({
+            "trader_id": "NATIVE-CONFIG-001",
+            "native_controller": { "actor_id": "NATIVE-CONTROLLER" },
+            "strategies": [
+                {"strategy_path":"native:Fixture","config_path":"native:Config","config":{"base":{"strategy_id":"Configured-001","oms_type":"HEDGING","external_order_instrument_ids":["AUDUSD.SIM"]},"value":7}},
+                {"strategy_path":"native:Fixture","config_path":"native:Config","config":{"base":{"strategy_id":"Configured-002"},"value":9}}
+            ]
+        })).unwrap();
+        let factory = StrategyFactory::new(
+            "native:Fixture",
+            "native:Config",
+            |config: ConfiguredFixtureConfig| {
+                Ok(ConfiguredFixture {
+                    core: StrategyCore::new(config.base),
+                    value: config.value,
+                })
+            },
+        )
+        .unwrap();
+        let mut node = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_strategy_factory(factory)
+            .build()
+            .unwrap();
+        assert_eq!(node.kernel().trader.borrow().strategy_ids().len(), 2);
+        let configured = StrategyId::from("Configured-001");
+        let instrument = InstrumentId::from("AUDUSD.SIM");
+        assert_eq!(
+            node.kernel()
+                .exec_engine
+                .borrow()
+                .oms_type_override(configured),
+            Some(OmsType::Hedging)
+        );
+        assert_eq!(
+            node.kernel()
+                .exec_engine
+                .borrow()
+                .get_external_order_claim(&instrument),
+            Some(configured)
+        );
+        assert_eq!(
+            node.exec_manager.get_external_order_claim(&instrument),
+            Some(configured)
+        );
+
+        for (id, value) in [("Configured-001", 7), ("Configured-002", 9)] {
+            let strategy =
+                try_get_actor_unchecked::<ConfiguredFixture>(&StrategyId::from(id).inner())
+                    .unwrap();
+            assert_eq!(strategy.value, value);
+            assert_eq!(strategy.state(), ComponentState::Ready);
+        }
+        node.dispose();
+    }
+
+    #[rstest]
+    fn test_live_node_rejects_ambiguous_controller_configuration() {
+        let result = LiveNodeBuilder::new("NATIVE-CONFIG-001".into(), Environment::Live)
+            .unwrap()
+            .with_native_controller(DataActorConfig::default())
+            .with_controller(ImportableControllerConfig {
+                controller_path: "python:Controller".into(),
+                config_path: "python:Config".into(),
+                config: HashMap::new(),
+            })
+            .build();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot combine native and importable Python controllers")
+        );
+    }
 
     #[rstest]
     fn test_with_controller_sets_config_controller() {
