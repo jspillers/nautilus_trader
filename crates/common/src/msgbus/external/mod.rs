@@ -192,6 +192,16 @@ pub fn republish_external_message(message: &BusMessage) -> anyhow::Result<()> {
 
     let _guard = SuppressExternalGuard::new();
 
+    if let Some(custom) = message.prepared_custom() {
+        anyhow::ensure!(
+            message.payload_type == BusPayloadType::Custom(custom.data.type_name().into())
+                && super::switchboard::get_custom_topic(&custom.data_type) == topic,
+            "Prepared external custom data differs from its registered type or topic"
+        );
+        publish_any(topic, custom);
+        return Ok(());
+    }
+
     match message.payload_type {
         BusPayloadType::Custom(_) => {
             handle_custom_data(
@@ -525,7 +535,15 @@ fn handle_custom_data(
     Ok(())
 }
 
-fn decode_custom_data_payload(
+/// Decodes external custom data using its producer's codec and native type registry.
+///
+/// Does not publish or access thread-local engine state. Protocol adapters can use
+/// this in an ingress processor before returning process-local prepared data.
+///
+/// # Errors
+///
+/// Returns an error if the serialized custom-data envelope cannot be decoded.
+pub fn decode_custom_data_payload(
     payload_type: BusPayloadType,
     encoding: SerializationEncoding,
     payload: &[u8],
@@ -619,6 +637,80 @@ mod tests {
     }
 
     struct ReentrantPayload<F>(F);
+
+    fn prepared_signal() -> BusMessage {
+        use nautilus_model::data::DataType;
+        let signal =
+            crate::signal::Signal::new("boundary".into(), "verified".into(), 1.into(), 2.into());
+        let custom = CustomData::new(
+            std::sync::Arc::new(signal),
+            DataType::new("SignalBoundary", None, None),
+        );
+        BusMessage::with_str_topic(
+            "data.SignalBoundary",
+            BusPayloadType::Custom("Signal".into()),
+            bytes::Bytes::from_static(b"original adapter bytes"),
+            SerializationEncoding::Json,
+        )
+        .with_prepared_custom(custom)
+    }
+
+    #[rstest]
+    fn prepared_ingress_keeps_registration_type_topic_and_echo_fences() {
+        let egress = install_egress();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let output = received.clone();
+        super::super::subscribe_any(
+            "data.SignalBoundary".into(),
+            super::super::ShareableMessageHandler::from_typed(move |data: &CustomData| {
+                output.borrow_mut().push(
+                    data.data
+                        .as_any()
+                        .downcast_ref::<crate::signal::Signal>()
+                        .unwrap()
+                        .value
+                        .clone(),
+                );
+            }),
+            None,
+        );
+        let message = prepared_signal();
+        republish_external_message(&message).unwrap();
+        assert!(received.borrow().is_empty());
+        get_message_bus()
+            .borrow_mut()
+            .add_streaming_type(message.payload_type);
+        republish_external_message(&message).unwrap();
+        assert_eq!(&*received.borrow(), &["verified"]);
+        assert!(egress.borrow().is_empty());
+
+        let mut wrong_topic = message.clone();
+        wrong_topic.topic = "data.SignalAnother".into();
+        assert!(republish_external_message(&wrong_topic).is_err());
+        let mut wrong_type = message;
+        wrong_type.payload_type = BusPayloadType::Custom("Another".into());
+        get_message_bus()
+            .borrow_mut()
+            .add_streaming_type(wrong_type.payload_type);
+        assert!(republish_external_message(&wrong_type).is_err());
+        assert_eq!(received.borrow().len(), 1);
+    }
+
+    #[rstest]
+    fn serialized_ingress_cannot_supply_prepared_process_local_data() {
+        install_egress();
+        let message = prepared_signal();
+        let mut wire = serde_json::to_value(&message).unwrap();
+        assert!(wire.get("prepared_custom").is_none());
+        wire["prepared_custom"] = serde_json::json!({"verified": true});
+        let received: BusMessage = serde_json::from_value(wire).unwrap();
+        assert!(received.prepared_custom().is_none());
+        assert_eq!(received.payload, message.payload);
+        get_message_bus()
+            .borrow_mut()
+            .add_streaming_type(received.payload_type);
+        assert!(republish_external_message(&received).is_err());
+    }
 
     impl<F: Fn()> Serialize for ReentrantPayload<F> {
         fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {

@@ -39,6 +39,21 @@ use nautilus_model::identifiers::TraderId;
 use super::config::MessageBusConfig;
 use crate::msgbus::BusMessage;
 
+/// Prepares external ingress in the backing's existing I/O task, before owner dispatch.
+///
+/// Protocol adapters can authenticate and decode immutable custom data here without
+/// accessing engines or thread-local state. `None` rejects a frame; errors stop the
+/// ingress task. The local bus still validates registration, type and topic before
+/// publication. Implementations must not mutate trading state.
+pub trait MessageBusIngressProcessor: Debug + Send + Sync {
+    /// Returns the accepted original frame, optionally carrying prepared custom data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when ingress cannot safely continue.
+    fn prepare(&self, message: BusMessage) -> anyhow::Result<Option<BusMessage>>;
+}
+
 /// Receiver for external message bus ingress publications.
 #[cfg(feature = "live")]
 pub type MessageBusExternalReceiver = tokio::sync::mpsc::Receiver<BusMessage>;

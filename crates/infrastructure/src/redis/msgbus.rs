@@ -47,7 +47,7 @@ use nautilus_common::{
     logging::{log_task_error, log_task_started, log_task_stopped},
     msgbus::{
         BusMessage, BusPayloadType, MessageBusBacking, MessageBusBackingFactory, MessageBusConfig,
-        switchboard::CLOSE_TOPIC,
+        MessageBusIngressProcessor, switchboard::CLOSE_TOPIC,
     },
 };
 use nautilus_core::{
@@ -256,13 +256,27 @@ impl MessageBusBackingFactory for RedisMessageBusConfig {
 #[derive(Debug, Clone)]
 pub struct RedisMessageBusFactory {
     config: RedisMessageBusConfig,
+    ingress_processor: Option<Arc<dyn MessageBusIngressProcessor>>,
 }
 
 impl RedisMessageBusFactory {
     /// Creates a new [`RedisMessageBusFactory`] from the given Redis configuration.
     #[must_use]
     pub const fn new(config: RedisMessageBusConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            ingress_processor: None,
+        }
+    }
+
+    /// Installs protocol preparation in the existing Redis stream reader task.
+    #[must_use]
+    pub fn with_ingress_processor(
+        mut self,
+        processor: Arc<dyn MessageBusIngressProcessor>,
+    ) -> Self {
+        self.ingress_processor = Some(processor);
+        self
     }
 }
 
@@ -273,7 +287,15 @@ impl MessageBusBackingFactory for RedisMessageBusFactory {
         instance_id: UUID4,
         config: MessageBusConfig,
     ) -> anyhow::Result<Box<dyn MessageBusBacking>> {
-        self.config.create(trader_id, instance_id, config)
+        Ok(Box::new(
+            RedisMessageBusBacking::new_with_ingress_processor(
+                trader_id,
+                instance_id,
+                config,
+                self.config.clone(),
+                self.ingress_processor.clone(),
+            )?,
+        ))
     }
 }
 
@@ -311,6 +333,21 @@ impl RedisMessageBusBacking {
         instance_id: UUID4,
         config: MessageBusConfig,
         backing: RedisMessageBusConfig,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_ingress_processor(trader_id, instance_id, config, backing, None)
+    }
+
+    /// Creates a backing with optional custom protocol preparation in its reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same configuration and connection errors as [`Self::new`].
+    pub fn new_with_ingress_processor(
+        trader_id: TraderId,
+        instance_id: UUID4,
+        config: MessageBusConfig,
+        backing: RedisMessageBusConfig,
+        ingress_processor: Option<Arc<dyn MessageBusIngressProcessor>>,
     ) -> anyhow::Result<Self> {
         install_cryptographic_provider();
 
@@ -369,11 +406,12 @@ impl RedisMessageBusBacking {
             (
                 Some(stream_rx),
                 Some(get_runtime().spawn(async move {
-                    if let Err(e) = stream_messages(
+                    if let Err(e) = stream_messages_with_processor(
                         stream_tx,
                         backing.clone(),
                         external_streams,
                         stream_signal_clone,
+                        ingress_processor,
                     )
                     .await
                     {
@@ -713,6 +751,16 @@ pub async fn stream_messages(
     stream_keys: Vec<String>,
     stream_signal: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
+    stream_messages_with_processor(tx, config, stream_keys, stream_signal, None).await
+}
+
+async fn stream_messages_with_processor(
+    tx: tokio::sync::mpsc::Sender<BusMessage>,
+    config: RedisMessageBusConfig,
+    stream_keys: Vec<String>,
+    stream_signal: Arc<AtomicBool>,
+    processor: Option<Arc<dyn MessageBusIngressProcessor>>,
+) -> anyhow::Result<()> {
     log_task_started(MSGBUS_STREAM);
 
     let Some(mut con) = connect_stream_connection(&config, &stream_signal).await? else {
@@ -773,6 +821,14 @@ pub async fn stream_messages(
 
                                 match decode_bus_message(array) {
                                     Ok(msg) => {
+                                        let msg = match &processor {
+                                            Some(processor) => processor.prepare(msg)?,
+                                            None => Some(msg),
+                                        };
+                                        let Some(msg) = msg else {
+                                            continue;
+                                        };
+
                                         if let Err(e) = tx.send(msg).await {
                                             log::debug!("Channel closed: {e:?}");
                                             break 'outer; // End streaming
@@ -1690,6 +1746,77 @@ mod serial_tests {
         create_redis_connection(MSGBUS_STREAM, &config)
             .await
             .expect("A running Redis service is required for this test")
+    }
+
+    #[derive(Debug)]
+    struct IngressControl {
+        threads: Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>,
+    }
+
+    impl MessageBusIngressProcessor for IngressControl {
+        fn prepare(&self, mut message: BusMessage) -> anyhow::Result<Option<BusMessage>> {
+            self.threads
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
+
+            if message.topic == "reject" {
+                return Ok(None);
+            }
+            message.payload = Bytes::from_static(b"prepared before native ingress");
+            Ok(Some(message))
+        }
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ingress_processor_runs_in_reader_before_channel_delivery(
+        #[future] redis_connection: ConnectionManager,
+    ) {
+        let mut con = redis_connection.await;
+        let stream = format!("ingress-processor-{}", UUID4::new());
+        let first = get_atomic_clock_realtime().get_time_ms() + 1_000_000;
+        for (id, topic) in [(first, "reject"), (first + 1, "accept")] {
+            let _: () = con
+                .xadd(
+                    &stream,
+                    id.to_string(),
+                    &[("topic", topic), ("payload", "original")],
+                )
+                .await
+                .unwrap();
+        }
+        let threads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let processor = Arc::new(IngressControl {
+            threads: threads.clone(),
+        });
+        let owner = std::thread::current().id();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let handle = tokio::spawn(async move {
+            stream_messages_with_processor(
+                tx,
+                RedisMessageBusConfig::default(),
+                vec![stream],
+                stopped,
+                Some(processor),
+            )
+            .await
+        });
+        let message = receive_bus_message(&mut rx, Duration::from_secs(2)).await;
+        assert_eq!(message.topic, "accept");
+        assert_eq!(
+            message.payload,
+            Bytes::from_static(b"prepared before native ingress")
+        );
+        let calls = threads.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.into_iter().all(|thread| thread != owner));
+        assert!(rx.try_recv().is_err());
+        stop.store(true, Ordering::Relaxed);
+        handle.await.unwrap().unwrap();
     }
 
     fn redis_msgbus_factory(config: RedisMessageBusConfig) -> Box<dyn MessageBusBackingFactory> {

@@ -86,10 +86,11 @@ pub use self::{
     api::*,
     backing::{
         MessageBusBacking, MessageBusBackingFactory, MessageBusExternalEgress,
-        external_egress_from_backing,
+        MessageBusIngressProcessor, external_egress_from_backing,
     },
     config::MessageBusConfig,
     core::{MessageBus, Subscription},
+    external::decode_custom_data_payload as decode_external_custom_data,
     message::{BusMessage, BusPayloadCategory, BusPayloadType},
     mstr::{Endpoint, MStr, Pattern, Topic},
     switchboard::MessagingSwitchboard,
