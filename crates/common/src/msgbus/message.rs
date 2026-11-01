@@ -16,6 +16,7 @@
 use std::fmt::Display;
 
 use bytes::Bytes;
+use nautilus_model::data::CustomData;
 use serde::{Deserialize, Serialize, de::Error as _};
 use ustr::Ustr;
 
@@ -338,6 +339,9 @@ pub struct BusMessage {
     /// The encoding the `payload` is serialized with, so the receiver can decode it without
     /// relying on its own configuration (mirrors a wire `content-type`).
     pub encoding: SerializationEncoding,
+    /// Process-local decoded data, never accepted from or written to the wire.
+    #[serde(skip)]
+    prepared_custom: Option<Box<CustomData>>,
 }
 
 impl BusMessage {
@@ -354,7 +358,23 @@ impl BusMessage {
             payload_type,
             payload,
             encoding,
+            prepared_custom: None,
         }
+    }
+
+    /// Attaches immutable custom data prepared by an ingress protocol adapter.
+    ///
+    /// Registration, topic and type are checked by the native bridge before dispatch.
+    #[must_use]
+    pub fn with_prepared_custom(mut self, data: CustomData) -> Self {
+        self.prepared_custom = Some(Box::new(data));
+        self
+    }
+
+    /// Returns process-local prepared data, if supplied by the backing.
+    #[must_use]
+    pub fn prepared_custom(&self) -> Option<&CustomData> {
+        self.prepared_custom.as_deref()
     }
 
     /// Creates a new [`BusMessage`] instance with a string-like topic.
